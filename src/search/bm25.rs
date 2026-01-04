@@ -547,23 +547,35 @@ mod tests {
         let config = BM25Config::default().with_path(path);
         let index1 = BM25Index::new(&config).unwrap();
 
-        // First write
+        // First write - use "hello world" content
         index1
-            .add_documents(&[("doc1".to_string(), "ns".to_string(), "test".to_string())])
+            .add_documents(&[(
+                "doc1".to_string(),
+                "ns".to_string(),
+                "hello world".to_string(),
+            )])
             .await
             .unwrap();
 
-        // Second instance should be able to write (lock released)
+        // Drop first instance to ensure all resources released
+        drop(index1);
+
+        // Second instance should be able to write (lock released) and see committed data
         let config2 = BM25Config::default().with_path(path);
         let index2 = BM25Index::new(&config2).unwrap();
 
+        // Use same keyword "hello" so both match
         index2
-            .add_documents(&[("doc2".to_string(), "ns".to_string(), "test2".to_string())])
+            .add_documents(&[(
+                "doc2".to_string(),
+                "ns".to_string(),
+                "hello there".to_string(),
+            )])
             .await
             .unwrap();
 
-        // Both docs should be searchable
-        let results = index2.search("test", None, 10).unwrap();
+        // Both docs should be searchable with "hello"
+        let results = index2.search("hello", None, 10).unwrap();
         assert_eq!(results.len(), 2);
     }
 

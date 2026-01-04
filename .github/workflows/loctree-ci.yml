@@ -1,0 +1,109 @@
+# Loctree CI - Codebase Health Analysis
+# Uses loctree 0.8.0+ for dead code detection, circular imports, and health scoring
+#
+# Created by M&K (c)2025 The LibraxisAI Team
+# Co-Authored-By: Maciej <void@div0.space> & Klaudiusz <the1st@whoai.am>
+
+name: Loctree CI
+
+on:
+  push:
+    branches: [main, develop, develop-update]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  HEALTH_THRESHOLD: 50  # Rust projects typically have lower scores due to macro complexity
+
+jobs:
+  loctree-analysis:
+    name: Codebase Health Analysis
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: loctree-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            loctree-${{ runner.os }}-
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install loctree
+        run: cargo install mcp-server-loctree --locked
+
+      - name: Run Full Scan
+        id: scan
+        run: |
+          echo "## 🌳 Loctree Codebase Health" >> $GITHUB_STEP_SUMMARY
+
+          # Generate snapshot and analysis artifacts
+          loct scan --force 2>/dev/null || true
+
+          # Try to get health metrics from snapshot
+          if [ -d .loctree ]; then
+            # Run health check
+            loct health > /tmp/health.txt 2>&1 || true
+            cat /tmp/health.txt >> $GITHUB_STEP_SUMMARY
+
+            # Extract metrics if agent.json exists
+            AGENT_JSON=$(find .loctree -name "agent.json" 2>/dev/null | head -1)
+            if [ -f "$AGENT_JSON" ]; then
+              HEALTH=$(jq -r '.summary.health_score // 50' "$AGENT_JSON")
+              DEAD=$(jq -r '.summary.dead_exports // 0' "$AGENT_JSON")
+              CYCLES=$(jq -r '.summary.circular_imports // 0' "$AGENT_JSON")
+
+              echo "health=$HEALTH" >> $GITHUB_OUTPUT
+              echo "dead=$DEAD" >> $GITHUB_OUTPUT
+              echo "cycles=$CYCLES" >> $GITHUB_OUTPUT
+
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+              echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+              echo "| Health Score | $HEALTH |" >> $GITHUB_STEP_SUMMARY
+              echo "| Dead Exports | $DEAD |" >> $GITHUB_STEP_SUMMARY
+              echo "| Cycles | $CYCLES |" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Check Health Threshold
+        if: steps.scan.outputs.health != ''
+        run: |
+          HEALTH=${{ steps.scan.outputs.health }}
+          if [ "$HEALTH" -lt "${{ env.HEALTH_THRESHOLD }}" ]; then
+            echo "::warning::Health score $HEALTH below threshold (${{ env.HEALTH_THRESHOLD }})"
+          fi
+
+      - name: Check Circular Imports
+        run: |
+          loct cycles 2>/dev/null || true
+          CYCLES="${{ steps.scan.outputs.cycles }}"
+          if [ "$CYCLES" != "0" ] && [ -n "$CYCLES" ]; then
+            echo "::warning::Found $CYCLES circular import(s)"
+          fi
+
+      - name: Check Dead Exports
+        run: |
+          echo "### Dead Code Analysis" >> $GITHUB_STEP_SUMMARY
+          loct dead --top 10 2>&1 | tee -a $GITHUB_STEP_SUMMARY || true
+
+      - name: Upload Loctree Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loctree-analysis-${{ matrix.os }}
+          path: .loctree/
+          if-no-files-found: ignore

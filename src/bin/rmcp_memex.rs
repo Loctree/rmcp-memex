@@ -14,7 +14,7 @@ use rmcp_memex::{
     BM25Config, EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearchResult, HybridSearcher,
     IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig, ProviderConfig,
     QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation, ServerConfig,
-    SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, run_wizard,
+    SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, path_utils, run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -2171,13 +2171,17 @@ async fn run_import(
     db_path: String,
     embedding_config: &EmbeddingConfig,
 ) -> Result<()> {
-    // Validate input file exists
-    if !input.exists() {
-        return Err(anyhow::anyhow!("Input file not found: {:?}", input));
-    }
+    // Validate and sanitize input file path (prevents path traversal)
+    // validate_read_path checks: exists, no ".." traversal, canonicalizes, validates under allowed base dirs
+    let validated_input = path_utils::validate_read_path(&input)?;
 
     // Read JSONL file
-    let content = tokio::fs::read_to_string(&input).await?;
+    // SAFETY: validated_input has been sanitized by validate_read_path which:
+    // 1. Checks for path traversal sequences (.., null bytes, newlines)
+    // 2. Canonicalizes the path (resolves symlinks)
+    // 3. Validates the path is under allowed directories (home, /tmp, /var/folders)
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let content = tokio::fs::read_to_string(&validated_input).await?;
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
 
     if lines.is_empty() {
@@ -3332,35 +3336,36 @@ async fn run_merge(
 ) -> Result<()> {
     let mut stats = MergeStats::default();
 
-    // Validate source paths exist
-    let mut validated_sources: Vec<String> = Vec::new();
+    // Validate and sanitize source paths (prevents path traversal)
+    let mut validated_sources: Vec<PathBuf> = Vec::new();
     for source in &source_paths {
-        let expanded = shellexpand::tilde(source.to_str().unwrap_or("")).to_string();
-        let path = Path::new(&expanded);
-        if !path.exists() {
-            if !json_output {
-                eprintln!("Warning: Source database not found: {}", expanded);
+        let source_str = source.to_str().unwrap_or("");
+        match path_utils::sanitize_existing_path(source_str) {
+            Ok(validated) => validated_sources.push(validated),
+            Err(e) => {
+                if !json_output {
+                    eprintln!("Warning: Source database invalid: {} - {}", source_str, e);
+                }
+                stats.errors += 1;
             }
-            stats.errors += 1;
-            continue;
         }
-        validated_sources.push(expanded);
     }
 
     if validated_sources.is_empty() {
         return Err(anyhow::anyhow!("No valid source databases found"));
     }
 
-    // Prepare target path
-    let target_expanded = shellexpand::tilde(target_path.to_str().unwrap_or("")).to_string();
+    // Validate and sanitize target path (prevents path traversal)
+    let target_str = target_path.to_str().unwrap_or("");
+    let validated_target = path_utils::sanitize_new_path(target_str)?;
 
     if !json_output {
         eprintln!("\n=== RMCP-MEMEX MERGE ===\n");
         eprintln!("Sources: {} database(s)", validated_sources.len());
         for src in &validated_sources {
-            eprintln!("  - {}", src);
+            eprintln!("  - {}", src.display());
         }
-        eprintln!("Target:  {}", target_expanded);
+        eprintln!("Target:  {}", validated_target.display());
         if let Some(ref prefix) = namespace_prefix {
             eprintln!("Prefix:  {}", prefix);
         }
@@ -3374,10 +3379,10 @@ async fn run_merge(
     // Open target storage (will create if not exists)
     let target_storage = if !dry_run {
         // Ensure parent directory exists for target
-        if let Some(parent) = Path::new(&target_expanded).parent() {
+        if let Some(parent) = validated_target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        Some(StorageManager::new_lance_only(&target_expanded).await?)
+        Some(StorageManager::new_lance_only(validated_target.to_str().unwrap_or("")).await?)
     } else {
         None
     };
@@ -3410,11 +3415,13 @@ async fn run_merge(
     // Process each source database
     for source_path in &validated_sources {
         if !json_output {
-            eprintln!("Processing: {}", source_path);
+            eprintln!("Processing: {}", source_path.display());
         }
 
         // Open source database read-only
-        let source_storage = match StorageManager::new_lance_only(source_path).await {
+        // SAFETY: source_path was validated by path_utils::sanitize_existing_path above
+        let source_path_str = source_path.to_str().unwrap_or("");
+        let source_storage = match StorageManager::new_lance_only(source_path_str).await {
             Ok(s) => s,
             Err(e) => {
                 if !json_output {
@@ -3563,7 +3570,7 @@ async fn run_merge(
             "namespaces": stats.namespaces.iter().collect::<Vec<_>>(),
             "namespace_count": stats.namespaces.len(),
             "errors": stats.errors,
-            "target": target_expanded,
+            "target": validated_target.display().to_string(),
             "dedup_enabled": dedup,
             "namespace_prefix": namespace_prefix,
         });
@@ -3583,7 +3590,7 @@ async fn run_merge(
         if stats.errors > 0 {
             eprintln!("  Errors:            {}", stats.errors);
         }
-        eprintln!("  Target database:   {}", target_expanded);
+        eprintln!("  Target database:   {}", validated_target.display());
 
         if dry_run {
             eprintln!("\n[DRY RUN - run without --dry-run to apply changes]");
