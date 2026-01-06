@@ -419,6 +419,390 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
         .collect()
 }
 
+/// Create short hash for document deduplication
+fn hash_content(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:x}", hasher.finish()).chars().take(12).collect()
+}
+
+/// Extract conversation documents from JSON with smart format detection.
+/// Returns individual messages as separate documents with proper metadata.
+/// Handles: sessions format, ChatGPT export, generic messages array.
+fn extract_conversation_documents(
+    value: &serde_json::Value,
+    source_path: &std::path::Path,
+) -> Option<Vec<(String, String, serde_json::Value)>> {
+    let obj = value.as_object()?;
+    let source_name = source_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    // Pattern 1: {sessions: [{info: {}, messages: [{role, text, timestamp}]}]}
+    // From extract_session_essence.py output
+    if let Some(serde_json::Value::Array(sessions)) = obj.get("sessions") {
+        let project = obj
+            .get("project")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let mut docs = Vec::new();
+        for session in sessions {
+            let session_obj = session.as_object()?;
+            let session_id = session_obj
+                .get("info")
+                .and_then(|i| i.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let session_short = &session_id[..session_id.len().min(8)];
+
+            if let Some(serde_json::Value::Array(messages)) = session_obj.get("messages") {
+                for (idx, msg) in messages.iter().enumerate() {
+                    let msg_obj = match msg.as_object() {
+                        Some(o) => o,
+                        None => continue,
+                    };
+
+                    let role = msg_obj
+                        .get("role")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let text = msg_obj
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let timestamp = msg_obj
+                        .get("timestamp")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    // Skip empty or too short messages
+                    let text = text.trim();
+                    if text.len() < 20 {
+                        continue;
+                    }
+
+                    let content_hash = hash_content(text);
+                    let doc_id = format!("msg-{}-{:04}-{}", session_short, idx, content_hash);
+
+                    let metadata = json!({
+                        "role": role,
+                        "session": session_short,
+                        "project": project,
+                        "timestamp": timestamp,
+                        "source": source_name,
+                        "type": "conversation",
+                        "format": "sessions"
+                    });
+
+                    docs.push((doc_id, text.to_string(), metadata));
+                }
+            }
+        }
+
+        if !docs.is_empty() {
+            tracing::info!(
+                "Sessions format detected: {} -> {} messages",
+                source_path.display(),
+                docs.len()
+            );
+            return Some(docs);
+        }
+    }
+
+    // Pattern 2: [{uuid, name, messages: [{sender, text, created_at}]}]
+    // Claude.ai conversations export (conversations-merged.json)
+    // This is handled at array level in extract_json_documents, but check for single conversation
+    if let Some(serde_json::Value::Array(messages)) = obj.get("messages") {
+        let conv_id = obj
+            .get("uuid")
+            .or_else(|| obj.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let conv_short = &conv_id[..conv_id.len().min(8)];
+        let title = obj
+            .get("name")
+            .or_else(|| obj.get("title"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Check if it looks like a conversation (messages with sender/role)
+        let looks_like_conversation = messages.iter().any(|m| {
+            m.get("sender").is_some()
+                || m.get("role").is_some()
+                || m.get("author").is_some()
+        });
+
+        if looks_like_conversation {
+            let mut docs = Vec::new();
+            for (idx, msg) in messages.iter().enumerate() {
+                let msg_obj = match msg.as_object() {
+                    Some(o) => o,
+                    None => continue,
+                };
+
+                let role = msg_obj
+                    .get("sender")
+                    .or_else(|| msg_obj.get("role"))
+                    .or_else(|| msg_obj.get("author").and_then(|a| a.get("role")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                // Normalize role names
+                let role = match role {
+                    "human" => "user",
+                    "assistant" | "bot" => "assistant",
+                    other => other,
+                };
+
+                // Extract text from various formats
+                let text = msg_obj
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| {
+                        // Handle content array (Claude format)
+                        msg_obj.get("content").and_then(|c| {
+                            if let Some(s) = c.as_str() {
+                                Some(s)
+                            } else if let Some(_arr) = c.as_array() {
+                                // Collect text from content blocks
+                                None // Handle below
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or("");
+
+                // Handle content blocks array
+                let text = if text.is_empty() {
+                    if let Some(serde_json::Value::Array(content)) = msg_obj.get("content") {
+                        content
+                            .iter()
+                            .filter_map(|c| c.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    text.to_string()
+                };
+
+                let timestamp = msg_obj
+                    .get("created_at")
+                    .or_else(|| msg_obj.get("timestamp"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let text = text.trim();
+                if text.len() < 20 {
+                    continue;
+                }
+
+                let content_hash = hash_content(text);
+                let doc_id = format!("conv-{}-{:04}-{}", conv_short, idx, content_hash);
+
+                let metadata = json!({
+                    "role": role,
+                    "conversation": conv_short,
+                    "title": title,
+                    "timestamp": timestamp,
+                    "source": source_name,
+                    "type": "conversation",
+                    "format": "claude_web"
+                });
+
+                docs.push((doc_id, text.to_string(), metadata));
+            }
+
+            if !docs.is_empty() {
+                tracing::info!(
+                    "Conversation format detected: {} -> {} messages",
+                    source_path.display(),
+                    docs.len()
+                );
+                return Some(docs);
+            }
+        }
+    }
+
+    // Pattern 4: {uuid, chat_messages: [{sender, text, created_at}]}
+    // Claude.ai conversations export format (conversations-merged.json)
+    if let Some(serde_json::Value::Array(messages)) = obj.get("chat_messages") {
+        let conv_id = obj
+            .get("uuid")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let conv_short = &conv_id[..conv_id.len().min(8)];
+        let title = obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let mut docs = Vec::new();
+        for (idx, msg) in messages.iter().enumerate() {
+            let msg_obj = match msg.as_object() {
+                Some(o) => o,
+                None => continue,
+            };
+
+            let role = msg_obj
+                .get("sender")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            // Normalize role names
+            let role = match role {
+                "human" => "user",
+                "assistant" | "bot" => "assistant",
+                other => other,
+            };
+
+            let text = msg_obj
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let timestamp = msg_obj
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let text = text.trim();
+            if text.len() < 20 {
+                continue;
+            }
+
+            let content_hash = hash_content(text);
+            let doc_id = format!("chat-{}-{:04}-{}", conv_short, idx, content_hash);
+
+            let metadata = json!({
+                "role": role,
+                "conversation": conv_short,
+                "title": title,
+                "timestamp": timestamp,
+                "source": source_name,
+                "type": "conversation",
+                "format": "claude_web"
+            });
+
+            docs.push((doc_id, text.to_string(), metadata));
+        }
+
+        if !docs.is_empty() {
+            tracing::info!(
+                "Claude.ai chat_messages format detected: {} -> {} messages",
+                source_path.display(),
+                docs.len()
+            );
+            return Some(docs);
+        }
+    }
+
+    // Pattern 3: {mapping: {id: {message: {content: {parts: []}}}}}
+    // ChatGPT export format
+    if let Some(serde_json::Value::Object(mapping)) = obj.get("mapping") {
+        let conv_id = obj
+            .get("id")
+            .or_else(|| obj.get("conversation_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let conv_short = &conv_id[..conv_id.len().min(8)];
+        let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("");
+
+        let mut docs = Vec::new();
+        let mut entries: Vec<_> = mapping.iter().collect();
+        // Try to sort by create_time if available
+        entries.sort_by(|a, b| {
+            let time_a = a.1.get("message")
+                .and_then(|m| m.get("create_time"))
+                .and_then(|t| t.as_f64())
+                .unwrap_or(0.0);
+            let time_b = b.1.get("message")
+                .and_then(|m| m.get("create_time"))
+                .and_then(|t| t.as_f64())
+                .unwrap_or(0.0);
+            time_a.partial_cmp(&time_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        for (idx, (_node_id, node)) in entries.iter().enumerate() {
+            let message = match node.get("message") {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let role = message
+                .get("author")
+                .and_then(|a| a.get("role"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            // Skip system messages
+            if role == "system" {
+                continue;
+            }
+
+            let text = message
+                .get("content")
+                .and_then(|c| c.get("parts"))
+                .and_then(|p| p.as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default();
+
+            let timestamp = message
+                .get("create_time")
+                .and_then(|t| t.as_f64())
+                .map(|ts| {
+                    chrono::DateTime::from_timestamp(ts as i64, 0)
+                        .map(|dt| dt.to_rfc3339())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+
+            let text = text.trim();
+            if text.len() < 20 {
+                continue;
+            }
+
+            let content_hash = hash_content(text);
+            let doc_id = format!("gpt-{}-{:04}-{}", conv_short, idx, content_hash);
+
+            let metadata = json!({
+                "role": role,
+                "conversation": conv_short,
+                "title": title,
+                "timestamp": timestamp,
+                "source": source_name,
+                "type": "conversation",
+                "format": "chatgpt"
+            });
+
+            docs.push((doc_id, text.to_string(), metadata));
+        }
+
+        if !docs.is_empty() {
+            tracing::info!(
+                "ChatGPT format detected: {} -> {} messages",
+                source_path.display(),
+                docs.len()
+            );
+            return Some(docs);
+        }
+    }
+
+    None
+}
+
 /// Extract meaningful text content from a JSON element (object or value).
 /// Handles common patterns: messages, conversations, entities, generic objects.
 fn extract_json_element_content(value: &serde_json::Value) -> String {
@@ -795,14 +1179,21 @@ impl RAGPipeline {
         let validated_path = crate::path_utils::validate_read_path(path)?;
         let ns = namespace.unwrap_or(DEFAULT_NAMESPACE);
 
-        // For Onion modes, use JSON-aware extraction to split arrays into documents
-        if matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast) {
+        // For JSON files, ALWAYS use JSON-aware extraction (smart conversation detection)
+        // This allows conversations to be extracted as individual messages regardless of slice_mode
+        let is_json = validated_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+
+        if is_json || matches!(slice_mode, SliceMode::Onion | SliceMode::OnionFast) {
             return self
                 .index_document_with_json_awareness(&validated_path, ns, slice_mode)
                 .await;
         }
 
-        // For Flat mode, use existing behavior (single document)
+        // For non-JSON Flat mode, use existing behavior (single document)
         let text = self.extract_text(&validated_path).await?;
 
         // Compute content hash BEFORE any processing
@@ -888,36 +1279,54 @@ impl RAGPipeline {
                 );
             }
 
-            // Index with onion slicing
-            let chunks = match slice_mode {
-                SliceMode::Onion => {
-                    self.index_with_onion_slicing_and_hash(
-                        &content,
-                        namespace,
-                        doc_metadata,
-                        &doc_hash,
-                    )
-                    .await?
-                }
-                SliceMode::OnionFast => {
-                    self.index_with_onion_slicing_fast_and_hash(
-                        &content,
-                        namespace,
-                        doc_metadata,
-                        &doc_hash,
-                    )
-                    .await?
-                }
-                SliceMode::Flat => {
-                    // Shouldn't reach here, but handle anyway
-                    self.index_with_flat_chunking_and_hash(
-                        &content,
-                        namespace,
-                        path,
-                        doc_metadata,
-                        &doc_hash,
-                    )
-                    .await?
+            // Check if this is a conversation message - store directly without chunking
+            let is_conversation = doc_metadata
+                .get("type")
+                .and_then(|v| v.as_str())
+                .map(|t| t == "conversation")
+                .unwrap_or(false);
+
+            let chunks = if is_conversation {
+                // Store conversation message as single document (no chunking!)
+                self.index_conversation_message_direct(
+                    &doc_id,
+                    &content,
+                    namespace,
+                    doc_metadata,
+                    &doc_hash,
+                )
+                .await?
+            } else {
+                // Index with onion/flat slicing for non-conversation content
+                match slice_mode {
+                    SliceMode::Onion => {
+                        self.index_with_onion_slicing_and_hash(
+                            &content,
+                            namespace,
+                            doc_metadata,
+                            &doc_hash,
+                        )
+                        .await?
+                    }
+                    SliceMode::OnionFast => {
+                        self.index_with_onion_slicing_fast_and_hash(
+                            &content,
+                            namespace,
+                            doc_metadata,
+                            &doc_hash,
+                        )
+                        .await?
+                    }
+                    SliceMode::Flat => {
+                        self.index_with_flat_chunking_and_hash(
+                            &content,
+                            namespace,
+                            path,
+                            doc_metadata,
+                            &doc_hash,
+                        )
+                        .await?
+                    }
                 }
             };
 
@@ -1302,6 +1711,42 @@ impl RAGPipeline {
         }
 
         Ok(())
+    }
+
+    /// Index a conversation message directly without chunking.
+    /// Each message is stored as a single document with its own embedding.
+    /// Used for smart-extracted conversation messages where chunking would lose context.
+    async fn index_conversation_message_direct(
+        &self,
+        doc_id: &str,
+        text: &str,
+        namespace: &str,
+        metadata: serde_json::Value,
+        content_hash: &str,
+    ) -> Result<usize> {
+        // Embed the entire message as one unit
+        let embedding = self.embed_query(text).await?;
+
+        // Create document with the smart-extracted ID (msg-XXX-NNNN-HASH)
+        let doc = ChromaDocument::new_flat_with_hash(
+            doc_id.to_string(),
+            namespace.to_string(),
+            embedding,
+            metadata,
+            text.to_string(),
+            content_hash.to_string(),
+        );
+
+        // Store directly
+        self.storage.add_to_store(vec![doc]).await?;
+
+        tracing::debug!(
+            "Conversation message stored directly: {} ({} chars)",
+            doc_id,
+            text.len()
+        );
+
+        Ok(1) // One document stored
     }
 
     /// Index using traditional flat chunking with content hash for deduplication
@@ -1700,7 +2145,29 @@ impl RAGPipeline {
 
         // Check if it's an array
         if let serde_json::Value::Array(arr) = parsed {
-            let mut docs = Vec::with_capacity(arr.len());
+            let mut docs = Vec::new();
+            let mut used_smart_extraction = false;
+
+            // Try smart conversation extraction for each array element
+            for item in arr.iter() {
+                if let Some(mut conv_docs) = extract_conversation_documents(item, path) {
+                    docs.append(&mut conv_docs);
+                    used_smart_extraction = true;
+                }
+            }
+
+            // If smart extraction found conversations, use those
+            if used_smart_extraction && !docs.is_empty() {
+                tracing::info!(
+                    "Conversation array detected: {} -> {} messages",
+                    path.display(),
+                    docs.len()
+                );
+                return Ok(docs);
+            }
+
+            // Fallback to element-by-element extraction
+            docs.clear();
             for (idx, item) in arr.iter().enumerate() {
                 let doc_id = format!("{}:{}", path.display(), idx);
                 let content = extract_json_element_content(item);
@@ -1729,7 +2196,12 @@ impl RAGPipeline {
             return Ok(docs);
         }
 
-        // Not an array, treat as single document
+        // Try smart conversation extraction first
+        if let Some(docs) = extract_conversation_documents(&parsed, path) {
+            return Ok(docs);
+        }
+
+        // Fallback: treat as single document
         let content = extract_json_element_content(&parsed);
         let doc_id = format!("{}:0", path.display());
         let metadata = json!({ "path": path.to_str(), "index": 0 });

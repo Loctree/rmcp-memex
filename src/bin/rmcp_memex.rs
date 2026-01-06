@@ -986,13 +986,13 @@ fn display_search_results(
         .map(|l| format!(" (layer: {})", l.name()))
         .unwrap_or_default();
 
-    eprintln!(
+    println!(
         "\n-> Search Results for \"{}\" in [{}]{}\n",
         query, ns_display, layer_display
     );
 
     if results.is_empty() {
-        eprintln!("No results found.");
+        println!("No results found.");
         return;
     }
 
@@ -1012,25 +1012,25 @@ fn display_search_results(
             .map(|l| format!("[{}]", l.name()))
             .unwrap_or_default();
 
-        eprintln!(
+        println!(
             "{}. [{:.2}] {} {}",
             i + 1,
             result.score,
             result.namespace,
             layer_str
         );
-        eprintln!("   \"{}{ellipsis}\"", preview);
-        eprintln!("   ID: {}", result.id);
+        println!("   \"{}{ellipsis}\"", preview);
+        println!("   ID: {}", result.id);
         if !result.keywords.is_empty() {
-            eprintln!("   Keywords: {}", result.keywords.join(", "));
+            println!("   Keywords: {}", result.keywords.join(", "));
         }
         if result.can_expand() {
-            eprintln!("   [expandable: {} children]", result.children_ids.len());
+            println!("   [expandable: {} children]", result.children_ids.len());
         }
         if !result.metadata.is_null() && result.metadata != serde_json::json!({}) {
-            eprintln!("   Metadata: {}", result.metadata);
+            println!("   Metadata: {}", result.metadata);
         }
-        eprintln!();
+        println!();
     }
 }
 
@@ -1079,13 +1079,13 @@ fn display_hybrid_search_results(
         SearchMode::Vector => "vector",
     };
 
-    eprintln!(
+    println!(
         "\n-> Search Results for \"{}\" in [{}]{} [mode: {}]\n",
         query, ns_display, layer_display, mode_display
     );
 
     if results.is_empty() {
-        eprintln!("No results found.");
+        println!("No results found.");
         return;
     }
 
@@ -1120,25 +1120,25 @@ fn display_hybrid_search_results(
             (None, None) => format!("[score: {:.2}]", result.combined_score),
         };
 
-        eprintln!(
+        println!(
             "{}. {} {} {}",
             i + 1,
             score_details,
             result.namespace,
             layer_str
         );
-        eprintln!("   \"{}{ellipsis}\"", preview);
-        eprintln!("   ID: {}", result.id);
+        println!("   \"{}{ellipsis}\"", preview);
+        println!("   ID: {}", result.id);
         if !result.keywords.is_empty() {
-            eprintln!("   Keywords: {}", result.keywords.join(", "));
+            println!("   Keywords: {}", result.keywords.join(", "));
         }
         if !result.children_ids.is_empty() {
-            eprintln!("   [expandable: {} children]", result.children_ids.len());
+            println!("   [expandable: {} children]", result.children_ids.len());
         }
         if !result.metadata.is_null() && result.metadata != serde_json::json!({}) {
-            eprintln!("   Metadata: {}", result.metadata);
+            println!("   Metadata: {}", result.metadata);
         }
-        eprintln!();
+        println!();
     }
 }
 

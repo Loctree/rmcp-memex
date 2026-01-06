@@ -824,12 +824,23 @@ pub struct McpMessagesParams {
 /// Creates a new session and sends the endpoint URL for messages
 async fn mcp_sse_handler(
     State(state): State<HttpState>,
+    headers: axum::http::HeaderMap,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     // Create a new session
     let (session_id, mut rx) = state.mcp_sessions.create_session().await;
-    let base_url = state.mcp_base_url.read().await.clone();
 
-    info!("MCP SSE: New session {}", session_id);
+    // Use Host header from request to build endpoint URL (enables remote access)
+    let base_url = if let Some(host) = headers.get(axum::http::header::HOST) {
+        if let Ok(host_str) = host.to_str() {
+            format!("http://{}", host_str)
+        } else {
+            state.mcp_base_url.read().await.clone()
+        }
+    } else {
+        state.mcp_base_url.read().await.clone()
+    };
+
+    info!("MCP SSE: New session {} (base_url: {})", session_id, base_url);
 
     let stream = async_stream::stream! {
         // First event: tell client where to POST messages (FastMCP/MCP SSE protocol)
@@ -1206,6 +1217,7 @@ async fn handle_mcp_request(
 
 /// Start the HTTP server with shared RAGPipeline
 pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()> {
+    // Fallback base_url - actual URL is derived from Host header in mcp_sse_handler
     let base_url = format!("http://localhost:{}", port);
     let state = HttpState {
         rag,
