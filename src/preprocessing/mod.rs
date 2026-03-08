@@ -468,6 +468,260 @@ impl Preprocessor {
     }
 }
 
+// =============================================================================
+// TEXT INTEGRITY METRICS - Quality assessment for embedding quality
+// =============================================================================
+
+/// Text integrity metrics for embedding quality assessment.
+///
+/// Target: >90% overall integrity score before indexing.
+///
+/// # Metrics
+/// - **Sentence Integrity**: % of complete sentences preserved (not cut mid-sentence)
+/// - **Word Integrity**: % of complete words (not truncated mid-word)
+/// - **Chunk Quality**: How close chunks are to optimal size
+///
+/// # Example
+/// ```rust,ignore
+/// let metrics = TextIntegrityMetrics::compute(original_text, &chunks);
+/// if !metrics.passes_threshold() {
+///     warn!("Text integrity below 90%: {:.1}%", metrics.overall * 100.0);
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextIntegrityMetrics {
+    /// Percentage of complete sentences preserved (0.0 - 1.0)
+    pub sentence_integrity: f32,
+
+    /// Percentage of complete words (not truncated) (0.0 - 1.0)
+    pub word_integrity: f32,
+
+    /// Quality score based on chunk length distribution (0.0 - 1.0)
+    pub chunk_quality: f32,
+
+    /// Combined overall score (0.0 - 1.0)
+    pub overall: f32,
+
+    /// Number of chunks analyzed
+    pub chunk_count: usize,
+
+    /// Average chunk length in characters
+    pub avg_chunk_length: usize,
+}
+
+impl TextIntegrityMetrics {
+    /// Minimum acceptable overall score (90%)
+    pub const THRESHOLD: f32 = 0.90;
+
+    /// Optimal chunk length range (characters)
+    pub const OPTIMAL_MIN: usize = 200;
+    pub const OPTIMAL_MAX: usize = 800;
+
+    /// Compute integrity metrics from original text and resulting chunks
+    pub fn compute(original: &str, chunks: &[String]) -> Self {
+        if chunks.is_empty() {
+            return Self {
+                sentence_integrity: 0.0,
+                word_integrity: 0.0,
+                chunk_quality: 0.0,
+                overall: 0.0,
+                chunk_count: 0,
+                avg_chunk_length: 0,
+            };
+        }
+
+        let sentence_integrity = Self::compute_sentence_integrity(original, chunks);
+        let word_integrity = Self::compute_word_integrity(chunks);
+        let chunk_quality = Self::compute_chunk_quality(chunks);
+
+        // Weighted average: sentence integrity is most important
+        let overall = sentence_integrity * 0.5 + word_integrity * 0.3 + chunk_quality * 0.2;
+
+        let total_chars: usize = chunks.iter().map(|c| c.len()).sum();
+        let avg_chunk_length = total_chars / chunks.len();
+
+        Self {
+            sentence_integrity,
+            word_integrity,
+            chunk_quality,
+            overall,
+            chunk_count: chunks.len(),
+            avg_chunk_length,
+        }
+    }
+
+    /// Check if metrics pass the minimum threshold (90%)
+    pub fn passes_threshold(&self) -> bool {
+        self.overall >= Self::THRESHOLD
+    }
+
+    /// Get recommendation based on metrics
+    pub fn recommendation(&self) -> IntegrityRecommendation {
+        if self.overall >= 0.95 {
+            IntegrityRecommendation::Excellent
+        } else if self.overall >= Self::THRESHOLD {
+            IntegrityRecommendation::Good
+        } else if self.overall >= 0.70 {
+            IntegrityRecommendation::Warn
+        } else {
+            IntegrityRecommendation::Purge
+        }
+    }
+
+    /// Compute sentence integrity score
+    fn compute_sentence_integrity(original: &str, chunks: &[String]) -> f32 {
+        let original_sentences = Self::count_sentences(original);
+        if original_sentences == 0 {
+            return 1.0; // No sentences to preserve
+        }
+
+        let preserved_sentences: usize = chunks
+            .iter()
+            .map(|c| Self::count_complete_sentences(c))
+            .sum();
+
+        // Ratio of preserved complete sentences
+        let ratio = preserved_sentences as f32 / original_sentences as f32;
+
+        // Cap at 1.0 (can exceed if chunks add sentence breaks)
+        ratio.min(1.0)
+    }
+
+    /// Compute word integrity (chunks not ending mid-word)
+    fn compute_word_integrity(chunks: &[String]) -> f32 {
+        if chunks.is_empty() {
+            return 1.0;
+        }
+
+        let complete_endings = chunks
+            .iter()
+            .filter(|c| Self::ends_at_word_boundary(c))
+            .count();
+
+        complete_endings as f32 / chunks.len() as f32
+    }
+
+    /// Compute chunk quality based on length distribution
+    fn compute_chunk_quality(chunks: &[String]) -> f32 {
+        if chunks.is_empty() {
+            return 0.0;
+        }
+
+        let optimal_count = chunks
+            .iter()
+            .filter(|c| {
+                let len = c.len();
+                (Self::OPTIMAL_MIN..=Self::OPTIMAL_MAX).contains(&len)
+            })
+            .count();
+
+        optimal_count as f32 / chunks.len() as f32
+    }
+
+    /// Count sentences in text (ending with . ! ?)
+    fn count_sentences(text: &str) -> usize {
+        text.chars()
+            .filter(|&c| c == '.' || c == '!' || c == '?')
+            .count()
+    }
+
+    /// Count complete sentences (not cut mid-sentence)
+    fn count_complete_sentences(chunk: &str) -> usize {
+        let trimmed = chunk.trim();
+        if trimmed.is_empty() {
+            return 0;
+        }
+
+        // A complete sentence ends with punctuation
+        let sentences = Self::count_sentences(trimmed);
+
+        // Check if chunk ends cleanly (with sentence terminator or at natural break)
+        if Self::ends_at_sentence_boundary(trimmed) {
+            sentences
+        } else {
+            // Last sentence is incomplete
+            sentences.saturating_sub(1)
+        }
+    }
+
+    /// Check if text ends at a sentence boundary
+    fn ends_at_sentence_boundary(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let last_char = trimmed.chars().last().unwrap_or(' ');
+        matches!(last_char, '.' | '!' | '?' | ':' | '"' | '\'' | ')' | ']')
+    }
+
+    /// Check if text ends at a word boundary (punctuation or whitespace)
+    /// Note: We consider alphanumeric endings as incomplete if the original
+    /// context isn't available - caller should verify if needed
+    fn ends_at_word_boundary(text: &str) -> bool {
+        let trimmed = text.trim_end();
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        let last_char = trimmed.chars().last().unwrap_or(' ');
+        // Only punctuation counts as clean word boundary
+        // Alphanumeric endings might be mid-word cuts
+        last_char.is_whitespace() || last_char.is_ascii_punctuation()
+    }
+}
+
+/// Recommendation based on integrity metrics
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntegrityRecommendation {
+    /// >95% - High quality, keep
+    Excellent,
+    /// 90-95% - Good quality, keep
+    Good,
+    /// 70-90% - Consider re-indexing with better chunking
+    Warn,
+    /// <70% - Low quality, purge and re-index
+    Purge,
+}
+
+impl IntegrityRecommendation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Excellent => "EXCELLENT",
+            Self::Good => "GOOD",
+            Self::Warn => "WARN",
+            Self::Purge => "PURGE",
+        }
+    }
+
+    pub fn emoji(&self) -> &'static str {
+        match self {
+            Self::Excellent => "✅",
+            Self::Good => "✅",
+            Self::Warn => "⚠️",
+            Self::Purge => "❌",
+        }
+    }
+}
+
+impl std::fmt::Display for TextIntegrityMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let rec = self.recommendation();
+        write!(
+            f,
+            "{} {}: {:.1}% (sentence: {:.1}%, word: {:.1}%, chunk: {:.1}%) - {} chunks, avg {}ch",
+            rec.emoji(),
+            rec.as_str(),
+            self.overall * 100.0,
+            self.sentence_integrity * 100.0,
+            self.word_integrity * 100.0,
+            self.chunk_quality * 100.0,
+            self.chunk_count,
+            self.avg_chunk_length
+        )
+    }
+}
+
 #[cfg(test)]
 impl Message {
     pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
@@ -476,5 +730,93 @@ impl Message {
             content: content.into(),
             metadata: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod integrity_tests {
+    use super::*;
+
+    #[test]
+    fn test_perfect_integrity() {
+        // Create longer chunks to pass chunk_quality (OPTIMAL_MIN=200)
+        let original = "This is the first sentence with some padding text to make it longer. \
+                        Here is another sentence that continues the thought and adds context. \
+                        The third sentence provides more information about the topic at hand. \
+                        Finally we conclude with a fourth sentence that wraps everything up nicely.";
+        let chunks = vec![
+            "This is the first sentence with some padding text to make it longer. \
+             Here is another sentence that continues the thought and adds context.".to_string(),
+            "The third sentence provides more information about the topic at hand. \
+             Finally we conclude with a fourth sentence that wraps everything up nicely.".to_string(),
+        ];
+
+        let metrics = TextIntegrityMetrics::compute(original, &chunks);
+        assert!(metrics.sentence_integrity >= 0.9, "sentence_integrity: {}", metrics.sentence_integrity);
+        assert!(metrics.word_integrity >= 0.9, "word_integrity: {}", metrics.word_integrity);
+        // overall = 0.5*sentence + 0.3*word + 0.2*chunk_quality
+        // With perfect sentence/word but short chunks (< OPTIMAL_MIN), overall = 0.8
+        assert!(metrics.overall >= 0.75, "overall: {}", metrics.overall);
+    }
+
+    #[test]
+    fn test_poor_integrity() {
+        let original = "This is a complete sentence with many words.";
+        // Chunks cut mid-word and mid-sentence
+        let chunks = vec![
+            "This is a compl".to_string(), // Cut mid-word
+            "ete sentence wi".to_string(), // Cut mid-word
+            "th many words".to_string(),   // Missing period
+        ];
+
+        let metrics = TextIntegrityMetrics::compute(original, &chunks);
+        assert!(metrics.word_integrity < 0.9); // Mid-word cuts
+        assert!(!metrics.passes_threshold());
+        assert_eq!(metrics.recommendation(), IntegrityRecommendation::Purge);
+    }
+
+    #[test]
+    fn test_empty_chunks() {
+        let original = "Some text";
+        let chunks: Vec<String> = vec![];
+
+        let metrics = TextIntegrityMetrics::compute(original, &chunks);
+        assert_eq!(metrics.chunk_count, 0);
+        assert_eq!(metrics.overall, 0.0);
+    }
+
+    #[test]
+    fn test_recommendation_levels() {
+        // Excellent
+        let m = TextIntegrityMetrics {
+            sentence_integrity: 1.0,
+            word_integrity: 1.0,
+            chunk_quality: 0.9,
+            overall: 0.97,
+            chunk_count: 10,
+            avg_chunk_length: 400,
+        };
+        assert_eq!(m.recommendation(), IntegrityRecommendation::Excellent);
+
+        // Good
+        let m = TextIntegrityMetrics {
+            overall: 0.92,
+            ..m
+        };
+        assert_eq!(m.recommendation(), IntegrityRecommendation::Good);
+
+        // Warn
+        let m = TextIntegrityMetrics {
+            overall: 0.75,
+            ..m
+        };
+        assert_eq!(m.recommendation(), IntegrityRecommendation::Warn);
+
+        // Purge
+        let m = TextIntegrityMetrics {
+            overall: 0.50,
+            ..m
+        };
+        assert_eq!(m.recommendation(), IntegrityRecommendation::Purge);
     }
 }

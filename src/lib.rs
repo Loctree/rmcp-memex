@@ -25,12 +25,15 @@ use tracing::Level;
 
 // Re-export core types for library consumers
 pub use embeddings::{
-    EmbeddingClient, EmbeddingConfig, MLXBridge, MlxConfig, ProviderConfig, RerankerConfig,
-    TokenConfig, estimate_tokens, safe_chunk_size, truncate_to_token_limit, validate_batch_tokens,
-    validate_chunk_tokens,
+    DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge, MlxConfig, MlxMergeOptions,
+    ProviderConfig, RerankerConfig, TokenConfig, cross_dimension_search_adapt, estimate_tokens,
+    safe_chunk_size, truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
-pub use preprocessing::{Message, PreprocessingConfig, PreprocessingStats, Preprocessor};
+pub use preprocessing::{
+    IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
+    TextIntegrityMetrics,
+};
 pub use query::{
     LoctreeSuggestion, QueryIntent, QueryRouter, RecommendedSearchMode, RoutingDecision,
     SearchModeRecommendation, TemporalHints, detect_intent,
@@ -80,7 +83,10 @@ pub use tools::{
 #[cfg(feature = "cli")]
 pub use progress::IndexProgressTracker;
 #[cfg(feature = "cli")]
-pub use tui::{HostDetection, HostKind, WizardConfig, detect_hosts, run_wizard};
+pub use tui::{
+    CheckStatus, HealthCheckItem, HealthCheckResult, HealthChecker, HostDetection, HostKind,
+    WizardConfig, detect_hosts, run_wizard,
+};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {

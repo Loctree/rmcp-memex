@@ -419,7 +419,7 @@ fn create_backup(path: &Path) -> Result<PathBuf> {
     })?;
 
     // Path is validated by validate_read_path/validate_write_path above
-    std::fs::copy(&safe_src, &safe_dst) // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    std::fs::copy(&safe_src, &safe_dst)
         .with_context(|| format!("Failed to create backup of {}", safe_src.display()))?;
     Ok(safe_dst)
 }
@@ -535,7 +535,6 @@ pub fn write_host_config(
             )
         })?;
         // Path is validated by validate_read_path above
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         std::fs::read_to_string(&safe_read_path)
             .with_context(|| format!("Failed to read {}", safe_read_path.display()))?
     } else {

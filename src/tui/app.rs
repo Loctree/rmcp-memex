@@ -208,10 +208,6 @@ fn get_hostname() -> String {
         .unwrap_or_else(|_| "local".to_string())
 }
 
-#[allow(dead_code)]
-pub fn detect_hostname() -> String {
-    get_hostname()
-}
 
 /// Database path mode for multi-host setups
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,15 +216,6 @@ pub enum DbPathMode {
     Shared,
     /// Per-host path with hostname suffix (e.g., ~/.ai-memories/lancedb.dragon)
     PerHost,
-}
-
-impl DbPathMode {
-    pub fn description(&self) -> &'static str {
-        match self {
-            DbPathMode::Shared => "Shared database (all hosts use same path)",
-            DbPathMode::PerHost => "Per-host database (separate DB per machine)",
-        }
-    }
 }
 
 /// Editable memex configuration.
@@ -273,14 +260,6 @@ impl MemexCfg {
         }
     }
 
-    /// Get description of current path configuration
-    #[allow(dead_code)]
-    pub fn path_description(&self) -> String {
-        match self.db_path_mode {
-            DbPathMode::Shared => format!("{} (shared)", self.db_path),
-            DbPathMode::PerHost => format!("{}.{} (per-host)", self.db_path, self.hostname),
-        }
-    }
 }
 
 /// Main application state.
@@ -541,39 +520,6 @@ impl App {
         7 // db_path, db_path_mode, http_port, cache_mb, log_level, max_request_bytes, mode
     }
 
-    /// Get field labels for settings display
-    #[allow(dead_code)]
-    pub fn get_field_label(&self, field: usize) -> &'static str {
-        match field {
-            0 => "Database Path",
-            1 => "Path Mode",
-            2 => "HTTP Port",
-            3 => "Cache (MB)",
-            4 => "Log Level",
-            5 => "Max Request (bytes)",
-            6 => "Mode",
-            _ => "",
-        }
-    }
-
-    /// Get field hint/description
-    #[allow(dead_code)]
-    pub fn get_field_hint(&self, field: usize) -> String {
-        match field {
-            0 => format!("Effective: {}", self.memex_cfg.effective_db_path()),
-            1 => self.memex_cfg.db_path_mode.description().to_string(),
-            2 => match self.memex_cfg.http_port {
-                Some(p) => format!("HTTP/SSE enabled on port {}", p),
-                None => "Disabled (MCP stdio only)".to_string(),
-            },
-            3 => "Memory cache for vector lookups".to_string(),
-            4 => "trace/debug/info/warn/error".to_string(),
-            5 => "Max JSON-RPC request size".to_string(),
-            6 => "full (all features) or memory (no filesystem)".to_string(),
-            _ => String::new(),
-        }
-    }
-
     pub fn get_field_value(&self, field: usize) -> String {
         match field {
             0 => self.memex_cfg.db_path.clone(),
@@ -625,24 +571,6 @@ impl App {
             6 => self.memex_cfg.mode = value,
             _ => {}
         }
-    }
-
-    /// Toggle db_path_mode (for space key)
-    #[allow(dead_code)]
-    pub fn toggle_db_path_mode(&mut self) {
-        self.memex_cfg.db_path_mode = match self.memex_cfg.db_path_mode {
-            DbPathMode::Shared => DbPathMode::PerHost,
-            DbPathMode::PerHost => DbPathMode::Shared,
-        };
-    }
-
-    /// Toggle http_port (for space key)
-    #[allow(dead_code)]
-    pub fn toggle_http_port(&mut self) {
-        self.memex_cfg.http_port = match self.memex_cfg.http_port {
-            None => Some(6660), // Default port (823x reserved for Whisper STT)
-            Some(_) => None,
-        };
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {

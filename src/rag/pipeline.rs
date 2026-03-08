@@ -231,7 +231,6 @@ async fn extract_file_text(path: &PathBuf) -> Result<String> {
     }
 
     // Default: treat as UTF-8 text
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     tokio::fs::read_to_string(path).await.map_err(|e| e.into())
 }
 
