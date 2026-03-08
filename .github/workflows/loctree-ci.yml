@@ -1,7 +1,7 @@
 # Loctree CI - Codebase Health Analysis
 # Uses loctree 0.8.0+ for dead code detection, circular imports, and health scoring
 #
-# Created by M&K (c)2025 The LibraxisAI Team
+# Vibecrafted with AI Agents by VetCoders (c)2025 The LibraxisAI Team
 # Co-Authored-By: Maciej <void@div0.space> & Klaudiusz <the1st@whoai.am>
 
 name: Loctree CI

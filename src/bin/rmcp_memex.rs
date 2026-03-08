@@ -11,10 +11,11 @@ use tracing_subscriber::FmtSubscriber;
 use walkdir::WalkDir;
 
 use rmcp_memex::{
-    BM25Config, EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearchResult, HybridSearcher,
-    IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig, ProviderConfig,
-    QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation, ServerConfig,
-    SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, path_utils, run_wizard,
+    BM25Config, EmbeddingClient, EmbeddingConfig, HealthChecker, HybridConfig, HybridSearchResult,
+    HybridSearcher, IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig,
+    ProviderConfig, QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation,
+    ServerConfig, SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, path_utils,
+    run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -56,7 +57,7 @@ fn discover_config() -> Option<String> {
 fn load_file_config(path: &str) -> Result<FileConfig> {
     let expanded = shellexpand::tilde(path).to_string();
     // This is the START of path validation - canonicalize resolves symlinks
-    let canonical = std::path::Path::new(&expanded) // nosemgrep
+    let canonical = std::path::Path::new(&expanded)
         .canonicalize()
         .map_err(|e| anyhow::anyhow!("Cannot resolve config path '{}': {}", path, e))?;
 
@@ -84,7 +85,7 @@ fn load_file_config(path: &str) -> Result<FileConfig> {
     }
 
     // Path is validated above: canonicalized + checked against HOME/CWD
-    let contents = std::fs::read_to_string(&canonical)?; // nosemgrep
+    let contents = std::fs::read_to_string(&canonical)?;
     toml::from_str(&contents).map_err(Into::into)
 }
 
@@ -125,6 +126,9 @@ struct FileConfig {
     /// Legacy: MLX embedding server configuration (deprecated)
     #[serde(default)]
     mlx: Option<MlxFileConfig>,
+    /// Automatic maintenance configuration
+    #[serde(default)]
+    maintenance: Option<MaintenanceFileConfig>,
 }
 
 /// New embedding configuration from TOML
@@ -200,17 +204,37 @@ impl MlxFileConfig {
     /// Convert legacy config to MlxConfig for backward compat
     fn to_mlx_config(&self) -> MlxConfig {
         let mut config = MlxConfig::from_env();
-        config.merge_file_config(
-            Some(self.disabled),
-            self.local_port,
-            self.dragon_url.clone(),
-            self.dragon_port,
-            self.embedder_model.clone(),
-            self.reranker_model.clone(),
-            self.reranker_port_offset,
-        );
+        config.merge_file_config(rmcp_memex::MlxMergeOptions {
+            disabled: Some(self.disabled),
+            local_port: self.local_port,
+            dragon_url: self.dragon_url.clone(),
+            dragon_port: self.dragon_port,
+            embedder_model: self.embedder_model.clone(),
+            reranker_model: self.reranker_model.clone(),
+            reranker_port_offset: self.reranker_port_offset,
+        });
         config
     }
+}
+
+/// Maintenance configuration for automatic optimization
+#[derive(serde::Deserialize, Default, Clone)]
+struct MaintenanceFileConfig {
+    /// Enable automatic optimization when version threshold is exceeded
+    #[serde(default)]
+    auto_optimize: bool,
+
+    /// Number of versions that triggers automatic optimization (default: 50)
+    #[serde(default = "default_version_threshold")]
+    version_threshold: usize,
+
+    /// Automatically cleanup versions older than N days (optional)
+    #[serde(default)]
+    auto_cleanup_days: Option<u64>,
+}
+
+fn default_version_threshold() -> usize {
+    50
 }
 
 impl FileConfig {
@@ -620,6 +644,79 @@ enum Commands {
     /// and reduce file descriptor usage.
     Optimize,
 
+    /// Show database health status and recommendations
+    ///
+    /// Checks database connectivity, embedder availability, namespace stats,
+    /// and provides maintenance recommendations.
+    ///
+    /// Examples:
+    ///   rmcp-memex health            # Full health check
+    ///   rmcp-memex health --quick    # Skip embedder check (faster)
+    ///   rmcp-memex health --json     # JSON output for scripting
+    Health {
+        /// Skip embedder connectivity check (faster, DB-only)
+        #[arg(long, short = 'q')]
+        quick: bool,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recall memories about a topic with synthesized summary
+    ///
+    /// Searches your memories and presents results as a coherent summary,
+    /// using the onion slice architecture (outer layers = summaries).
+    ///
+    /// Examples:
+    ///   rmcp-memex recall "Vista architecture"          # Search all namespaces
+    ///   rmcp-memex recall "dragon setup" -n memories    # Specific namespace
+    ///   rmcp-memex recall "auth flow" --limit 20        # More sources
+    Recall {
+        /// What to recall (search query)
+        query: String,
+
+        /// Limit to specific namespace (default: search all)
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Maximum number of sources to consider (default: 10)
+        #[arg(long, short = 'l', default_value = "10")]
+        limit: usize,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show timeline of indexed content
+    ///
+    /// Displays when documents were indexed, grouped by month.
+    /// Useful for understanding temporal coverage of your memory.
+    ///
+    /// Examples:
+    ///   rmcp-memex timeline                           # All namespaces
+    ///   rmcp-memex timeline -n memories               # Specific namespace
+    ///   rmcp-memex timeline -n memories --since 30d   # Last 30 days
+    ///   rmcp-memex timeline --gaps                    # Show only gaps
+    Timeline {
+        /// Filter to specific namespace (default: all namespaces)
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Show entries since this time (e.g., "30d", "2025-01", "2024-12-01")
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Only show gaps in the timeline (days with no indexed content)
+        #[arg(long)]
+        gaps: bool,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Compact database files into larger chunks
     ///
     /// Merges small data files into larger ones for better read performance.
@@ -817,6 +914,29 @@ enum Commands {
         json: bool,
     },
 
+    /// Delete all documents in a namespace (DESTRUCTIVE)
+    ///
+    /// Permanently removes all chunks from the specified namespace.
+    /// This action cannot be undone - use with caution!
+    ///
+    /// Examples:
+    ///   rmcp-memex purge-namespace -n garbage
+    ///   rmcp-memex purge-namespace -n old-data --confirm
+    #[command(alias = "purge")]
+    PurgeNamespace {
+        /// Namespace to purge
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Skip confirmation prompt (use with caution!)
+        #[arg(long)]
+        confirm: bool,
+
+        /// Output results as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Import documents from JSONL file into a namespace
     ///
     /// Reads documents exported with 'export' command and stores them.
@@ -841,6 +961,59 @@ enum Commands {
         /// Database path override
         #[arg(long)]
         db_path: Option<String>,
+    },
+
+    /// Audit database quality and text integrity
+    ///
+    /// Analyzes namespaces for embedding quality, text integrity (>90% target),
+    /// and provides recommendations for cleanup.
+    ///
+    /// Examples:
+    ///   rmcp-memex audit                    # Audit all namespaces
+    ///   rmcp-memex audit -n memories        # Audit specific namespace
+    ///   rmcp-memex audit --threshold 85     # Custom quality threshold
+    ///   rmcp-memex audit --json             # JSON output for scripting
+    #[command(alias = "quality")]
+    Audit {
+        /// Specific namespace to audit (default: all namespaces)
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Minimum quality threshold (0-100, default: 90)
+        #[arg(long, default_value = "90")]
+        threshold: u8,
+
+        /// Show detailed metrics for each chunk (verbose)
+        #[arg(long, short = 'v')]
+        verbose: bool,
+
+        /// Output results as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Purge low-quality namespaces based on audit results
+    ///
+    /// Removes namespaces that fall below the quality threshold.
+    /// Always runs in dry-run mode unless --confirm is passed.
+    ///
+    /// Examples:
+    ///   rmcp-memex purge-quality                      # Dry run with 90% threshold
+    ///   rmcp-memex purge-quality --threshold 80      # Lower threshold
+    ///   rmcp-memex purge-quality --confirm           # Actually delete
+    #[command(alias = "purge-low-quality")]
+    PurgeQuality {
+        /// Minimum quality threshold (0-100, default: 90)
+        #[arg(long, default_value = "90")]
+        threshold: u8,
+
+        /// Actually delete namespaces (default: dry-run)
+        #[arg(long)]
+        confirm: bool,
+
+        /// Output results as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1176,9 +1349,39 @@ fn json_hybrid_search_results(
     })
 }
 
-/// Run semantic search within a namespace
-#[allow(clippy::too_many_arguments)] // CLI entry point - args from clap parser
-async fn run_search(
+/// Check if auto-optimization should run and execute if needed
+async fn check_and_maybe_optimize(
+    storage: &StorageManager,
+    maintenance_config: &Option<MaintenanceFileConfig>,
+) -> Result<bool> {
+    let config = match maintenance_config {
+        Some(c) if c.auto_optimize => c,
+        _ => return Ok(false), // Auto-optimize disabled
+    };
+
+    let stats = storage.stats().await?;
+
+    if stats.version_count > config.version_threshold {
+        eprintln!(
+            "Auto-optimizing: {} versions exceed threshold {}",
+            stats.version_count, config.version_threshold
+        );
+        storage.optimize().await?;
+
+        // Also run cleanup if configured
+        if let Some(days) = config.auto_cleanup_days {
+            storage.cleanup(Some(days)).await?;
+        }
+
+        eprintln!("Auto-optimization complete");
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+/// Configuration for semantic search
+struct SearchConfig<'a> {
     namespace: String,
     query: String,
     limit: usize,
@@ -1186,8 +1389,21 @@ async fn run_search(
     db_path: String,
     layer_filter: Option<SliceLayer>,
     search_mode: SearchMode,
-    embedding_config: &EmbeddingConfig,
-) -> Result<()> {
+    embedding_config: &'a EmbeddingConfig,
+}
+
+/// Run semantic search within a namespace
+async fn run_search(config: SearchConfig<'_>) -> Result<()> {
+    let SearchConfig {
+        namespace,
+        query,
+        limit,
+        json_output,
+        db_path,
+        layer_filter,
+        search_mode,
+        embedding_config,
+    } = config;
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
 
@@ -1798,6 +2014,756 @@ async fn run_overview(namespace: Option<String>, json_output: bool, db_path: Str
     Ok(())
 }
 
+/// Health check result for JSON output
+#[derive(Debug, Clone, Serialize)]
+struct HealthReport {
+    database: DatabaseHealth,
+    embedder: Option<EmbedderHealth>,
+    namespaces: Vec<NamespaceHealth>,
+    recommendations: Vec<String>,
+    overall_status: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DatabaseHealth {
+    path: String,
+    status: String,
+    row_count: usize,
+    version_count: usize,
+    size_estimate_mb: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EmbedderHealth {
+    provider: Option<String>,
+    status: String,
+    dimension: Option<usize>,
+    dimension_match: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NamespaceHealth {
+    name: String,
+    chunk_count: usize,
+}
+
+/// Run health check command
+async fn run_health(
+    db_path: String,
+    embedding_config: &EmbeddingConfig,
+    config_path_display: Option<String>,
+    quick: bool,
+    json_output: bool,
+) -> Result<()> {
+    let mut recommendations = Vec::new();
+    let mut overall_ok = true;
+
+    // 1. Database health
+    let db_health = match StorageManager::new_lance_only(&db_path).await {
+        Ok(storage) => {
+            let stats = storage.stats().await.unwrap_or(rmcp_memex::TableStats {
+                row_count: 0,
+                version_count: 0,
+                table_name: "memories".to_string(),
+                db_path: db_path.clone(),
+            });
+
+            // Estimate size: ~4KB per row (embedding + metadata)
+            let size_mb = (stats.row_count as f64 * 4.0) / 1024.0;
+
+            // Check version count threshold
+            if stats.version_count > 50 {
+                recommendations.push(format!(
+                    "Run 'rmcp-memex optimize' ({} versions accumulated)",
+                    stats.version_count
+                ));
+            }
+
+            DatabaseHealth {
+                path: db_path.clone(),
+                status: "OK".to_string(),
+                row_count: stats.row_count,
+                version_count: stats.version_count,
+                size_estimate_mb: size_mb,
+            }
+        }
+        Err(e) => {
+            overall_ok = false;
+            recommendations.push(format!("Database error: {}", e));
+            DatabaseHealth {
+                path: db_path.clone(),
+                status: format!("ERROR: {}", e),
+                row_count: 0,
+                version_count: 0,
+                size_estimate_mb: 0.0,
+            }
+        }
+    };
+
+    // 2. Embedder health (skip if --quick)
+    let embedder_health = if quick {
+        None
+    } else {
+        let checker = HealthChecker::new();
+        let result = checker.run_all(embedding_config, &db_path).await;
+
+        let provider = result.connected_provider.clone();
+        let dimension = result.verified_dimension;
+        let dim_ok = dimension
+            .map(|d| d == embedding_config.required_dimension)
+            .unwrap_or(false);
+
+        let status = if result.all_passed() {
+            "OK".to_string()
+        } else {
+            overall_ok = false;
+            let failures: Vec<_> = result
+                .items
+                .iter()
+                .filter(|i| i.status.is_fail())
+                .map(|i| i.name.clone())
+                .collect();
+            if provider.is_none() {
+                recommendations
+                    .push("Embedder unreachable - check if embedding server is running".to_string());
+            }
+            format!("FAILED: {}", failures.join(", "))
+        };
+
+        Some(EmbedderHealth {
+            provider,
+            status,
+            dimension,
+            dimension_match: dim_ok,
+        })
+    };
+
+    // 3. Namespace stats
+    let namespaces = if let Ok(storage) = StorageManager::new_lance_only(&db_path).await {
+        storage
+            .list_namespaces()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, count)| NamespaceHealth {
+                name,
+                chunk_count: count,
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Build report
+    let overall_status = if overall_ok && recommendations.is_empty() {
+        "HEALTHY".to_string()
+    } else if overall_ok {
+        "OK (with recommendations)".to_string()
+    } else {
+        "UNHEALTHY".to_string()
+    };
+
+    let report = HealthReport {
+        database: db_health,
+        embedder: embedder_health,
+        namespaces,
+        recommendations: recommendations.clone(),
+        overall_status: overall_status.clone(),
+    };
+
+    // Output
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        // Config info
+        if let Some(ref path) = config_path_display {
+            eprintln!("Config: {}", path);
+        }
+        eprintln!();
+
+        // Database section
+        eprintln!("Database: {}", report.database.path);
+        eprintln!("  Status:   {}", report.database.status);
+        eprintln!("  Rows:     {}", report.database.row_count);
+        eprintln!("  Versions: {}", report.database.version_count);
+        eprintln!("  Size:     ~{:.1} MB (estimate)", report.database.size_estimate_mb);
+        eprintln!();
+
+        // Embedder section
+        if let Some(ref emb) = report.embedder {
+            eprintln!("Embedder:");
+            eprintln!("  Status:    {}", emb.status);
+            if let Some(ref provider) = emb.provider {
+                eprintln!("  Provider:  {}", provider);
+            }
+            if let Some(dim) = emb.dimension {
+                let check = if emb.dimension_match { "[OK]" } else { "[MISMATCH]" };
+                eprintln!("  Dimension: {} {}", dim, check);
+            }
+            eprintln!();
+        } else if quick {
+            eprintln!("Embedder: (skipped with --quick)");
+            eprintln!();
+        }
+
+        // Namespaces section
+        if !report.namespaces.is_empty() {
+            eprintln!("Namespaces:");
+            for ns in &report.namespaces {
+                eprintln!("  {}: {} chunks", ns.name, ns.chunk_count);
+            }
+            eprintln!();
+        }
+
+        // Recommendations
+        if report.recommendations.is_empty() {
+            eprintln!("Status: {} - No action needed", overall_status);
+        } else {
+            eprintln!("Recommendations:");
+            for rec in &report.recommendations {
+                eprintln!("  - {}", rec);
+            }
+            eprintln!();
+            eprintln!("Status: {}", overall_status);
+        }
+    }
+
+    Ok(())
+}
+
+/// Recall result for JSON output
+#[derive(Debug, Clone, Serialize)]
+struct RecallReport {
+    query: String,
+    summary: String,
+    sources: Vec<RecallSource>,
+    related: Vec<RecallRelated>,
+    total_chunks: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallSource {
+    namespace: String,
+    source: Option<String>,
+    date: Option<String>,
+    preview: String,
+    score: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecallRelated {
+    title: String,
+    date: Option<String>,
+    namespace: String,
+}
+
+/// Run recall command - synthesized search results
+async fn run_recall(
+    query: String,
+    namespace_filter: Option<String>,
+    limit: usize,
+    json_output: bool,
+    db_path: String,
+    embedding_config: &EmbeddingConfig,
+) -> Result<()> {
+    use std::collections::HashMap;
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
+    storage.ensure_collection().await?;
+
+    let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
+    let rag = RAGPipeline::new(embedding_client, storage.clone()).await?;
+
+    // Get namespaces to search
+    let namespaces: Vec<String> = if let Some(ref ns) = namespace_filter {
+        vec![ns.clone()]
+    } else {
+        storage
+            .list_namespaces()
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+
+    if namespaces.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "No namespaces found",
+                    "query": query,
+                })
+            );
+        } else {
+            eprintln!("No namespaces found in database");
+        }
+        return Ok(());
+    }
+
+    // Search each namespace for outer layer results (summaries)
+    let mut all_results: Vec<(String, rmcp_memex::SearchResult)> = Vec::new();
+
+    for ns in &namespaces {
+        // Search specifically for outer layer (summaries)
+        let results = rag
+            .memory_search_with_layer(ns, &query, limit, Some(SliceLayer::Outer))
+            .await?;
+
+        for r in results {
+            all_results.push((ns.clone(), r));
+        }
+    }
+
+    // Sort by score (best first)
+    all_results.sort_by(|a, b| {
+        b.1.score
+            .partial_cmp(&a.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Take top results
+    let top_results: Vec<_> = all_results.into_iter().take(limit).collect();
+
+    if top_results.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "query": query,
+                    "summary": "No relevant memories found",
+                    "sources": [],
+                    "related": [],
+                    "total_chunks": 0,
+                })
+            );
+        } else {
+            eprintln!("No relevant memories found for: \"{}\"", query);
+        }
+        return Ok(());
+    }
+
+    // Build summary from top outer slices
+    let mut summary_parts: Vec<String> = Vec::new();
+    let mut sources: Vec<RecallSource> = Vec::new();
+    let mut seen_sources: HashMap<String, bool> = HashMap::new();
+
+    for (ns, result) in &top_results {
+        // Extract source file
+        let source = result
+            .metadata
+            .get("source")
+            .and_then(|v| v.as_str())
+            .or_else(|| result.metadata.get("file_path").and_then(|v| v.as_str()))
+            .map(|s| {
+                std::path::Path::new(s)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(s)
+                    .to_string()
+            });
+
+        let date = result
+            .metadata
+            .get("indexed_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| result.metadata.get("timestamp").and_then(|v| v.as_str()))
+            .map(|s| s.split('T').next().unwrap_or(s).to_string());
+
+        // Add to summary (first few, avoiding duplicates)
+        let source_key = format!("{}-{:?}", ns, source);
+        if !seen_sources.contains_key(&source_key) && summary_parts.len() < 5 {
+            // Use the text directly as it's already a summary (outer layer)
+            let text = result.text.trim();
+            if !text.is_empty() && text.len() > 20 {
+                summary_parts.push(text.to_string());
+            }
+            seen_sources.insert(source_key, true);
+        }
+
+        // Build preview
+        let preview: String = result.text.chars().take(150).collect();
+        let preview = if result.text.len() > 150 {
+            format!("{}...", preview.trim())
+        } else {
+            preview.trim().to_string()
+        };
+
+        sources.push(RecallSource {
+            namespace: ns.clone(),
+            source,
+            date,
+            preview,
+            score: result.score,
+        });
+    }
+
+    // Build related items (unique sources/dates)
+    let mut related: Vec<RecallRelated> = Vec::new();
+    let mut seen_related: HashMap<String, bool> = HashMap::new();
+
+    for source in &sources {
+        let key = format!("{:?}-{:?}", source.source, source.date);
+        if let std::collections::hash_map::Entry::Vacant(e) = seen_related.entry(key) {
+            related.push(RecallRelated {
+                title: source.source.clone().unwrap_or_else(|| "Unknown".to_string()),
+                date: source.date.clone(),
+                namespace: source.namespace.clone(),
+            });
+            e.insert(true);
+        }
+    }
+
+    // Combine summary parts
+    let summary = if summary_parts.is_empty() {
+        "Found relevant memories but no clear summary available.".to_string()
+    } else {
+        summary_parts.join("\n\n")
+    };
+
+    let report = RecallReport {
+        query: query.clone(),
+        summary,
+        sources,
+        related,
+        total_chunks: top_results.len(),
+    };
+
+    // Output
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        eprintln!("Recall: \"{}\"", query);
+        eprintln!();
+
+        eprintln!("Based on {} relevant memories:", report.total_chunks);
+        eprintln!();
+
+        // Print summary
+        for part in report.summary.lines().take(20) {
+            eprintln!("  {}", part);
+        }
+        eprintln!();
+
+        // Print related discussions
+        if !report.related.is_empty() {
+            eprintln!("Related discussions:");
+            for r in report.related.iter().take(5) {
+                let date_str = r.date.as_deref().unwrap_or("unknown date");
+                eprintln!("  - \"{}\" ({}) [{}]", r.title, date_str, r.namespace);
+            }
+            if report.related.len() > 5 {
+                eprintln!("  ... and {} more", report.related.len() - 5);
+            }
+            eprintln!();
+        }
+
+        // Namespace breakdown
+        let mut ns_counts: HashMap<String, usize> = HashMap::new();
+        for s in &report.sources {
+            *ns_counts.entry(s.namespace.clone()).or_default() += 1;
+        }
+        let ns_summary: Vec<_> = ns_counts
+            .iter()
+            .map(|(k, v)| format!("{} from {}", v, k))
+            .collect();
+        eprintln!("Sources: {}", ns_summary.join(", "));
+    }
+
+    Ok(())
+}
+
+/// Timeline entry for JSON output
+#[derive(Debug, Clone, Serialize)]
+struct TimelineEntry {
+    date: String,
+    namespace: String,
+    source: Option<String>,
+    chunk_count: usize,
+}
+
+/// Timeline report for JSON output
+#[derive(Debug, Clone, Serialize)]
+struct TimelineReport {
+    namespaces: Vec<String>,
+    entries: Vec<TimelineEntry>,
+    coverage: TimelineCoverage,
+    gaps: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineCoverage {
+    earliest: Option<String>,
+    latest: Option<String>,
+    total_days: usize,
+    days_with_data: usize,
+}
+
+/// Run timeline command - show when content was indexed
+async fn run_timeline(
+    db_path: String,
+    namespace_filter: Option<String>,
+    since: Option<String>,
+    show_gaps_only: bool,
+    json_output: bool,
+) -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+
+    // Get namespaces to query
+    let namespaces: Vec<String> = if let Some(ref ns) = namespace_filter {
+        vec![ns.clone()]
+    } else {
+        storage
+            .list_namespaces()
+            .await?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+
+    if namespaces.is_empty() {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "error": "No namespaces found",
+                    "namespaces": [],
+                    "entries": [],
+                })
+            );
+        } else {
+            eprintln!("No namespaces found in database");
+        }
+        return Ok(());
+    }
+
+    // Parse since filter
+    let since_date: Option<chrono::NaiveDate> = since.as_ref().and_then(|s| {
+        // Try parsing as duration like "30d"
+        if let Some(days_str) = s.strip_suffix('d')
+            && let Ok(days) = days_str.parse::<i64>() {
+                return Some(
+                    (chrono::Utc::now() - chrono::Duration::days(days))
+                        .date_naive(),
+                );
+            }
+        // Try parsing as YYYY-MM
+        if s.len() == 7 && s.chars().nth(4) == Some('-')
+            && let Ok(date) = chrono::NaiveDate::parse_from_str(&format!("{}-01", s), "%Y-%m-%d") {
+                return Some(date);
+            }
+        // Try parsing as full date
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+    });
+
+    // Collect timeline data: date -> namespace -> source -> count
+    let mut timeline: BTreeMap<String, BTreeMap<String, BTreeMap<String, usize>>> = BTreeMap::new();
+    let mut all_dates: BTreeSet<String> = BTreeSet::new();
+
+    for ns_name in &namespaces {
+        let docs = storage.get_all_in_namespace(ns_name).await?;
+
+        for doc in docs {
+            // Extract indexed_at from metadata
+            let indexed_at = doc
+                .metadata
+                .get("indexed_at")
+                .and_then(|v| v.as_str())
+                .or_else(|| doc.metadata.get("timestamp").and_then(|v| v.as_str()));
+
+            let date_str = if let Some(ts) = indexed_at {
+                // Parse ISO timestamp and extract date
+                ts.split('T').next().unwrap_or("unknown").to_string()
+            } else {
+                "unknown".to_string()
+            };
+
+            // Apply since filter
+            if let Some(since_d) = since_date
+                && let Ok(doc_date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                    && doc_date < since_d {
+                        continue;
+                    }
+
+            all_dates.insert(date_str.clone());
+
+            // Extract source from metadata
+            let source = doc
+                .metadata
+                .get("source")
+                .and_then(|v| v.as_str())
+                .or_else(|| doc.metadata.get("file_path").and_then(|v| v.as_str()))
+                .map(|s| {
+                    // Extract filename from path
+                    std::path::Path::new(s)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(s)
+                        .to_string()
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+
+            *timeline
+                .entry(date_str)
+                .or_default()
+                .entry(ns_name.clone())
+                .or_default()
+                .entry(source)
+                .or_default() += 1;
+        }
+    }
+
+    // Build entries list for JSON
+    let mut entries: Vec<TimelineEntry> = Vec::new();
+    for (date, ns_map) in &timeline {
+        for (ns, source_map) in ns_map {
+            for (source, count) in source_map {
+                entries.push(TimelineEntry {
+                    date: date.clone(),
+                    namespace: ns.clone(),
+                    source: Some(source.clone()),
+                    chunk_count: *count,
+                });
+            }
+        }
+    }
+
+    // Calculate coverage
+    let dates_vec: Vec<&String> = all_dates.iter().collect();
+    let earliest = dates_vec.first().map(|s| (*s).clone());
+    let latest = dates_vec.last().map(|s| (*s).clone());
+
+    // Find gaps (consecutive dates with no data)
+    let mut gaps: Vec<String> = Vec::new();
+    if dates_vec.len() >= 2 {
+        let sorted_dates: Vec<chrono::NaiveDate> = dates_vec
+            .iter()
+            .filter_map(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .collect();
+
+        for window in sorted_dates.windows(2) {
+            let diff = (window[1] - window[0]).num_days();
+            if diff > 1 {
+                gaps.push(format!(
+                    "{} to {} ({} days)",
+                    window[0].format("%Y-%m-%d"),
+                    window[1].format("%Y-%m-%d"),
+                    diff - 1
+                ));
+            }
+        }
+    }
+
+    let coverage = TimelineCoverage {
+        earliest,
+        latest,
+        total_days: if dates_vec.len() >= 2 {
+            dates_vec
+                .first()
+                .and_then(|e| chrono::NaiveDate::parse_from_str(e, "%Y-%m-%d").ok())
+                .zip(
+                    dates_vec
+                        .last()
+                        .and_then(|l| chrono::NaiveDate::parse_from_str(l, "%Y-%m-%d").ok()),
+                )
+                .map(|(e, l)| (l - e).num_days() as usize + 1)
+                .unwrap_or(0)
+        } else {
+            dates_vec.len()
+        },
+        days_with_data: all_dates.len(),
+    };
+
+    let report = TimelineReport {
+        namespaces: namespaces.clone(),
+        entries,
+        coverage,
+        gaps: gaps.clone(),
+    };
+
+    // Output
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if show_gaps_only {
+        // Only show gaps
+        if gaps.is_empty() {
+            eprintln!("No gaps found in timeline");
+        } else {
+            eprintln!("Timeline Gaps:");
+            for gap in &gaps {
+                eprintln!("  - {}", gap);
+            }
+        }
+    } else {
+        // Full timeline grouped by month
+        eprintln!("Timeline: {} namespace(s)", namespaces.len());
+        if let Some(ref ns) = namespace_filter {
+            eprintln!("  Namespace: {}", ns);
+        }
+        eprintln!();
+
+        // Group by year-month
+        let mut by_month: BTreeMap<String, Vec<(String, String, usize)>> = BTreeMap::new();
+        for (date, ns_map) in &timeline {
+            let month = if date.len() >= 7 {
+                date[..7].to_string()
+            } else {
+                date.clone()
+            };
+
+            for (ns, source_map) in ns_map {
+                let total: usize = source_map.values().sum();
+                let sources: Vec<_> = source_map.keys().take(3).cloned().collect();
+                let source_str = if sources.len() < source_map.len() {
+                    format!("{} (+{} more)", sources.join(", "), source_map.len() - sources.len())
+                } else {
+                    sources.join(", ")
+                };
+                by_month
+                    .entry(month.clone())
+                    .or_default()
+                    .push((date.clone(), format!("[{}] {} ({})", ns, source_str, total), total));
+            }
+        }
+
+        for (month, entries) in by_month {
+            eprintln!("{}:", month);
+            for (date, desc, _) in entries.iter().take(10) {
+                eprintln!("  {}: {}", date, desc);
+            }
+            if entries.len() > 10 {
+                eprintln!("  ... and {} more entries", entries.len() - 10);
+            }
+            eprintln!();
+        }
+
+        // Coverage summary
+        eprintln!("Coverage:");
+        if let (Some(e), Some(l)) = (&report.coverage.earliest, &report.coverage.latest) {
+            eprintln!("  Period: {} to {}", e, l);
+        }
+        eprintln!(
+            "  Days with data: {} / {} total",
+            report.coverage.days_with_data, report.coverage.total_days
+        );
+
+        if !gaps.is_empty() {
+            eprintln!();
+            eprintln!("Gaps ({}):", gaps.len());
+            for gap in gaps.iter().take(5) {
+                eprintln!("  - {}", gap);
+            }
+            if gaps.len() > 5 {
+                eprintln!("  ... and {} more gaps", gaps.len() - 5);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Run dive command - deep exploration with all onion layers
 async fn run_dive(
     namespace: String,
@@ -2180,7 +3146,6 @@ async fn run_import(
     // 1. Checks for path traversal sequences (.., null bytes, newlines)
     // 2. Canonicalizes the path (resolves symlinks)
     // 3. Validates the path is under allowed directories (home, /tmp, /var/folders)
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let content = tokio::fs::read_to_string(&validated_input).await?;
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
 
@@ -2304,6 +3269,297 @@ async fn run_import(
     Ok(())
 }
 
+// =============================================================================
+// AUDIT & PURGE QUALITY COMMANDS
+// =============================================================================
+
+/// Namespace audit result with quality metrics
+#[derive(Debug, Serialize)]
+struct NamespaceAuditResult {
+    namespace: String,
+    document_count: usize,
+    avg_chunk_length: usize,
+    sentence_integrity: f32,
+    word_integrity: f32,
+    chunk_quality: f32,
+    overall_score: f32,
+    recommendation: String,
+    passes_threshold: bool,
+}
+
+/// Run audit on namespaces to check quality metrics
+async fn run_audit(
+    namespace: Option<String>,
+    threshold: u8,
+    verbose: bool,
+    json: bool,
+    db_path: String,
+) -> Result<()> {
+    use rmcp_memex::{IntegrityRecommendation, TextIntegrityMetrics};
+
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+
+    // Get namespaces to audit (list_namespaces returns Vec<(String, usize)>)
+    let namespaces: Vec<String> = if let Some(ns) = namespace {
+        vec![ns]
+    } else {
+        storage.list_namespaces().await?.into_iter().map(|(name, _count)| name).collect()
+    };
+
+    if namespaces.is_empty() {
+        if json {
+            println!(r#"{{"namespaces": [], "summary": {{"total": 0}}}}"#);
+        } else {
+            eprintln!("No namespaces found in database");
+        }
+        return Ok(());
+    }
+
+    let threshold_f32 = threshold as f32 / 100.0;
+    let mut results: Vec<NamespaceAuditResult> = Vec::new();
+
+    if !json {
+        eprintln!("Auditing {} namespace(s) with {}% quality threshold...\n", namespaces.len(), threshold);
+    }
+
+    for ns in &namespaces {
+        // Get all documents in namespace
+        let docs = storage.get_all_in_namespace(ns).await?;
+
+        if docs.is_empty() {
+            results.push(NamespaceAuditResult {
+                namespace: ns.clone(),
+                document_count: 0,
+                avg_chunk_length: 0,
+                sentence_integrity: 0.0,
+                word_integrity: 0.0,
+                chunk_quality: 0.0,
+                overall_score: 0.0,
+                recommendation: "EMPTY".to_string(),
+                passes_threshold: false,
+            });
+            continue;
+        }
+
+        // Extract text from documents and compute metrics (ChromaDocument has `document` field)
+        let chunks: Vec<String> = docs.iter().map(|d| d.document.clone()).collect();
+        let combined_text = chunks.join(" ");
+
+        let metrics = TextIntegrityMetrics::compute(&combined_text, &chunks);
+        let passes = metrics.overall >= threshold_f32;
+
+        let recommendation = match metrics.recommendation() {
+            IntegrityRecommendation::Excellent => "EXCELLENT",
+            IntegrityRecommendation::Good => "GOOD",
+            IntegrityRecommendation::Warn => "WARN",
+            IntegrityRecommendation::Purge => "PURGE",
+        };
+
+        results.push(NamespaceAuditResult {
+            namespace: ns.clone(),
+            document_count: docs.len(),
+            avg_chunk_length: metrics.avg_chunk_length,
+            sentence_integrity: metrics.sentence_integrity,
+            word_integrity: metrics.word_integrity,
+            chunk_quality: metrics.chunk_quality,
+            overall_score: metrics.overall,
+            recommendation: recommendation.to_string(),
+            passes_threshold: passes,
+        });
+
+        if verbose && !json {
+            eprintln!("Namespace: {}", ns);
+            eprintln!("  Documents: {}", docs.len());
+            eprintln!("  {}", metrics);
+            eprintln!();
+        }
+    }
+
+    // Output results
+    if json {
+        let passing = results.iter().filter(|r| r.passes_threshold).count();
+        let failing = results.len() - passing;
+
+        let output = serde_json::json!({
+            "namespaces": results,
+            "summary": {
+                "total": results.len(),
+                "passing": passing,
+                "failing": failing,
+                "threshold": threshold
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        // Human-readable output
+        println!("╔════════════════════════════════════════════════════════════════╗");
+        println!("║                    NAMESPACE QUALITY AUDIT                     ║");
+        println!("╠════════════════════════════════════════════════════════════════╣");
+        println!("║ {:30} │ {:>6} │ {:>6} │ {:>8} ║", "Namespace", "Docs", "Score", "Status");
+        println!("╠════════════════════════════════════════════════════════════════╣");
+
+        for result in &results {
+            let status_icon = if result.passes_threshold { "✅" } else { "❌" };
+            let ns_display = if result.namespace.len() > 28 {
+                format!("{}...", &result.namespace[..25])
+            } else {
+                result.namespace.clone()
+            };
+
+            println!(
+                "║ {:30} │ {:>6} │ {:>5.1}% │ {} {:>6} ║",
+                ns_display,
+                result.document_count,
+                result.overall_score * 100.0,
+                status_icon,
+                result.recommendation
+            );
+        }
+
+        println!("╚════════════════════════════════════════════════════════════════╝");
+
+        let passing = results.iter().filter(|r| r.passes_threshold).count();
+        let failing = results.len() - passing;
+
+        println!();
+        println!("Summary: {} passing, {} failing (threshold: {}%)", passing, failing, threshold);
+
+        if failing > 0 {
+            println!();
+            println!("Namespaces below threshold:");
+            for result in results.iter().filter(|r| !r.passes_threshold) {
+                println!(
+                    "  - {} ({:.1}% quality, {} docs)",
+                    result.namespace,
+                    result.overall_score * 100.0,
+                    result.document_count
+                );
+            }
+            println!();
+            println!("Run 'rmcp-memex purge-quality --threshold {}' to remove low-quality namespaces", threshold);
+        }
+    }
+
+    Ok(())
+}
+
+/// Purge namespaces below quality threshold
+async fn run_purge_quality(
+    threshold: u8,
+    confirm: bool,
+    json: bool,
+    db_path: String,
+) -> Result<()> {
+    use rmcp_memex::TextIntegrityMetrics;
+
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+    // list_namespaces returns Vec<(String, usize)>
+    let namespace_list = storage.list_namespaces().await?;
+
+    if namespace_list.is_empty() {
+        if json {
+            println!(r#"{{"purged": [], "dry_run": {}}}"#, !confirm);
+        } else {
+            eprintln!("No namespaces found in database");
+        }
+        return Ok(());
+    }
+
+    let threshold_f32 = threshold as f32 / 100.0;
+    let mut to_purge: Vec<(String, f32, usize)> = Vec::new();
+
+    if !json {
+        eprintln!("Analyzing {} namespace(s) with {}% quality threshold...\n", namespace_list.len(), threshold);
+    }
+
+    for (ns, _count) in &namespace_list {
+        let docs = storage.get_all_in_namespace(ns).await?;
+
+        if docs.is_empty() {
+            to_purge.push((ns.clone(), 0.0, 0));
+            continue;
+        }
+
+        // ChromaDocument has `document` field, not `text`
+        let chunks: Vec<String> = docs.iter().map(|d| d.document.clone()).collect();
+        let combined_text = chunks.join(" ");
+        let metrics = TextIntegrityMetrics::compute(&combined_text, &chunks);
+
+        if metrics.overall < threshold_f32 {
+            to_purge.push((ns.clone(), metrics.overall, docs.len()));
+        }
+    }
+
+    if to_purge.is_empty() {
+        if json {
+            println!(r#"{{"purged": [], "message": "All namespaces pass quality threshold"}}"#);
+        } else {
+            println!("All namespaces pass the {}% quality threshold. Nothing to purge.", threshold);
+        }
+        return Ok(());
+    }
+
+    if json {
+        let output = serde_json::json!({
+            "dry_run": !confirm,
+            "threshold": threshold,
+            "to_purge": to_purge.iter().map(|(ns, score, count)| {
+                serde_json::json!({
+                    "namespace": ns,
+                    "quality_score": score,
+                    "document_count": count
+                })
+            }).collect::<Vec<_>>()
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+
+        if !confirm {
+            return Ok(());
+        }
+    } else {
+        println!("Found {} namespace(s) below {}% quality threshold:", to_purge.len(), threshold);
+        for (ns, score, count) in &to_purge {
+            println!("  - {} ({:.1}% quality, {} docs)", ns, score * 100.0, count);
+        }
+        println!();
+
+        if !confirm {
+            println!("DRY RUN - No changes made.");
+            println!("Run with --confirm to actually delete these namespaces.");
+            return Ok(());
+        }
+    }
+
+    // Actually purge if confirmed (use purge_namespace, not delete_namespace)
+    let mut purged_count = 0;
+    for (ns, _score, count) in &to_purge {
+        if !json {
+            eprint!("Purging '{}' ({} docs)... ", ns, count);
+        }
+
+        match storage.purge_namespace(ns).await {
+            Ok(_) => {
+                purged_count += 1;
+                if !json {
+                    eprintln!("done");
+                }
+            }
+            Err(e) => {
+                if !json {
+                    eprintln!("ERROR: {}", e);
+                }
+            }
+        }
+    }
+
+    if !json {
+        println!();
+        println!("Purged {} namespace(s) with quality below {}%", purged_count, threshold);
+    }
+
+    Ok(())
+}
+
 /// Checkpoint for resumable indexing
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexCheckpoint {
@@ -2393,20 +3649,15 @@ struct BatchIndexConfig {
 
 /// Result of indexing a single file (for parallel processing)
 #[derive(Debug)]
-#[allow(dead_code)]
 enum FileIndexResult {
     /// File was indexed successfully
-    Indexed {
-        file_path: PathBuf,
-        chunks: usize,
-        file_bytes: u64,
-    },
+    Indexed,
     /// File was skipped (duplicate content)
-    Skipped { file_path: PathBuf, reason: String },
+    Skipped,
     /// File was skipped (already in checkpoint)
-    SkippedResume { file_path: PathBuf },
+    SkippedResume,
     /// Indexing failed
-    Failed { file_path: PathBuf, error: String },
+    Failed,
 }
 
 /// Run batch indexing with optional pipeline mode for concurrent processing
@@ -2430,7 +3681,6 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     } = config;
     // Expand and canonicalize path - canonicalize validates path exists and resolves symlinks
     let expanded = shellexpand::tilde(path.to_str().unwrap_or("")).to_string();
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let canonical = Path::new(&expanded).canonicalize()?;
 
     // Collect files
@@ -2466,7 +3716,6 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
 
     // Initialize RAG pipeline - db_path is from CLI args or config, validated at load time
     let expanded_db = shellexpand::tilde(&db_path).to_string();
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let db_dir = Path::new(&expanded_db);
     if let Some(parent) = db_dir.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2628,7 +3877,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     if let Some(ref t) = tracker {
                         t.lock().await.file_skipped();
                     }
-                    return FileIndexResult::SkippedResume { file_path };
+                    return FileIndexResult::SkippedResume;
                 }
             }
 
@@ -2714,11 +3963,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         let _ = cp.save(&db_path);
                     }
 
-                    FileIndexResult::Indexed {
-                        file_path,
-                        chunks: chunks_indexed,
-                        file_bytes,
-                    }
+                    FileIndexResult::Indexed
                 }
                 Ok(rmcp_memex::IndexResult::Skipped { reason, .. }) => {
                     // Handle calibration if this was the first file
@@ -2745,7 +3990,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         let _ = cp.save(&db_path);
                     }
 
-                    FileIndexResult::Skipped { file_path, reason }
+                    FileIndexResult::Skipped
                 }
                 Err(e) => {
                     // Handle calibration if this was the first file
@@ -2765,10 +4010,7 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         eprintln!("  -> {} FAILED: {}", display_path, e);
                     }
 
-                    FileIndexResult::Failed {
-                        file_path,
-                        error: e.to_string(),
-                    }
+                    FileIndexResult::Failed
                 }
             };
 
@@ -2809,19 +4051,47 @@ async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         }
     } else {
         eprintln!();
-        eprintln!("Indexing complete:");
-        eprintln!("  New chunks:        {}", total_chunks);
-        eprintln!("  Files indexed:     {}", indexed);
-        if dedup && skipped > 0 {
-            eprintln!("  Skipped (duplicate): {}", skipped);
-        }
-        if skipped_resume > 0 {
-            eprintln!("  Skipped (resumed): {}", skipped_resume);
-        }
-        if failed > 0 {
+
+        // Determine outcome and show appropriate summary
+        let all_skipped = indexed == 0 && skipped > 0 && failed == 0;
+        let all_failed = indexed == 0 && skipped == 0 && failed > 0;
+
+        if all_skipped {
+            eprintln!("Indexing complete: All content already indexed");
+            eprintln!();
+            eprintln!("  Files checked:     {}", total);
+            eprintln!("  Already indexed:   {} (skipped)", skipped);
+            if skipped_resume > 0 {
+                eprintln!("  Resumed from:      {} (checkpoint)", skipped_resume);
+            }
+            eprintln!();
+            eprintln!("  [OK] No new content to index - your memory is up to date!");
+        } else if all_failed {
+            eprintln!("Indexing FAILED: No files were indexed");
+            eprintln!();
+            eprintln!("  Files attempted:   {}", total);
             eprintln!("  Failed:            {}", failed);
+            eprintln!();
+            eprintln!("  [!] Check file permissions and embedding server connectivity");
+        } else {
+            eprintln!("Indexing complete:");
+            eprintln!();
+            eprintln!("  New chunks:        {}", total_chunks);
+            eprintln!("  Files indexed:     {}", indexed);
+            if dedup && skipped > 0 {
+                eprintln!("  Already indexed:   {} (skipped)", skipped);
+            }
+            if skipped_resume > 0 {
+                eprintln!("  Resumed from:      {} (checkpoint)", skipped_resume);
+            }
+            if failed > 0 {
+                eprintln!("  Failed:            {}", failed);
+            }
+            eprintln!("  Total processed:   {}", total);
         }
-        eprintln!("  Total processed:   {}", total);
+
+        eprintln!();
+        eprintln!("Config:");
         if let Some(ref ns) = namespace {
             eprintln!("  Namespace:         {}", ns);
         }
@@ -3308,6 +4578,80 @@ async fn run_migrate_namespace(
     Ok(())
 }
 
+/// Purge (delete) all documents in a namespace
+async fn run_purge_namespace(
+    namespace: String,
+    db_path: String,
+    confirm: bool,
+    json_output: bool,
+) -> Result<()> {
+    let db_path = shellexpand::tilde(&db_path).to_string();
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+
+    // Check if namespace exists
+    let exists = storage.namespace_exists(&namespace).await?;
+    if !exists {
+        let msg = format!("Namespace '{}' does not exist or is empty", namespace);
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "error",
+                    "message": msg
+                }))?
+            );
+        } else {
+            eprintln!("Error: {}", msg);
+        }
+        return Err(anyhow::anyhow!(msg));
+    }
+
+    // Get count before purge
+    let docs = storage.get_all_in_namespace(&namespace).await?;
+    let doc_count = docs.len();
+
+    // Confirmation prompt (unless --confirm flag)
+    if !confirm && !json_output {
+        eprintln!("\n⚠️  WARNING: This will permanently delete {} documents from namespace '{}'", doc_count, namespace);
+        eprintln!("   This action cannot be undone!\n");
+        eprint!("   Type 'yes' to confirm: ");
+
+        use std::io::{self, BufRead, Write};
+        io::stderr().flush()?;
+        let stdin = io::stdin();
+        let mut input = String::new();
+        stdin.lock().read_line(&mut input)?;
+
+        if input.trim().to_lowercase() != "yes" {
+            eprintln!("\n   Aborted. No changes made.");
+            return Ok(());
+        }
+    }
+
+    // Perform the purge
+    let deleted = storage.purge_namespace(&namespace).await?;
+
+    // Report results
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "success",
+                "namespace": namespace,
+                "documents_deleted": doc_count,
+                "rows_deleted": deleted
+            }))?
+        );
+    } else {
+        eprintln!("\n✓ Purged namespace '{}'", namespace);
+        eprintln!("  Documents deleted: {}", doc_count);
+        eprintln!("  Rows deleted: {}", deleted);
+        eprintln!("  DB path: {}", db_path);
+    }
+
+    Ok(())
+}
+
 /// Statistics for merge operation
 #[derive(Debug, Clone, Default, Serialize)]
 struct MergeStats {
@@ -3636,17 +4980,19 @@ async fn main() -> Result<()> {
 
             // Extract embedding config before any moves
             let embedding_config = file_cfg.to_embedding_config();
+            let maintenance_config = file_cfg.maintenance.clone();
 
             let db_path = cli
                 .db_path
                 .or(file_cfg.db_path)
                 .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path_expanded = shellexpand::tilde(&db_path).to_string();
             let _cache_mb = cli.cache_mb.or(file_cfg.cache_mb).unwrap_or(4096);
             // CLI flag overrides file config
             let preprocess = preprocess || file_cfg.preprocessing_enabled.unwrap_or(false);
             let slice_mode: SliceMode = slice_mode.parse().unwrap_or_default();
 
-            run_batch_index(BatchIndexConfig {
+            let result = run_batch_index(BatchIndexConfig {
                 path,
                 namespace,
                 recursive,
@@ -3663,7 +5009,15 @@ async fn main() -> Result<()> {
                 pipeline,
                 parallel,
             })
-            .await
+            .await;
+
+            // Auto-optimize after successful indexing
+            if result.is_ok()
+                && let Ok(storage) = StorageManager::new_lance_only(&db_path_expanded).await {
+                    let _ = check_and_maybe_optimize(&storage, &maintenance_config).await;
+                }
+
+            result
         }
         Some(Commands::Overview { namespace, json }) => {
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
@@ -3777,16 +5131,16 @@ async fn main() -> Result<()> {
                 mode.parse().unwrap_or_default()
             };
 
-            run_search(
+            run_search(SearchConfig {
                 namespace,
                 query,
                 limit,
-                json,
+                json_output: json,
                 db_path,
                 layer_filter,
                 search_mode,
-                &embedding_config,
-            )
+                embedding_config: &embedding_config,
+            })
             .await
         }
         Some(Commands::Expand {
@@ -3895,6 +5249,7 @@ async fn main() -> Result<()> {
             }
 
             let embedding_config = file_cfg.to_embedding_config();
+            let maintenance_config = file_cfg.maintenance.clone();
 
             let db_path = cli
                 .db_path
@@ -3927,7 +5282,7 @@ async fn main() -> Result<()> {
             let embedding_client =
                 Arc::new(Mutex::new(EmbeddingClient::new(&embedding_config).await?));
             let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
-            let rag = RAGPipeline::new(embedding_client, storage).await?;
+            let rag = RAGPipeline::new(embedding_client, storage.clone()).await?;
 
             // Upsert
             rag.memory_upsert(&namespace, id.clone(), content.clone(), meta)
@@ -3936,6 +5291,9 @@ async fn main() -> Result<()> {
             eprintln!("✓ Upserted chunk '{}' to namespace '{}'", id, namespace);
             eprintln!("  Text: {} chars", content.len());
             eprintln!("  DB: {}", db_path);
+
+            // Auto-optimize after upsert
+            let _ = check_and_maybe_optimize(&storage, &maintenance_config).await;
 
             Ok(())
         }
@@ -3971,6 +5329,59 @@ async fn main() -> Result<()> {
             }
 
             Ok(())
+        }
+        Some(Commands::Health { quick, json }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+
+            let embedding_config = file_cfg.to_embedding_config();
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_health(db_path, &embedding_config, config_path, quick, json).await
+        }
+        Some(Commands::Recall {
+            query,
+            namespace,
+            limit,
+            json,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let embedding_config = file_cfg.to_embedding_config();
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_recall(query, namespace, limit, json, db_path, &embedding_config).await
+        }
+        Some(Commands::Timeline {
+            namespace,
+            since,
+            gaps,
+            json,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_timeline(db_path, namespace, since, gaps, json).await
         }
         Some(Commands::Compact) => {
             let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
@@ -4182,6 +5593,19 @@ async fn main() -> Result<()> {
 
             run_migrate_namespace(from, to, db_path, merge, delete_source, dry_run, json).await
         }
+        Some(Commands::PurgeNamespace {
+            namespace,
+            confirm,
+            json,
+        }) => {
+            let (file_cfg, _) = load_or_discover_config(cli.config.as_deref())?;
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+
+            run_purge_namespace(namespace, db_path, confirm, json).await
+        }
         Some(Commands::Import {
             namespace,
             input,
@@ -4202,6 +5626,43 @@ async fn main() -> Result<()> {
             let db_path = shellexpand::tilde(&db_path).to_string();
 
             run_import(namespace, input, skip_existing, db_path, &embedding_config).await
+        }
+        Some(Commands::Audit {
+            namespace,
+            threshold,
+            verbose,
+            json,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_audit(namespace, threshold, verbose, json, db_path).await
+        }
+        Some(Commands::PurgeQuality {
+            threshold,
+            confirm,
+            json,
+        }) => {
+            let (file_cfg, config_path) = load_or_discover_config(cli.config.as_deref())?;
+            if let Some(ref path) = config_path {
+                eprintln!("Using config: {}", path);
+            }
+
+            let db_path = cli
+                .db_path
+                .or(file_cfg.db_path)
+                .unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/lancedb".to_string());
+            let db_path = shellexpand::tilde(&db_path).to_string();
+
+            run_purge_quality(threshold, confirm, json, db_path).await
         }
         Some(Commands::Serve) | None => {
             // Run MCP server (and optionally HTTP/SSE server)

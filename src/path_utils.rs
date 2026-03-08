@@ -100,7 +100,6 @@ pub fn sanitize_existing_path(path: &str) -> Result<PathBuf> {
 
     // This IS the sanitization function. Traversal is checked above,
     // and the path is canonicalized and validated below.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let path_buf = PathBuf::from(&expanded);
 
     // Canonicalize to resolve any remaining symlinks
@@ -142,7 +141,6 @@ pub fn sanitize_new_path(path: &str) -> Result<PathBuf> {
 
     // This IS the sanitization function. Traversal is checked above,
     // and parent directory is validated below.
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let path_buf = PathBuf::from(&expanded);
 
     // For new paths, validate the parent exists and is allowed

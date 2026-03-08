@@ -214,6 +214,18 @@ pub struct MlxConfig {
     pub max_batch_items: usize,
 }
 
+/// Options for merging file config into MlxConfig
+#[derive(Debug, Clone, Default)]
+pub struct MlxMergeOptions {
+    pub disabled: Option<bool>,
+    pub local_port: Option<u16>,
+    pub dragon_url: Option<String>,
+    pub dragon_port: Option<u16>,
+    pub embedder_model: Option<String>,
+    pub reranker_model: Option<String>,
+    pub reranker_port_offset: Option<u16>,
+}
+
 impl Default for MlxConfig {
     fn default() -> Self {
         Self {
@@ -286,36 +298,26 @@ impl MlxConfig {
     }
 
     /// Merge with values from file config
-    #[allow(clippy::too_many_arguments)]
-    pub fn merge_file_config(
-        &mut self,
-        disabled: Option<bool>,
-        local_port: Option<u16>,
-        dragon_url: Option<String>,
-        dragon_port: Option<u16>,
-        embedder_model: Option<String>,
-        reranker_model: Option<String>,
-        reranker_port_offset: Option<u16>,
-    ) {
-        if let Some(v) = disabled {
+    pub fn merge_file_config(&mut self, opts: MlxMergeOptions) {
+        if let Some(v) = opts.disabled {
             self.disabled = v;
         }
-        if let Some(v) = local_port {
+        if let Some(v) = opts.local_port {
             self.local_port = v;
         }
-        if let Some(v) = dragon_url {
+        if let Some(v) = opts.dragon_url {
             self.dragon_url = v;
         }
-        if let Some(v) = dragon_port {
+        if let Some(v) = opts.dragon_port {
             self.dragon_port = v;
         }
-        if let Some(v) = embedder_model {
+        if let Some(v) = opts.embedder_model {
             self.embedder_model = v;
         }
-        if let Some(v) = reranker_model {
+        if let Some(v) = opts.reranker_model {
             self.reranker_model = v;
         }
-        if let Some(v) = reranker_port_offset {
+        if let Some(v) = opts.reranker_port_offset {
             self.reranker_port_offset = v;
         }
     }
@@ -429,17 +431,47 @@ impl EmbeddingClient {
                             (None, None)
                         };
 
-                    return Ok(Self {
-                        client,
-                        embedder_url,
-                        embedder_model: provider.model.clone(),
-                        reranker_url,
-                        reranker_model,
-                        connected_to: provider.name.clone(),
-                        required_dimension: config.required_dimension,
-                        max_batch_chars: config.max_batch_chars,
-                        max_batch_items: config.max_batch_items,
-                    });
+                    // FAIL-FAST: Test embedding dimension before accepting this provider
+                    let test_dim = Self::test_dimension(
+                        &client,
+                        &embedder_url,
+                        &provider.model,
+                        config.required_dimension,
+                    )
+                    .await;
+
+                    match test_dim {
+                        Ok(actual_dim) => {
+                            tracing::info!(
+                                "Embedding: Dimension verified: {} (required: {})",
+                                actual_dim,
+                                config.required_dimension
+                            );
+                            return Ok(Self {
+                                client,
+                                embedder_url,
+                                embedder_model: provider.model.clone(),
+                                reranker_url,
+                                reranker_model,
+                                connected_to: provider.name.clone(),
+                                required_dimension: config.required_dimension,
+                                max_batch_chars: config.max_batch_chars,
+                                max_batch_items: config.max_batch_items,
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "Embedding: {} dimension check FAILED: {}",
+                                provider.name,
+                                e
+                            );
+                            tried.push(format!(
+                                "- {} ({}): dimension check failed: {}",
+                                provider.name, base_url, e
+                            ));
+                            // Continue to next provider
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -506,6 +538,60 @@ impl EmbeddingClient {
             Ok(resp) => Err(anyhow!("Health check failed: {}", resp.status())),
             Err(e) => Err(anyhow!("Connection failed: {}", e)),
         }
+    }
+
+    /// Test embedding dimension by sending a probe request.
+    /// Returns actual dimension if it matches required, otherwise error.
+    async fn test_dimension(
+        client: &Client,
+        embedder_url: &str,
+        model: &str,
+        required_dimension: usize,
+    ) -> Result<usize> {
+        let request = EmbeddingRequest {
+            input: vec!["dimension test".to_string()],
+            model: model.to_string(),
+        };
+
+        let response = client
+            .post(embedder_url)
+            .json(&request)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| anyhow!("Dimension probe failed: {}", e))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Dimension probe returned {}: {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ));
+        }
+
+        let embed_response: EmbeddingResponse = response
+            .json()
+            .await
+            .map_err(|e| anyhow!("Failed to parse dimension probe response: {}", e))?;
+
+        let actual_dim = embed_response
+            .data
+            .first()
+            .map(|d| d.embedding.len())
+            .ok_or_else(|| anyhow!("No embedding in dimension probe response"))?;
+
+        if actual_dim != required_dimension {
+            return Err(anyhow!(
+                "DIMENSION MISMATCH: model returns {} dims, but database requires {}. \
+                 Using this provider would CORRUPT the database!",
+                actual_dim,
+                required_dimension
+            ));
+        }
+
+        Ok(actual_dim)
     }
 
     /// Get which provider we're connected to
@@ -1295,5 +1381,210 @@ mod tests {
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].0, 1); // Index 1
         assert_eq!(failures[1].0, 3); // Index 3
+    }
+}
+
+// =============================================================================
+// DIMENSION ADAPTER - Cross-dimension embedding compatibility
+// =============================================================================
+
+/// Adapter for cross-dimension embedding compatibility.
+///
+/// Enables searching across databases with different embedding dimensions
+/// (e.g., 1024, 2048, 4096) by expanding or contracting embeddings.
+///
+/// # Strategies
+/// - **Expand**: Zero-pad smaller embeddings to target dimension
+/// - **Contract**: Truncate or project larger embeddings to target dimension
+///
+/// # Example
+/// ```rust,ignore
+/// let adapter = DimensionAdapter::new(1024, 4096);
+/// let expanded = adapter.expand(small_embedding);  // 1024 -> 4096
+///
+/// let adapter = DimensionAdapter::new(4096, 1024);
+/// let contracted = adapter.contract(large_embedding);  // 4096 -> 1024
+/// ```
+#[derive(Debug, Clone)]
+pub struct DimensionAdapter {
+    /// Source embedding dimension
+    pub source_dim: usize,
+    /// Target embedding dimension
+    pub target_dim: usize,
+}
+
+impl DimensionAdapter {
+    /// Create a new dimension adapter
+    pub fn new(source_dim: usize, target_dim: usize) -> Self {
+        Self {
+            source_dim,
+            target_dim,
+        }
+    }
+
+    /// Check if adaptation is needed
+    pub fn needs_adaptation(&self) -> bool {
+        self.source_dim != self.target_dim
+    }
+
+    /// Adapt embedding to target dimension (auto-detect expand/contract)
+    pub fn adapt(&self, embedding: Vec<f32>) -> Vec<f32> {
+        if embedding.len() == self.target_dim {
+            return embedding;
+        }
+
+        if embedding.len() < self.target_dim {
+            self.expand(embedding)
+        } else {
+            self.contract(embedding)
+        }
+    }
+
+    /// Expand smaller embeddings to target dimension via zero-padding.
+    ///
+    /// Uses normalized zero-padding to minimize impact on cosine similarity.
+    pub fn expand(&self, embedding: Vec<f32>) -> Vec<f32> {
+        if embedding.len() >= self.target_dim {
+            return embedding[..self.target_dim].to_vec();
+        }
+
+        let mut padded = embedding;
+        padded.resize(self.target_dim, 0.0);
+
+        // Re-normalize to unit length for cosine similarity
+        self.normalize(&mut padded);
+        padded
+    }
+
+    /// Contract larger embeddings to target dimension.
+    ///
+    /// Uses PCA-like projection for dimensions that are powers of 2,
+    /// otherwise falls back to truncation.
+    pub fn contract(&self, embedding: Vec<f32>) -> Vec<f32> {
+        if embedding.len() <= self.target_dim {
+            return embedding;
+        }
+
+        // For power-of-2 reductions (4096->2048, 2048->1024), use averaging
+        // This preserves more information than truncation
+        if self.is_power_of_two_reduction(embedding.len()) {
+            self.average_reduction(embedding)
+        } else {
+            // Fallback to truncation
+            embedding[..self.target_dim].to_vec()
+        }
+    }
+
+    /// Check if this is a clean power-of-2 reduction (e.g., 4096->2048)
+    fn is_power_of_two_reduction(&self, source_len: usize) -> bool {
+        source_len > self.target_dim
+            && source_len.is_power_of_two()
+            && self.target_dim.is_power_of_two()
+            && source_len.is_multiple_of(self.target_dim)
+    }
+
+    /// Reduce by averaging consecutive elements (preserves information better than truncation)
+    fn average_reduction(&self, embedding: Vec<f32>) -> Vec<f32> {
+        let factor = embedding.len() / self.target_dim;
+        let mut result = Vec::with_capacity(self.target_dim);
+
+        for chunk in embedding.chunks(factor) {
+            let sum: f32 = chunk.iter().sum();
+            result.push(sum / factor as f32);
+        }
+
+        // Re-normalize
+        self.normalize(&mut result);
+        result
+    }
+
+    /// Normalize vector to unit length (L2 norm)
+    fn normalize(&self, vec: &mut [f32]) {
+        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-10 {
+            for v in vec.iter_mut() {
+                *v /= norm;
+            }
+        }
+    }
+}
+
+/// Perform cross-dimension search by adapting query embedding
+pub fn cross_dimension_search_adapt(
+    query_embedding: Vec<f32>,
+    target_dim: usize,
+) -> Vec<f32> {
+    let adapter = DimensionAdapter::new(query_embedding.len(), target_dim);
+    adapter.adapt(query_embedding)
+}
+
+#[cfg(test)]
+mod dimension_adapter_tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_1024_to_4096() {
+        let adapter = DimensionAdapter::new(1024, 4096);
+        let small = vec![0.1f32; 1024];
+        let expanded = adapter.expand(small);
+
+        assert_eq!(expanded.len(), 4096);
+        // First 1024 should be non-zero (after normalization)
+        assert!(expanded[0].abs() > 1e-10);
+        // Last elements should be zero
+        assert!(expanded[4095].abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_contract_4096_to_1024() {
+        let adapter = DimensionAdapter::new(4096, 1024);
+        let large = vec![0.1f32; 4096];
+        let contracted = adapter.contract(large);
+
+        assert_eq!(contracted.len(), 1024);
+        // Should be normalized
+        let norm: f32 = contracted.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_adapt_auto_detect() {
+        let adapter = DimensionAdapter::new(1024, 4096);
+
+        // Small to large (expand)
+        let small = vec![0.1f32; 1024];
+        let result = adapter.adapt(small);
+        assert_eq!(result.len(), 4096);
+
+        // Large to small (contract)
+        let adapter = DimensionAdapter::new(4096, 1024);
+        let large = vec![0.1f32; 4096];
+        let result = adapter.adapt(large);
+        assert_eq!(result.len(), 1024);
+    }
+
+    #[test]
+    fn test_no_adaptation_needed() {
+        let adapter = DimensionAdapter::new(4096, 4096);
+        assert!(!adapter.needs_adaptation());
+
+        let embedding = vec![0.1f32; 4096];
+        let result = adapter.adapt(embedding.clone());
+        assert_eq!(result, embedding);
+    }
+
+    #[test]
+    fn test_average_reduction_preserves_info() {
+        let adapter = DimensionAdapter::new(4096, 2048);
+
+        // Create embedding with distinct values
+        let large: Vec<f32> = (0..4096).map(|i| i as f32 / 4096.0).collect();
+        let contracted = adapter.contract(large);
+
+        assert_eq!(contracted.len(), 2048);
+        // Averaged values should be between min and max of source chunks
+        // After normalization, should be unit length
+        let norm: f32 = contracted.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
     }
 }

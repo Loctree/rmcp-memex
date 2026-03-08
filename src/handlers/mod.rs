@@ -65,7 +65,6 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
     // Expand ~ to home directory
     let expanded = shellexpand::tilde(path_str).to_string();
     // This IS the path validation/sanitization function - not a vulnerability
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let path = Path::new(&expanded);
 
     // Check for obvious path traversal patterns before canonicalization
@@ -100,7 +99,6 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
         allowed_paths.iter().any(|allowed| {
             // Expand ~ in allowed path
             let expanded_allowed = shellexpand::tilde(allowed).to_string();
-            // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
             let allowed_path = Path::new(&expanded_allowed);
 
             // Try to canonicalize the allowed path, fall back to expanded path if it doesn't exist

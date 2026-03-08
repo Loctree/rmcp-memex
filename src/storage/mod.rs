@@ -250,6 +250,8 @@ impl StorageManager {
         if documents.is_empty() {
             return Ok(());
         }
+
+        // Pre-validation: check all documents before writing anything
         let dim = documents
             .first()
             .ok_or_else(|| anyhow!("No documents to add"))?
@@ -259,10 +261,47 @@ impl StorageManager {
             return Err(anyhow!("Embedding dimension is zero"));
         }
 
+        // Validate ALL documents have consistent dimensions and required fields
+        for (i, doc) in documents.iter().enumerate() {
+            if doc.embedding.len() != dim {
+                return Err(anyhow!(
+                    "Document {} has inconsistent embedding dimension: expected {}, got {}. \
+                     Aborting batch to prevent database corruption.",
+                    i,
+                    dim,
+                    doc.embedding.len()
+                ));
+            }
+            if doc.id.is_empty() {
+                return Err(anyhow!(
+                    "Document {} has empty ID. Aborting batch.",
+                    i
+                ));
+            }
+            if doc.namespace.is_empty() {
+                return Err(anyhow!(
+                    "Document {} has empty namespace. Aborting batch.",
+                    i
+                ));
+            }
+            // Check for NaN/Inf in embeddings
+            for (j, &val) in doc.embedding.iter().enumerate() {
+                if val.is_nan() || val.is_infinite() {
+                    return Err(anyhow!(
+                        "Document {} has invalid embedding value at index {}: {}. \
+                         Aborting batch to prevent database corruption.",
+                        i,
+                        j,
+                        val
+                    ));
+                }
+            }
+        }
+
         let table = self.ensure_table(dim).await?;
         let batch = self.docs_to_batch(&documents, dim)?;
         table.add(batch).execute().await?;
-        debug!("Inserted {} documents into Lance", documents.len());
+        debug!("Inserted {} documents into Lance (validated)", documents.len());
         Ok(())
     }
 

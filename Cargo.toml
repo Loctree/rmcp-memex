@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-memex"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 build = "src/build.rs"
 description = "RAG/memory MCP server with LanceDB vector storage"
@@ -28,6 +28,25 @@ path = "src/lib.rs"
 [[bin]]
 name = "rmcp-memex"
 path = "src/bin/rmcp_memex.rs"
+required-features = ["cli"]
+
+# CLI-focused binary (same code, different default behavior)
+# Usage: rust-memex index/search/dive/audit/etc.
+[[bin]]
+name = "rust-memex"
+path = "src/bin/rust_memex.rs"
+required-features = ["cli"]
+
+# Short alias for rust-memex
+[[bin]]
+name = "rmmx"
+path = "src/bin/rust_memex.rs"
+required-features = ["cli"]
+
+# Alternative alias
+[[bin]]
+name = "rmemex"
+path = "src/bin/rust_memex.rs"
 required-features = ["cli"]
 
 [dependencies]

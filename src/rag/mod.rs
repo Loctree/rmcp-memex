@@ -1245,9 +1245,8 @@ impl RAGPipeline {
         let mut total_chunks = 0;
         let mut skipped_docs = 0;
         // Path is validated by caller (index_document_with_dedup) via validate_read_path
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let file_content_hash = compute_content_hash(
-            &tokio::fs::read_to_string(path).await.unwrap_or_default(), // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+            &tokio::fs::read_to_string(path).await.unwrap_or_default(),
         );
 
         for (doc_id, content, mut doc_metadata) in documents {
@@ -2100,7 +2099,6 @@ impl RAGPipeline {
 
         // Default: treat as UTF-8 text
         // Path is validated by caller (handlers::validate_path) before reaching this private method
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         tokio::fs::read_to_string(path).await.map_err(|e| e.into())
     }
 
@@ -2131,7 +2129,6 @@ impl RAGPipeline {
 
         // Try to parse as JSON
         // Path is validated by caller (index_document_with_dedup) via validate_read_path
-        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let raw = tokio::fs::read_to_string(path).await?;
         let parsed: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(v) => v,

@@ -93,4 +93,4 @@ To normalne dla dużych plików. 8MB JSON = ~15-20 minut z Qwen3-Embedding-8B.
 
 ---
 
-Created by M&K (c)2025 The LibraxisAI Team
+Vibecrafted with AI Agents by VetCoders (c)2025 The LibraxisAI Team

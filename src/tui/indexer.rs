@@ -397,7 +397,6 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     tokio::fs::create_dir_all(&safe_dst).await?;
 
     // Path is validated by validate_read_path above
-    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let mut entries = tokio::fs::read_dir(&safe_src).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();

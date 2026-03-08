@@ -48,4 +48,4 @@ Add to `~/.claude/settings.json`:
 
 ---
 
-Created by M&K (c)2026 The LibraxisAI Team
+Vibecrafted with AI Agents by VetCoders (c)2026 The LibraxisAI Team
