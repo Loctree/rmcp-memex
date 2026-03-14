@@ -14,7 +14,8 @@ use rmcp_memex::{
     BM25Config, EmbeddingClient, EmbeddingConfig, HealthChecker, HybridConfig, HybridSearchResult,
     HybridSearcher, IndexProgressTracker, MlxConfig, NamespaceSecurityConfig, PreprocessingConfig,
     ProviderConfig, QueryRouter, RAGPipeline, RerankerConfig, SearchMode, SearchModeRecommendation,
-    ServerConfig, SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, path_utils, run_wizard,
+    ServerConfig, SliceLayer, SliceMode, StorageManager, WizardConfig, create_server, path_utils,
+    run_wizard,
 };
 
 fn parse_features(raw: &str) -> Vec<String> {
@@ -2123,8 +2124,9 @@ async fn run_health(
                 .map(|i| i.name.clone())
                 .collect();
             if provider.is_none() {
-                recommendations
-                    .push("Embedder unreachable - check if embedding server is running".to_string());
+                recommendations.push(
+                    "Embedder unreachable - check if embedding server is running".to_string(),
+                );
             }
             format!("FAILED: {}", failures.join(", "))
         };
@@ -2185,7 +2187,10 @@ async fn run_health(
         eprintln!("  Status:   {}", report.database.status);
         eprintln!("  Rows:     {}", report.database.row_count);
         eprintln!("  Versions: {}", report.database.version_count);
-        eprintln!("  Size:     ~{:.1} MB (estimate)", report.database.size_estimate_mb);
+        eprintln!(
+            "  Size:     ~{:.1} MB (estimate)",
+            report.database.size_estimate_mb
+        );
         eprintln!();
 
         // Embedder section
@@ -2196,7 +2201,11 @@ async fn run_health(
                 eprintln!("  Provider:  {}", provider);
             }
             if let Some(dim) = emb.dimension {
-                let check = if emb.dimension_match { "[OK]" } else { "[MISMATCH]" };
+                let check = if emb.dimension_match {
+                    "[OK]"
+                } else {
+                    "[MISMATCH]"
+                };
                 eprintln!("  Dimension: {} {}", dim, check);
             }
             eprintln!();
@@ -2405,7 +2414,10 @@ async fn run_recall(
         let key = format!("{:?}-{:?}", source.source, source.date);
         if let std::collections::hash_map::Entry::Vacant(e) = seen_related.entry(key) {
             related.push(RecallRelated {
-                title: source.source.clone().unwrap_or_else(|| "Unknown".to_string()),
+                title: source
+                    .source
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
                 date: source.date.clone(),
                 namespace: source.namespace.clone(),
             });
@@ -2542,17 +2554,17 @@ async fn run_timeline(
     let since_date: Option<chrono::NaiveDate> = since.as_ref().and_then(|s| {
         // Try parsing as duration like "30d"
         if let Some(days_str) = s.strip_suffix('d')
-            && let Ok(days) = days_str.parse::<i64>() {
-                return Some(
-                    (chrono::Utc::now() - chrono::Duration::days(days))
-                        .date_naive(),
-                );
-            }
+            && let Ok(days) = days_str.parse::<i64>()
+        {
+            return Some((chrono::Utc::now() - chrono::Duration::days(days)).date_naive());
+        }
         // Try parsing as YYYY-MM
-        if s.len() == 7 && s.chars().nth(4) == Some('-')
-            && let Ok(date) = chrono::NaiveDate::parse_from_str(&format!("{}-01", s), "%Y-%m-%d") {
-                return Some(date);
-            }
+        if s.len() == 7
+            && s.chars().nth(4) == Some('-')
+            && let Ok(date) = chrono::NaiveDate::parse_from_str(&format!("{}-01", s), "%Y-%m-%d")
+        {
+            return Some(date);
+        }
         // Try parsing as full date
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
     });
@@ -2582,9 +2594,10 @@ async fn run_timeline(
             // Apply since filter
             if let Some(since_d) = since_date
                 && let Ok(doc_date) = chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
-                    && doc_date < since_d {
-                        continue;
-                    }
+                && doc_date < since_d
+            {
+                continue;
+            }
 
             all_dates.insert(date_str.clone());
 
@@ -2716,14 +2729,19 @@ async fn run_timeline(
                 let total: usize = source_map.values().sum();
                 let sources: Vec<_> = source_map.keys().take(3).cloned().collect();
                 let source_str = if sources.len() < source_map.len() {
-                    format!("{} (+{} more)", sources.join(", "), source_map.len() - sources.len())
+                    format!(
+                        "{} (+{} more)",
+                        sources.join(", "),
+                        source_map.len() - sources.len()
+                    )
                 } else {
                     sources.join(", ")
                 };
-                by_month
-                    .entry(month.clone())
-                    .or_default()
-                    .push((date.clone(), format!("[{}] {} ({})", ns, source_str, total), total));
+                by_month.entry(month.clone()).or_default().push((
+                    date.clone(),
+                    format!("[{}] {} ({})", ns, source_str, total),
+                    total,
+                ));
             }
         }
 
@@ -3302,7 +3320,12 @@ async fn run_audit(
     let namespaces: Vec<String> = if let Some(ns) = namespace {
         vec![ns]
     } else {
-        storage.list_namespaces().await?.into_iter().map(|(name, _count)| name).collect()
+        storage
+            .list_namespaces()
+            .await?
+            .into_iter()
+            .map(|(name, _count)| name)
+            .collect()
     };
 
     if namespaces.is_empty() {
@@ -3318,7 +3341,11 @@ async fn run_audit(
     let mut results: Vec<NamespaceAuditResult> = Vec::new();
 
     if !json {
-        eprintln!("Auditing {} namespace(s) with {}% quality threshold...\n", namespaces.len(), threshold);
+        eprintln!(
+            "Auditing {} namespace(s) with {}% quality threshold...\n",
+            namespaces.len(),
+            threshold
+        );
     }
 
     for ns in &namespaces {
@@ -3394,11 +3421,18 @@ async fn run_audit(
         println!("╔════════════════════════════════════════════════════════════════╗");
         println!("║                    NAMESPACE QUALITY AUDIT                     ║");
         println!("╠════════════════════════════════════════════════════════════════╣");
-        println!("║ {:30} │ {:>6} │ {:>6} │ {:>8} ║", "Namespace", "Docs", "Score", "Status");
+        println!(
+            "║ {:30} │ {:>6} │ {:>6} │ {:>8} ║",
+            "Namespace", "Docs", "Score", "Status"
+        );
         println!("╠════════════════════════════════════════════════════════════════╣");
 
         for result in &results {
-            let status_icon = if result.passes_threshold { "✅" } else { "❌" };
+            let status_icon = if result.passes_threshold {
+                "✅"
+            } else {
+                "❌"
+            };
             let ns_display = if result.namespace.len() > 28 {
                 format!("{}...", &result.namespace[..25])
             } else {
@@ -3421,7 +3455,10 @@ async fn run_audit(
         let failing = results.len() - passing;
 
         println!();
-        println!("Summary: {} passing, {} failing (threshold: {}%)", passing, failing, threshold);
+        println!(
+            "Summary: {} passing, {} failing (threshold: {}%)",
+            passing, failing, threshold
+        );
 
         if failing > 0 {
             println!();
@@ -3435,7 +3472,10 @@ async fn run_audit(
                 );
             }
             println!();
-            println!("Run 'rmcp-memex purge-quality --threshold {}' to remove low-quality namespaces", threshold);
+            println!(
+                "Run 'rmcp-memex purge-quality --threshold {}' to remove low-quality namespaces",
+                threshold
+            );
         }
     }
 
@@ -3468,7 +3508,11 @@ async fn run_purge_quality(
     let mut to_purge: Vec<(String, f32, usize)> = Vec::new();
 
     if !json {
-        eprintln!("Analyzing {} namespace(s) with {}% quality threshold...\n", namespace_list.len(), threshold);
+        eprintln!(
+            "Analyzing {} namespace(s) with {}% quality threshold...\n",
+            namespace_list.len(),
+            threshold
+        );
     }
 
     for (ns, _count) in &namespace_list {
@@ -3493,7 +3537,10 @@ async fn run_purge_quality(
         if json {
             println!(r#"{{"purged": [], "message": "All namespaces pass quality threshold"}}"#);
         } else {
-            println!("All namespaces pass the {}% quality threshold. Nothing to purge.", threshold);
+            println!(
+                "All namespaces pass the {}% quality threshold. Nothing to purge.",
+                threshold
+            );
         }
         return Ok(());
     }
@@ -3516,7 +3563,11 @@ async fn run_purge_quality(
             return Ok(());
         }
     } else {
-        println!("Found {} namespace(s) below {}% quality threshold:", to_purge.len(), threshold);
+        println!(
+            "Found {} namespace(s) below {}% quality threshold:",
+            to_purge.len(),
+            threshold
+        );
         for (ns, score, count) in &to_purge {
             println!("  - {} ({:.1}% quality, {} docs)", ns, score * 100.0, count);
         }
@@ -3553,7 +3604,10 @@ async fn run_purge_quality(
 
     if !json {
         println!();
-        println!("Purged {} namespace(s) with quality below {}%", purged_count, threshold);
+        println!(
+            "Purged {} namespace(s) with quality below {}%",
+            purged_count, threshold
+        );
     }
 
     Ok(())
@@ -4611,7 +4665,10 @@ async fn run_purge_namespace(
 
     // Confirmation prompt (unless --confirm flag)
     if !confirm && !json_output {
-        eprintln!("\n⚠️  WARNING: This will permanently delete {} documents from namespace '{}'", doc_count, namespace);
+        eprintln!(
+            "\n⚠️  WARNING: This will permanently delete {} documents from namespace '{}'",
+            doc_count, namespace
+        );
         eprintln!("   This action cannot be undone!\n");
         eprint!("   Type 'yes' to confirm: ");
 
@@ -5012,9 +5069,10 @@ async fn main() -> Result<()> {
 
             // Auto-optimize after successful indexing
             if result.is_ok()
-                && let Ok(storage) = StorageManager::new_lance_only(&db_path_expanded).await {
-                    let _ = check_and_maybe_optimize(&storage, &maintenance_config).await;
-                }
+                && let Ok(storage) = StorageManager::new_lance_only(&db_path_expanded).await
+            {
+                let _ = check_and_maybe_optimize(&storage, &maintenance_config).await;
+            }
 
             result
         }

@@ -1510,10 +1510,7 @@ impl DimensionAdapter {
 }
 
 /// Perform cross-dimension search by adapting query embedding
-pub fn cross_dimension_search_adapt(
-    query_embedding: Vec<f32>,
-    target_dim: usize,
-) -> Vec<f32> {
+pub fn cross_dimension_search_adapt(query_embedding: Vec<f32>, target_dim: usize) -> Vec<f32> {
     let adapter = DimensionAdapter::new(query_embedding.len(), target_dim);
     adapter.adapt(query_embedding)
 }

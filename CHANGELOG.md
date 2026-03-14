@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-03-09
+
+### Changed
+- Semver bump for the current breaking public API surface
+- Added self-contained CLI E2E coverage for folder indexing, chunking, and RAG search
+- Split CLI alias binaries into dedicated wrapper entrypoints to remove duplicate-target warnings structurally
+
 ## [0.3.6] - 2026-01-03
 
 ### Added

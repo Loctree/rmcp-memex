@@ -1,6 +1,6 @@
 [package]
 name = "rmcp-memex"
-version = "0.3.7"
+version = "0.4.0"
 edition = "2024"
 build = "src/build.rs"
 description = "RAG/memory MCP server with LanceDB vector storage"
@@ -40,13 +40,13 @@ required-features = ["cli"]
 # Short alias for rust-memex
 [[bin]]
 name = "rmmx"
-path = "src/bin/rust_memex.rs"
+path = "src/bin/rmmx.rs"
 required-features = ["cli"]
 
 # Alternative alias
 [[bin]]
 name = "rmemex"
-path = "src/bin/rust_memex.rs"
+path = "src/bin/rmemex.rs"
 required-features = ["cli"]
 
 [dependencies]
@@ -110,6 +110,10 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3.14"
+
+[patch.crates-io]
+# Keep local directory namespaces without pulling unused cloud backends into the graph.
+lance-namespace-impls = { path = "vendor/lance-namespace-impls" }
 
 [profile.release]
 lto = true

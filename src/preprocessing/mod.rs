@@ -746,14 +746,24 @@ mod integrity_tests {
                         Finally we conclude with a fourth sentence that wraps everything up nicely.";
         let chunks = vec![
             "This is the first sentence with some padding text to make it longer. \
-             Here is another sentence that continues the thought and adds context.".to_string(),
+             Here is another sentence that continues the thought and adds context."
+                .to_string(),
             "The third sentence provides more information about the topic at hand. \
-             Finally we conclude with a fourth sentence that wraps everything up nicely.".to_string(),
+             Finally we conclude with a fourth sentence that wraps everything up nicely."
+                .to_string(),
         ];
 
         let metrics = TextIntegrityMetrics::compute(original, &chunks);
-        assert!(metrics.sentence_integrity >= 0.9, "sentence_integrity: {}", metrics.sentence_integrity);
-        assert!(metrics.word_integrity >= 0.9, "word_integrity: {}", metrics.word_integrity);
+        assert!(
+            metrics.sentence_integrity >= 0.9,
+            "sentence_integrity: {}",
+            metrics.sentence_integrity
+        );
+        assert!(
+            metrics.word_integrity >= 0.9,
+            "word_integrity: {}",
+            metrics.word_integrity
+        );
         // overall = 0.5*sentence + 0.3*word + 0.2*chunk_quality
         // With perfect sentence/word but short chunks (< OPTIMAL_MIN), overall = 0.8
         assert!(metrics.overall >= 0.75, "overall: {}", metrics.overall);
@@ -799,24 +809,15 @@ mod integrity_tests {
         assert_eq!(m.recommendation(), IntegrityRecommendation::Excellent);
 
         // Good
-        let m = TextIntegrityMetrics {
-            overall: 0.92,
-            ..m
-        };
+        let m = TextIntegrityMetrics { overall: 0.92, ..m };
         assert_eq!(m.recommendation(), IntegrityRecommendation::Good);
 
         // Warn
-        let m = TextIntegrityMetrics {
-            overall: 0.75,
-            ..m
-        };
+        let m = TextIntegrityMetrics { overall: 0.75, ..m };
         assert_eq!(m.recommendation(), IntegrityRecommendation::Warn);
 
         // Purge
-        let m = TextIntegrityMetrics {
-            overall: 0.50,
-            ..m
-        };
+        let m = TextIntegrityMetrics { overall: 0.50, ..m };
         assert_eq!(m.recommendation(), IntegrityRecommendation::Purge);
     }
 }

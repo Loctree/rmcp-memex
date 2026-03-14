@@ -273,10 +273,7 @@ impl StorageManager {
                 ));
             }
             if doc.id.is_empty() {
-                return Err(anyhow!(
-                    "Document {} has empty ID. Aborting batch.",
-                    i
-                ));
+                return Err(anyhow!("Document {} has empty ID. Aborting batch.", i));
             }
             if doc.namespace.is_empty() {
                 return Err(anyhow!(
@@ -301,7 +298,10 @@ impl StorageManager {
         let table = self.ensure_table(dim).await?;
         let batch = self.docs_to_batch(&documents, dim)?;
         table.add(batch).execute().await?;
-        debug!("Inserted {} documents into Lance (validated)", documents.len());
+        debug!(
+            "Inserted {} documents into Lance (validated)",
+            documents.len()
+        );
         Ok(())
     }
 

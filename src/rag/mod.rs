@@ -1238,9 +1238,8 @@ impl RAGPipeline {
         let mut total_chunks = 0;
         let mut skipped_docs = 0;
         // Path is validated by caller (index_document_with_dedup) via validate_read_path
-        let file_content_hash = compute_content_hash(
-            &tokio::fs::read_to_string(path).await.unwrap_or_default(),
-        );
+        let file_content_hash =
+            compute_content_hash(&tokio::fs::read_to_string(path).await.unwrap_or_default());
 
         for (doc_id, content, mut doc_metadata) in documents {
             if content.len() < 50 {

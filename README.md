@@ -72,10 +72,10 @@ RAG/Memory MCP Server with LanceDB vector storage for AI agents.
 
 ```toml
 # Full library with CLI
-rmcp-memex = "0.3"
+rmcp-memex = "0.4"
 
 # Library only (no CLI dependencies)
-rmcp-memex = { version = "0.3", default-features = false }
+rmcp-memex = { version = "0.4", default-features = false }
 ```
 
 ### Basic Usage

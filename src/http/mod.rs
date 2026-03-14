@@ -10,12 +10,15 @@
 //!
 //! Endpoints:
 //! - GET  /                  - HTML Dashboard (browse memories visually)
+//! - GET  /api/discovery     - Endpoint discovery: status, db info, namespaces (canonical)
 //! - GET  /api/namespaces    - List all namespaces with counts
 //! - GET  /api/overview      - Database overview/stats
 //! - GET  /api/browse/:ns    - Browse documents in namespace
 //! - GET  /health            - Health check
 //! - POST /search            - Search documents
 //! - GET  /sse/search        - SSE streaming search
+//! - GET  /sse/namespaces    - SSE streaming namespace listing with summaries
+//! - POST /sse/optimize      - SSE streaming database optimize (compact + prune)
 //! - POST /upsert            - Upsert document (memory_upsert)
 //! - POST /index             - Index text with full pipeline
 //! - GET  /expand/:ns/:id    - Expand onion slice (get children)
@@ -835,6 +838,8 @@ pub struct HttpState {
     pub mcp_base_url: Arc<RwLock<String>>,
     /// Cached namespace list (refreshed in background for large DBs)
     pub cached_namespaces: Arc<RwLock<Option<Vec<NamespaceInfo>>>>,
+    /// Per-namespace last activity timestamp (updated on upsert/index)
+    pub namespace_activity: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Search request body
@@ -1009,6 +1014,7 @@ pub fn create_router(state: HttpState) -> Router {
     Router::new()
         // Dashboard & Browse API
         .route("/", get(dashboard_handler))
+        .route("/api/discovery", get(discovery_handler))
         .route("/api/namespaces", get(namespaces_handler))
         .route("/api/overview", get(overview_handler))
         .route("/api/status", get(status_handler))
@@ -1022,6 +1028,8 @@ pub fn create_router(state: HttpState) -> Router {
         .route("/sse/search", get(sse_search_handler))
         .route("/cross-search", get(cross_search_handler))
         .route("/sse/cross-search", get(sse_cross_search_handler))
+        .route("/sse/namespaces", get(sse_namespaces_handler))
+        .route("/sse/optimize", post(sse_optimize_handler))
         .route("/upsert", post(upsert_handler))
         .route("/index", post(index_handler))
         .route("/expand/{ns}/{id}", get(expand_handler))
@@ -1061,16 +1069,17 @@ async fn dashboard_handler() -> Html<String> {
 /// List all namespaces with document counts (GET /api/namespaces)
 /// Uses cached namespace list (refreshed in background every 5 minutes)
 /// Falls back to "loading" state if cache not yet populated
-async fn namespaces_handler(
-    State(state): State<HttpState>,
-) -> Json<NamespacesResponse> {
+async fn namespaces_handler(State(state): State<HttpState>) -> Json<NamespacesResponse> {
     // Try to use cached namespaces first (instant response)
     let cache = state.cached_namespaces.read().await;
     if let Some(ref namespaces) = *cache {
         let mut sorted = namespaces.clone();
         sorted.sort_by(|a, b| b.count.cmp(&a.count));
         let total = sorted.len();
-        debug!("API: /api/namespaces - returning {} cached namespaces", total);
+        debug!(
+            "API: /api/namespaces - returning {} cached namespaces",
+            total
+        );
         return Json(NamespacesResponse {
             namespaces: sorted,
             total,
@@ -1095,15 +1104,10 @@ async fn overview_handler(
     info!("API: /api/overview - fetching stats");
 
     // Use efficient stats() - only counts rows, doesn't load all data
-    let stats = state
-        .rag
-        .storage()
-        .stats()
-        .await
-        .map_err(|e| {
-            error!("API: /api/overview - stats error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
+    let stats = state.rag.storage().stats().await.map_err(|e| {
+        error!("API: /api/overview - stats error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
 
     info!("API: /api/overview - {} documents", stats.row_count);
 
@@ -1119,9 +1123,7 @@ async fn overview_handler(
 
 /// System status including cache state (GET /api/status)
 /// Returns info about whether namespace cache is ready (for dashboard)
-async fn status_handler(
-    State(state): State<HttpState>,
-) -> Json<serde_json::Value> {
+async fn status_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
     let cache = state.cached_namespaces.read().await;
     let cache_ready = cache.is_some();
     let namespace_count = cache.as_ref().map(|v| v.len()).unwrap_or(0);
@@ -1144,9 +1146,16 @@ async fn browse_handler(
     Path(ns): Path<String>,
     Query(params): Query<BrowseParams>,
 ) -> Result<Json<BrowseResponse>, (StatusCode, String)> {
-    info!("API: /api/browse/{} - limit={}, offset={}", ns, params.limit, params.offset);
+    info!(
+        "API: /api/browse/{} - limit={}, offset={}",
+        ns, params.limit, params.offset
+    );
 
-    let namespace = if ns.is_empty() { None } else { Some(ns.as_str()) };
+    let namespace = if ns.is_empty() {
+        None
+    } else {
+        Some(ns.as_str())
+    };
 
     // Use a zero embedding to get all docs (sorted by default order)
     let zero_embedding = vec![0.0_f32; 4096];
@@ -1200,7 +1209,10 @@ async fn browse_all_handler(
     State(state): State<HttpState>,
     Query(params): Query<BrowseParams>,
 ) -> Result<Json<BrowseResponse>, (StatusCode, String)> {
-    info!("API: /api/browse (all) - limit={}, offset={}", params.limit, params.offset);
+    info!(
+        "API: /api/browse (all) - limit={}, offset={}",
+        params.limit, params.offset
+    );
 
     // Use a zero embedding to get documents (random order without real search)
     let zero_embedding = vec![0.0_f32; 4096];
@@ -1567,6 +1579,247 @@ async fn sse_cross_search_handler(
     )
 }
 
+/// Minimal endpoint discovery — single source of truth for clients and dashboards
+/// GET /api/discovery
+///
+/// Returns status, db info, and all namespaces with counts and last activity.
+/// Replaces fragmented /api/namespaces + /api/overview + /api/status trio.
+async fn discovery_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
+    let cache = state.cached_namespaces.read().await;
+    let activity = state.namespace_activity.read().await;
+
+    let namespaces: Vec<serde_json::Value> = cache
+        .as_ref()
+        .map(|ns_list| {
+            ns_list
+                .iter()
+                .map(|ns| {
+                    json!({
+                        "id": ns.name,
+                        "count": ns.count,
+                        "last_indexed_at": activity.get(&ns.name),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let total_documents: usize = cache
+        .as_ref()
+        .map(|ns| ns.iter().map(|n| n.count).sum())
+        .unwrap_or(0);
+
+    Json(json!({
+        "status": if cache.is_some() { "ok" } else { "loading" },
+        "version": env!("CARGO_PKG_VERSION"),
+        "db_path": state.rag.storage().lance_path(),
+        "embedding_provider": state.rag.mlx_connected_to(),
+        "total_documents": total_documents,
+        "namespaces": namespaces,
+    }))
+}
+
+/// SSE streaming namespace listing with per-namespace summary
+/// GET /sse/namespaces - streams each namespace with doc count, layer distribution, keywords
+async fn sse_namespaces_handler(
+    State(state): State<HttpState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let stream = async_stream::stream! {
+        let start = std::time::Instant::now();
+
+        yield Ok(Event::default()
+            .event("start")
+            .data(serde_json::json!({
+                "status": "scanning_namespaces"
+            }).to_string()));
+
+        // Get namespace list
+        let namespaces = match state.rag.storage().list_namespaces().await {
+            Ok(ns) => ns,
+            Err(e) => {
+                yield Ok(Event::default()
+                    .event("error")
+                    .data(serde_json::json!({"error": e.to_string()}).to_string()));
+                return;
+            }
+        };
+
+        let total_namespaces = namespaces.len();
+        let total_docs: usize = namespaces.iter().map(|(_, c)| *c).sum();
+
+        yield Ok(Event::default()
+            .event("overview")
+            .data(serde_json::json!({
+                "total_namespaces": total_namespaces,
+                "total_documents": total_docs
+            }).to_string()));
+
+        // Stream per-namespace summary
+        for (i, (ns_name, doc_count)) in namespaces.iter().enumerate() {
+            // Get documents for this namespace to compute layer distribution + keywords
+            let mut layer_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut all_keywords: Vec<String> = Vec::new();
+
+            if let Ok(docs) = state.rag.storage().get_all_in_namespace(ns_name).await {
+                for doc in &docs {
+                    let layer_name = SliceLayer::from_u8(doc.layer)
+                        .map(|l| l.name().to_string())
+                        .unwrap_or_else(|| "flat".to_string());
+                    *layer_counts.entry(layer_name).or_insert(0) += 1;
+
+                    for kw in &doc.keywords {
+                        if all_keywords.len() < 20 && !all_keywords.contains(kw) {
+                            all_keywords.push(kw.clone());
+                        }
+                    }
+                }
+            }
+
+            let ns_summary = serde_json::json!({
+                "name": ns_name,
+                "document_count": doc_count,
+                "layers": layer_counts,
+                "sample_keywords": all_keywords,
+                "index": i,
+            });
+
+            yield Ok(Event::default()
+                .event("namespace")
+                .id(i.to_string())
+                .data(ns_summary.to_string()));
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        yield Ok(Event::default()
+            .event("done")
+            .data(serde_json::json!({
+                "status": "complete",
+                "total_namespaces": total_namespaces,
+                "total_documents": total_docs,
+                "elapsed_ms": start.elapsed().as_millis() as u64
+            }).to_string()));
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+/// SSE streaming optimize endpoint - runs compact + prune with progress events
+/// POST /sse/optimize - streams optimization progress and stats
+async fn sse_optimize_handler(
+    State(state): State<HttpState>,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let stream = async_stream::stream! {
+        let start = std::time::Instant::now();
+
+        // Pre-optimize stats
+        let pre_stats = state.rag.storage().stats().await.ok();
+
+        yield Ok(Event::default()
+            .event("start")
+            .data(serde_json::json!({
+                "status": "starting_optimization",
+                "db_path": state.rag.storage().lance_path(),
+                "pre_row_count": pre_stats.as_ref().map(|s| s.row_count),
+                "pre_version_count": pre_stats.as_ref().map(|s| s.version_count),
+            }).to_string()));
+
+        // Phase 1: Compact
+        yield Ok(Event::default()
+            .event("phase")
+            .data(serde_json::json!({
+                "phase": "compact",
+                "status": "running",
+                "description": "Merging small files into larger ones"
+            }).to_string()));
+
+        let compact_result = state.rag.storage().compact().await;
+
+        match &compact_result {
+            Ok(stats) => {
+                yield Ok(Event::default()
+                    .event("compact_done")
+                    .data(serde_json::json!({
+                        "phase": "compact",
+                        "status": "complete",
+                        "files_removed": stats.compaction.as_ref().map(|c| c.files_removed),
+                        "files_added": stats.compaction.as_ref().map(|c| c.files_added),
+                        "fragments_removed": stats.compaction.as_ref().map(|c| c.fragments_removed),
+                        "fragments_added": stats.compaction.as_ref().map(|c| c.fragments_added),
+                    }).to_string()));
+            }
+            Err(e) => {
+                yield Ok(Event::default()
+                    .event("compact_error")
+                    .data(serde_json::json!({
+                        "phase": "compact",
+                        "status": "error",
+                        "error": e.to_string()
+                    }).to_string()));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Phase 2: Prune old versions
+        yield Ok(Event::default()
+            .event("phase")
+            .data(serde_json::json!({
+                "phase": "prune",
+                "status": "running",
+                "description": "Removing old versions (>7 days)"
+            }).to_string()));
+
+        let prune_result = state.rag.storage().cleanup(Some(7)).await;
+
+        match &prune_result {
+            Ok(stats) => {
+                yield Ok(Event::default()
+                    .event("prune_done")
+                    .data(serde_json::json!({
+                        "phase": "prune",
+                        "status": "complete",
+                        "old_versions": stats.prune.as_ref().map(|p| p.old_versions),
+                        "bytes_removed": stats.prune.as_ref().map(|p| p.bytes_removed),
+                    }).to_string()));
+            }
+            Err(e) => {
+                yield Ok(Event::default()
+                    .event("prune_error")
+                    .data(serde_json::json!({
+                        "phase": "prune",
+                        "status": "error",
+                        "error": e.to_string()
+                    }).to_string()));
+            }
+        }
+
+        // Post-optimize stats
+        let post_stats = state.rag.storage().stats().await.ok();
+
+        yield Ok(Event::default()
+            .event("done")
+            .data(serde_json::json!({
+                "status": "complete",
+                "post_row_count": post_stats.as_ref().map(|s| s.row_count),
+                "post_version_count": post_stats.as_ref().map(|s| s.version_count),
+                "compact_ok": compact_result.is_ok(),
+                "prune_ok": prune_result.is_ok(),
+                "elapsed_ms": start.elapsed().as_millis() as u64
+            }).to_string()));
+    };
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
 /// Upsert document endpoint (POST /upsert) - uses memory_upsert
 async fn upsert_handler(
     State(state): State<HttpState>,
@@ -1587,6 +1840,13 @@ async fn upsert_handler(
             error!("Upsert error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
+
+    // Track namespace activity for discovery endpoint
+    state
+        .namespace_activity
+        .write()
+        .await
+        .insert(req.namespace.clone(), chrono::Utc::now().to_rfc3339());
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -1632,6 +1892,13 @@ async fn index_handler(
             error!("Index error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
+
+    // Track namespace activity for discovery endpoint
+    state
+        .namespace_activity
+        .write()
+        .await
+        .insert(req.namespace.clone(), chrono::Utc::now().to_rfc3339());
 
     Ok(Json(serde_json::json!({
         "status": "indexed",
@@ -2159,6 +2426,7 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
         mcp_sessions: Arc::new(McpSessionManager::new()),
         mcp_base_url: Arc::new(RwLock::new(base_url.clone())),
         cached_namespaces: cached_namespaces.clone(),
+        namespace_activity: Arc::new(RwLock::new(HashMap::new())),
     };
 
     // Spawn background task to refresh namespace cache every 5 minutes
@@ -2167,10 +2435,9 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
     tokio::spawn(async move {
         // Initial load (with longer timeout for startup)
         info!("Background: Loading namespace cache (may take a while on large DB)...");
-        match tokio::time::timeout(
-            Duration::from_secs(120),
-            bg_rag.storage().list_namespaces(),
-        ).await {
+        match tokio::time::timeout(Duration::from_secs(120), bg_rag.storage().list_namespaces())
+            .await
+        {
             Ok(Ok(ns_list)) => {
                 let namespaces: Vec<NamespaceInfo> = ns_list
                     .into_iter()
@@ -2181,7 +2448,10 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
             }
             Ok(Err(e)) => {
                 // Database error (likely "too many open files" - needs optimize)
-                warn!("Background: Namespace load FAILED: {} - run 'rmcp-memex optimize' to fix", e);
+                warn!(
+                    "Background: Namespace load FAILED: {} - run 'rmcp-memex optimize' to fix",
+                    e
+                );
             }
             Err(_) => {
                 warn!("Background: Namespace load timed out (120s) - will retry");
@@ -2195,10 +2465,9 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
         loop {
             interval.tick().await;
             debug!("Background: Refreshing namespace cache...");
-            match tokio::time::timeout(
-                Duration::from_secs(60),
-                bg_rag.storage().list_namespaces(),
-            ).await {
+            match tokio::time::timeout(Duration::from_secs(60), bg_rag.storage().list_namespaces())
+                .await
+            {
                 Ok(Ok(ns_list)) => {
                     let namespaces: Vec<NamespaceInfo> = ns_list
                         .into_iter()
@@ -2208,7 +2477,10 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
                     *bg_cache.write().await = Some(namespaces);
                 }
                 Ok(Err(e)) => {
-                    warn!("Background: Namespace refresh FAILED: {} - run 'rmcp-memex optimize'", e);
+                    warn!(
+                        "Background: Namespace refresh FAILED: {} - run 'rmcp-memex optimize'",
+                        e
+                    );
                 }
                 Err(_) => {
                     debug!("Background: Namespace refresh timed out");
@@ -2222,6 +2494,7 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
     let addr = format!("0.0.0.0:{}", port);
     info!("HTTP/SSE server starting on http://{}", addr);
     info!("  Dashboard: http://{}/ (browse memories visually)", addr);
+    info!("  Discovery: /api/discovery (canonical endpoint)");
     info!("  API: /api/namespaces, /api/overview, /api/browse/:ns");
     info!("  Search: /search, /sse/search, /cross-search");
     info!("  MCP-SSE: /sse/, /messages/");

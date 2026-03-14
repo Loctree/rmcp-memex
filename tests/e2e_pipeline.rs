@@ -7,7 +7,9 @@
 //!
 //! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
-use rmcp_memex::{ChromaDocument, EmbeddingClient, EmbeddingConfig, ProviderConfig, StorageManager};
+use rmcp_memex::{
+    ChromaDocument, EmbeddingClient, EmbeddingConfig, ProviderConfig, StorageManager,
+};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -96,11 +98,26 @@ async fn test_e2e_index_embed_search() {
 
     // Test documents
     let test_docs = vec![
-        ("doc-rust", "Rust is a systems programming language focused on safety and performance."),
-        ("doc-python", "Python is a high-level interpreted language known for its readability."),
-        ("doc-javascript", "JavaScript is the language of the web, running in browsers and Node.js."),
-        ("doc-veterinary", "Veterinary medicine involves the diagnosis and treatment of animals."),
-        ("doc-ai", "Artificial intelligence enables machines to learn from experience."),
+        (
+            "doc-rust",
+            "Rust is a systems programming language focused on safety and performance.",
+        ),
+        (
+            "doc-python",
+            "Python is a high-level interpreted language known for its readability.",
+        ),
+        (
+            "doc-javascript",
+            "JavaScript is the language of the web, running in browsers and Node.js.",
+        ),
+        (
+            "doc-veterinary",
+            "Veterinary medicine involves the diagnosis and treatment of animals.",
+        ),
+        (
+            "doc-ai",
+            "Artificial intelligence enables machines to learn from experience.",
+        ),
     ];
 
     // INDEX: Generate embeddings and store documents
@@ -111,11 +128,7 @@ async fn test_e2e_index_embed_search() {
             .await
             .expect("Failed to generate embedding");
 
-        assert_eq!(
-            embedding.len(),
-            4096,
-            "Embedding dimension should be 4096"
-        );
+        assert_eq!(embedding.len(), 4096, "Embedding dimension should be 4096");
 
         let doc = ChromaDocument::new_flat(
             id.to_string(),
@@ -134,10 +147,7 @@ async fn test_e2e_index_embed_search() {
 
     // SEARCH: Query for programming languages
     let query = "systems programming language with memory safety";
-    let query_embedding = embedder
-        .embed(query)
-        .await
-        .expect("Failed to embed query");
+    let query_embedding = embedder.embed(query).await.expect("Failed to embed query");
 
     let results = storage
         .search_store(Some("e2e-test-ns"), query_embedding, 3)
@@ -185,7 +195,11 @@ async fn test_e2e_batch_embedding() {
         .await
         .expect("Failed to batch embed");
 
-    assert_eq!(embeddings.len(), texts.len(), "Should get embedding for each text");
+    assert_eq!(
+        embeddings.len(),
+        texts.len(),
+        "Should get embedding for each text"
+    );
 
     for (i, emb) in embeddings.iter().enumerate() {
         assert_eq!(
@@ -220,7 +234,10 @@ async fn test_e2e_dimension_validation() {
     // Config with correct dimension
     let config = create_test_embedding_config();
     let result = EmbeddingClient::new(&config).await;
-    assert!(result.is_ok(), "Should connect with correct dimension config");
+    assert!(
+        result.is_ok(),
+        "Should connect with correct dimension config"
+    );
 
     let embedder = result.unwrap();
     let connected = embedder.connected_to();

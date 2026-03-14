@@ -208,7 +208,6 @@ fn get_hostname() -> String {
         .unwrap_or_else(|_| "local".to_string())
 }
 
-
 /// Database path mode for multi-host setups
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbPathMode {
@@ -259,7 +258,6 @@ impl MemexCfg {
             DbPathMode::PerHost => format!("{}.{}", self.db_path, self.hostname),
         }
     }
-
 }
 
 /// Main application state.
