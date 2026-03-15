@@ -972,29 +972,6 @@ impl MCPServer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_notification_request;
-    use serde_json::json;
-
-    #[test]
-    fn detects_notification_when_id_is_missing() {
-        assert!(is_notification_request(&json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        })));
-    }
-
-    #[test]
-    fn request_with_id_is_not_notification() {
-        assert!(!is_notification_request(&json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list"
-        })));
-    }
-}
-
 pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
     // Initialize embedding client with config-driven provider cascade
     let embedding_client = EmbeddingClient::new(&config.embeddings).await?;
@@ -1006,8 +983,6 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
 
     let db_path = shellexpand::tilde(&config.db_path).to_string();
     let storage = Arc::new(StorageManager::new(&db_path).await?);
-    // NOTE: Removed ensure_collection() - table opens lazily on first use
-    // This speeds up MCP server startup significantly
     let rag = Arc::new(RAGPipeline::new(embedding_client.clone(), storage.clone()).await?);
 
     // Initialize hybrid searcher if mode is not vector-only
@@ -1034,4 +1009,27 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
         allowed_paths: config.allowed_paths,
         access_manager,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_notification_request;
+    use serde_json::json;
+
+    #[test]
+    fn detects_notification_when_id_is_missing() {
+        assert!(is_notification_request(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })));
+    }
+
+    #[test]
+    fn request_with_id_is_not_notification() {
+        assert!(!is_notification_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })));
+    }
 }
