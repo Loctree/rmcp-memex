@@ -520,10 +520,9 @@ pub fn write_host_config(
     // Read existing content or use empty string
     let existing_content = if host.exists {
         // Validate path before reading
-        let (_safe_path, content) = crate::path_utils::safe_read_to_string(
-            &host.path.to_string_lossy(),
-        )
-        .with_context(|| format!("Cannot read config: {}", host.path.display()))?;
+        let (_safe_path, content) =
+            crate::path_utils::safe_read_to_string(&host.path.to_string_lossy())
+                .with_context(|| format!("Cannot read config: {}", host.path.display()))?;
         content
     } else {
         String::new()

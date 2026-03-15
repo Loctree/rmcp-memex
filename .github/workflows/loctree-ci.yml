@@ -43,7 +43,7 @@ jobs:
           toolchain: stable
 
       - name: Install loctree
-        run: cargo install mcp-server-loctree --locked
+        run: cargo install loctree --locked
 
       - name: Run Full Scan
         id: scan

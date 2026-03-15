@@ -68,7 +68,10 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
 
     // Check for path traversal on raw input BEFORE any expansion
     if path_str.contains("..") || path_str.contains('\0') || path_str.contains('\n') {
-        return Err(anyhow!("Path traversal detected: invalid sequences in '{}'", path_str));
+        return Err(anyhow!(
+            "Path traversal detected: invalid sequences in '{}'",
+            path_str
+        ));
     }
 
     // Expand ~ and canonicalize through path_utils (centralized validation)

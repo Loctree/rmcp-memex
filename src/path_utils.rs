@@ -263,8 +263,14 @@ pub async fn safe_read_dir(path: &Path) -> Result<(PathBuf, tokio::fs::ReadDir)>
 pub fn safe_copy(src: &Path, dst: &Path) -> Result<PathBuf> {
     let safe_src = validate_read_path(src)?;
     let safe_dst = validate_write_path(dst)?;
-    std::fs::copy(&safe_src, &safe_dst)
-        .map_err(|e| anyhow!("Failed to copy '{}' → '{}': {}", safe_src.display(), safe_dst.display(), e))?;
+    std::fs::copy(&safe_src, &safe_dst).map_err(|e| {
+        anyhow!(
+            "Failed to copy '{}' → '{}': {}",
+            safe_src.display(),
+            safe_dst.display(),
+            e
+        )
+    })?;
     Ok(safe_dst)
 }
 
