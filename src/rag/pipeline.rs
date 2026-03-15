@@ -21,7 +21,7 @@
 //! `index_documents_pipeline()` directly.
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -215,7 +215,7 @@ pub async fn stage_read_files(
 }
 
 /// Extract text content from a file (PDF or text)
-async fn extract_file_text(path: &PathBuf) -> Result<String> {
+async fn extract_file_text(path: &Path) -> Result<String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -224,14 +224,15 @@ async fn extract_file_text(path: &PathBuf) -> Result<String> {
 
     if ext == "pdf" {
         // pdf_extract is blocking; offload to blocking thread
-        let path = path.clone();
+        let path = path.to_path_buf();
         let pdf_text =
             tokio::task::spawn_blocking(move || pdf_extract::extract_text(&path)).await??;
         return Ok(pdf_text);
     }
 
-    // Default: treat as UTF-8 text
-    tokio::fs::read_to_string(path).await.map_err(|e| e.into())
+    // Default: treat as UTF-8 text (validated read)
+    let (_p, content) = crate::path_utils::safe_read_to_string_async(path).await?;
+    Ok(content)
 }
 
 // =============================================================================

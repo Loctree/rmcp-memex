@@ -51,7 +51,7 @@ async fn memory_roundtrip_and_search() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let db_path = tmp.path().join(".lancedb");
 
-    let storage = Arc::new(StorageManager::new(64, &db_path.to_string_lossy()).await?);
+    let storage = Arc::new(StorageManager::new(&db_path.to_string_lossy()).await?);
     storage.ensure_collection().await?;
 
     let rag = RAGPipeline::new(mlx, storage.clone()).await?;

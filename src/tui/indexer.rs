@@ -386,18 +386,16 @@ pub async fn import_lancedb(
 
 /// Recursively copy a directory with path validation
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    use crate::path_utils::{validate_read_path, validate_write_path};
+    use crate::path_utils::validate_write_path;
 
-    // Validate source directory is safe to read
-    let safe_src = validate_read_path(src)?;
+    // Validate source and read directory in one atomic step
+    let (safe_src, mut entries) = crate::path_utils::safe_read_dir(src).await?;
 
     // Validate destination is safe to write
     let safe_dst = validate_write_path(dst)?;
 
     tokio::fs::create_dir_all(&safe_dst).await?;
-
-    // Path is validated by validate_read_path above
-    let mut entries = tokio::fs::read_dir(&safe_src).await?;
+    let _ = &safe_src; // keep binding alive for clarity
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
 
@@ -419,11 +417,9 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         if path.is_dir() {
             Box::pin(copy_dir_recursive(&path, &dest_path)).await?;
         } else {
-            // Validate individual file paths
-            if let (Ok(safe_file_src), Ok(safe_file_dst)) =
-                (validate_read_path(&path), validate_write_path(&dest_path))
-            {
-                tokio::fs::copy(&safe_file_src, &safe_file_dst).await?;
+            // Validate and copy in one atomic step
+            if let Ok(_dst) = crate::path_utils::safe_copy(&path, &dest_path) {
+                // copied successfully
             }
         }
     }

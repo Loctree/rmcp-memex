@@ -1,0 +1,24 @@
+# Copyright (c) 2025-2026 VetCoders (https://vetcoders.io)
+name: Bug Report
+description: Report a reproducible problem in rmcp-memex
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Share the smallest set of steps that reproduces the issue.
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. Observe ...
+    validations:
+      required: true

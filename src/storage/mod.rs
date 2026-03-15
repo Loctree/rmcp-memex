@@ -174,7 +174,7 @@ type BatchIter =
     RecordBatchIterator<std::vec::IntoIter<std::result::Result<RecordBatch, ArrowError>>>;
 
 impl StorageManager {
-    pub async fn new(_cache_mb: usize, db_path: &str) -> Result<Self> {
+    pub async fn new(db_path: &str) -> Result<Self> {
         // Embedded LanceDB path (expand ~, allow override via env)
         let lance_env = std::env::var("LANCEDB_PATH").unwrap_or_else(|_| db_path.to_string());
         let lance_path = if lance_env.trim().is_empty() {

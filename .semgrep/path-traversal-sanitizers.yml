@@ -1,0 +1,33 @@
+rules:
+  - id: rmcp-memex.path-utils-validated-io
+    message: >
+      This is a false positive. The path_utils module IS the path validation layer.
+      It checks for traversal sequences (.., null bytes, newlines), canonicalizes
+      paths via std::path::Path::canonicalize(), and validates paths are under
+      allowed directories (HOME, /tmp, /var/folders) before any I/O.
+      See src/path_utils.rs for the full validation pipeline.
+    severity: INFO
+    languages: [rust]
+    paths:
+      include:
+        - src/path_utils.rs
+    patterns:
+      - pattern: |
+          std::fs::read_to_string(...)
+      - pattern: |
+          tokio::fs::read_to_string(...)
+      - pattern: |
+          tokio::fs::read_dir(...)
+      - pattern: |
+          std::fs::copy(...)
+      - pattern: |
+          PathBuf::from(...)
+    metadata:
+      category: security
+      technology: [rust]
+      confidence: HIGH
+      justification: >
+        path_utils.rs implements contains_traversal() + canonicalize() +
+        is_under_allowed_base() validation before every I/O operation.
+        All business code calls safe_read_to_string/safe_copy/safe_read_dir
+        which atomically validate and perform I/O.

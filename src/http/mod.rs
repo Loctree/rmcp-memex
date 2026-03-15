@@ -33,13 +33,15 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, Query, Request, State},
+    http::{HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{
         Html, IntoResponse,
         sse::{Event, Sse},
@@ -49,7 +51,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{RwLock, broadcast};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
 use crate::rag::{RAGPipeline, SearchResult, SliceLayer};
@@ -840,6 +842,8 @@ pub struct HttpState {
     pub cached_namespaces: Arc<RwLock<Option<Vec<NamespaceInfo>>>>,
     /// Per-namespace last activity timestamp (updated on upsert/index)
     pub namespace_activity: Arc<RwLock<HashMap<String, String>>>,
+    /// Optional Bearer token for authenticating mutating requests
+    pub auth_token: Option<String>,
 }
 
 /// Search request body
@@ -1004,15 +1008,99 @@ pub struct HealthResponse {
     pub embedding_provider: String,
 }
 
-/// Create the HTTP router
-pub fn create_router(state: HttpState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+/// Bearer token auth middleware for mutating endpoints.
+/// If the server has an auth_token configured, requires `Authorization: Bearer <token>`.
+/// Returns 401 if the token is missing or doesn't match.
+async fn auth_middleware(
+    State(state): State<HttpState>,
+    request: Request,
+    next: Next,
+) -> impl IntoResponse {
+    if let Some(ref expected) = state.auth_token {
+        let auth_header = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok());
 
-    Router::new()
-        // Dashboard & Browse API
+        match auth_header {
+            Some(header) if header.starts_with("Bearer ") => {
+                let token = &header[7..];
+                if token != expected.as_str() {
+                    return Err((
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({"error": "missing or invalid auth token"})),
+                    ));
+                }
+            }
+            _ => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "missing or invalid auth token"})),
+                ));
+            }
+        }
+    }
+    Ok(next.run(request).await)
+}
+
+/// HTTP server configuration passed to `create_router` and `start_server`
+#[derive(Clone)]
+pub struct HttpServerConfig {
+    /// Bearer token for auth on mutating endpoints. None = no auth.
+    pub auth_token: Option<String>,
+    /// Allowed CORS origins. Empty = same-origin only (unless localhost).
+    pub cors_origins: Vec<String>,
+    /// Bind address. Defaults to 127.0.0.1.
+    pub bind_address: IpAddr,
+}
+
+impl Default for HttpServerConfig {
+    fn default() -> Self {
+        Self {
+            auth_token: None,
+            cors_origins: Vec::new(),
+            bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+        }
+    }
+}
+
+/// Create the HTTP router
+pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
+    let is_localhost = config.bind_address.is_loopback();
+
+    // CORS policy: permissive on localhost, restrictive otherwise
+    let cors = if is_localhost && config.cors_origins.is_empty() {
+        // Localhost with no explicit origins: permissive (safe since local only)
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
+    } else if config.cors_origins.is_empty() {
+        // Non-localhost with no explicit origins: restrict to GET/POST, same-origin
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
+    } else {
+        // Explicit origins configured
+        let origins: Vec<HeaderValue> = config
+            .cors_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::AUTHORIZATION,
+            ])
+    };
+
+    // Read-only routes (no auth required)
+    let public_routes = Router::new()
         .route("/", get(dashboard_handler))
         .route("/api/discovery", get(discovery_handler))
         .route("/api/namespaces", get(namespaces_handler))
@@ -1021,28 +1109,43 @@ pub fn create_router(state: HttpState) -> Router {
         .route("/api/browse", get(browse_all_handler))
         .route("/api/browse/", get(browse_all_handler))
         .route("/api/browse/{ns}", get(browse_handler))
-        // Core API
         .route("/health", get(health_handler))
-        .route("/refresh", post(refresh_handler))
         .route("/search", post(search_handler))
         .route("/sse/search", get(sse_search_handler))
         .route("/cross-search", get(cross_search_handler))
         .route("/sse/cross-search", get(sse_cross_search_handler))
         .route("/sse/namespaces", get(sse_namespaces_handler))
+        .route("/expand/{ns}/{id}", get(expand_handler))
+        .route("/parent/{ns}/{id}", get(parent_handler))
+        .route("/get/{ns}/{id}", get(get_handler));
+
+    // Mutating routes (auth required when token is configured)
+    let authed_routes = Router::new()
+        .route("/refresh", post(refresh_handler))
         .route("/sse/optimize", post(sse_optimize_handler))
         .route("/upsert", post(upsert_handler))
         .route("/index", post(index_handler))
-        .route("/expand/{ns}/{id}", get(expand_handler))
-        .route("/parent/{ns}/{id}", get(parent_handler))
-        .route("/get/{ns}/{id}", get(get_handler))
         .route("/delete/{ns}/{id}", post(delete_handler))
         .route("/ns/{namespace}", delete(purge_namespace_handler))
-        // MCP-over-SSE endpoints for Claude Code compatibility
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    // MCP-over-SSE endpoints (auth required when token is configured)
+    let mcp_routes = Router::new()
         .route("/mcp/", get(mcp_sse_handler))
         .route("/mcp/messages/", post(mcp_messages_handler))
-        // Also support /sse/ path for FastMCP compatibility
         .route("/sse/", get(mcp_sse_handler))
         .route("/messages/", post(mcp_messages_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    public_routes
+        .merge(authed_routes)
+        .merge(mcp_routes)
         .layer(cors)
         .with_state(state)
 }
@@ -2416,10 +2519,30 @@ async fn handle_mcp_request(
 }
 
 /// Start the HTTP server with shared RAGPipeline
-pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()> {
+pub async fn start_server(
+    rag: Arc<RAGPipeline>,
+    port: u16,
+    server_config: HttpServerConfig,
+) -> anyhow::Result<()> {
     // Fallback base_url - actual URL is derived from Host header in mcp_sse_handler
-    let base_url = format!("http://localhost:{}", port);
+    let base_url = format!("http://{}:{}", server_config.bind_address, port);
     let cached_namespaces = Arc::new(RwLock::new(None));
+
+    // Log auth status
+    if server_config.auth_token.is_some() {
+        info!("HTTP auth: Bearer token required for mutating endpoints");
+    } else {
+        warn!(
+            "WARNING: HTTP server running without auth token. Set MEMEX_AUTH_TOKEN or use --auth-token."
+        );
+    }
+
+    // Warn if exposed on network without auth
+    if !server_config.bind_address.is_loopback() && server_config.auth_token.is_none() {
+        warn!(
+            "WARNING: HTTP server exposed on network without auth token. Set MEMEX_AUTH_TOKEN or use --auth-token."
+        );
+    }
 
     let state = HttpState {
         rag: rag.clone(),
@@ -2427,6 +2550,7 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
         mcp_base_url: Arc::new(RwLock::new(base_url.clone())),
         cached_namespaces: cached_namespaces.clone(),
         namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+        auth_token: server_config.auth_token.clone(),
     };
 
     // Spawn background task to refresh namespace cache every 5 minutes
@@ -2489,9 +2613,9 @@ pub async fn start_server(rag: Arc<RAGPipeline>, port: u16) -> anyhow::Result<()
         }
     });
 
-    let app = create_router(state);
+    let app = create_router(state, &server_config);
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("{}:{}", server_config.bind_address, port);
     info!("HTTP/SSE server starting on http://{}", addr);
     info!("  Dashboard: http://{}/ (browse memories visually)", addr);
     info!("  Discovery: /api/discovery (canonical endpoint)");

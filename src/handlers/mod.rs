@@ -40,6 +40,10 @@ fn jsonrpc_success(id: &Value, result: Value) -> Value {
     }
 }
 
+fn is_notification_request(request: &Value) -> bool {
+    request.get("id").is_none()
+}
+
 use crate::{
     ServerConfig,
     embeddings::EmbeddingClient,
@@ -62,21 +66,13 @@ fn validate_path(path_str: &str, allowed_paths: &[String]) -> Result<std::path::
         return Err(anyhow!("Path cannot be empty"));
     }
 
-    // Expand ~ to home directory
-    let expanded = shellexpand::tilde(path_str).to_string();
-    // This IS the path validation/sanitization function - not a vulnerability
-    let path = Path::new(&expanded);
-
-    // Check for obvious path traversal patterns before canonicalization
-    let path_string = path_str.to_string();
-    if path_string.contains("..") {
-        return Err(anyhow!("Path traversal detected: '..' not allowed"));
+    // Check for path traversal on raw input BEFORE any expansion
+    if path_str.contains("..") || path_str.contains('\0') || path_str.contains('\n') {
+        return Err(anyhow!("Path traversal detected: invalid sequences in '{}'", path_str));
     }
 
-    // Canonicalize to resolve symlinks and get absolute path
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| anyhow!("Cannot resolve path '{}': {}", path_str, e))?;
+    // Expand ~ and canonicalize through path_utils (centralized validation)
+    let canonical = crate::path_utils::sanitize_existing_path(path_str)?;
 
     // Determine allowed base paths
     let is_safe = if allowed_paths.is_empty() {
@@ -191,10 +187,11 @@ impl MCPServer {
                 }
             };
 
+            let is_notification = is_notification_request(&request);
             let response = self.handle_request(request).await;
 
             // Don't send response for notifications (JSON-RPC spec: notifications get no reply)
-            if response.get("_notification").is_some() {
+            if is_notification {
                 continue;
             }
 
@@ -960,9 +957,7 @@ impl MCPServer {
 
             // MCP notifications (no response expected per JSON-RPC spec)
             method if method.starts_with("notifications/") => {
-                // Notifications don't get responses - return empty object
-                // The caller should check for this and not send anything
-                return json!({"_notification": true});
+                json!(null)
             }
 
             _ => {
@@ -971,6 +966,29 @@ impl MCPServer {
         };
 
         jsonrpc_success(&id, result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_notification_request;
+    use serde_json::json;
+
+    #[test]
+    fn detects_notification_when_id_is_missing() {
+        assert!(is_notification_request(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        })));
+    }
+
+    #[test]
+    fn request_with_id_is_not_notification() {
+        assert!(!is_notification_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        })));
     }
 }
 
@@ -984,7 +1002,7 @@ pub async fn create_server(config: ServerConfig) -> Result<MCPServer> {
     let embedding_client = Arc::new(Mutex::new(embedding_client));
 
     let db_path = shellexpand::tilde(&config.db_path).to_string();
-    let storage = Arc::new(StorageManager::new(config.cache_mb, &db_path).await?);
+    let storage = Arc::new(StorageManager::new(&db_path).await?);
     // NOTE: Removed ensure_collection() - table opens lazily on first use
     // This speeds up MCP server startup significantly
     let rag = Arc::new(RAGPipeline::new(embedding_client.clone(), storage.clone()).await?);

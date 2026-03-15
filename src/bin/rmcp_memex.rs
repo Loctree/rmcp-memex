@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -55,37 +55,8 @@ fn discover_config() -> Option<String> {
 }
 
 fn load_file_config(path: &str) -> Result<FileConfig> {
-    let expanded = shellexpand::tilde(path).to_string();
-    // This is the START of path validation - canonicalize resolves symlinks
-    let canonical = std::path::Path::new(&expanded)
-        .canonicalize()
-        .map_err(|e| anyhow::anyhow!("Cannot resolve config path '{}': {}", path, e))?;
-
-    // Security: validate path is under home directory or current working directory
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .ok();
-    let cwd = std::env::current_dir().ok();
-
-    let is_safe = home
-        .as_ref()
-        .map(|h| canonical.starts_with(h))
-        .unwrap_or(false)
-        || cwd
-            .as_ref()
-            .map(|c| canonical.starts_with(c))
-            .unwrap_or(false);
-
-    if !is_safe {
-        return Err(anyhow::anyhow!(
-            "Access denied: config path '{}' is outside allowed directories",
-            path
-        ));
-    }
-
-    // Path is validated above: canonicalized + checked against HOME/CWD
-    let contents = std::fs::read_to_string(&canonical)?;
+    let (_canonical, contents) = path_utils::safe_read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("Cannot load config '{}': {}", path, e))?;
     toml::from_str(&contents).map_err(Into::into)
 }
 
@@ -129,6 +100,12 @@ struct FileConfig {
     /// Automatic maintenance configuration
     #[serde(default)]
     maintenance: Option<MaintenanceFileConfig>,
+    /// Bearer token for HTTP auth (mutating endpoints)
+    auth_token: Option<String>,
+    /// Bind address for HTTP server (default: 127.0.0.1)
+    bind_address: Option<String>,
+    /// Allowed CORS origins (comma-separated list)
+    cors_origins: Option<String>,
 }
 
 /// New embedding configuration from TOML
@@ -348,6 +325,21 @@ struct Cli {
     /// Requires --http-port to be set.
     #[arg(long, global = true)]
     http_only: bool,
+
+    /// Bearer token for authenticating mutating HTTP endpoints.
+    /// Can also be set via MEMEX_AUTH_TOKEN env var.
+    #[arg(long, global = true)]
+    auth_token: Option<String>,
+
+    /// Bind address for the HTTP server. Defaults to 127.0.0.1 (localhost only).
+    /// Use 0.0.0.0 to expose on all interfaces (requires --auth-token for safety).
+    #[arg(long, global = true)]
+    bind_address: Option<String>,
+
+    /// Allowed CORS origins (comma-separated). If empty, defaults to same-origin
+    /// when bound to non-localhost, or permissive when bound to localhost.
+    #[arg(long, global = true)]
+    cors_origins: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -3154,16 +3146,7 @@ async fn run_import(
     db_path: String,
     embedding_config: &EmbeddingConfig,
 ) -> Result<()> {
-    // Validate and sanitize input file path (prevents path traversal)
-    // validate_read_path checks: exists, no ".." traversal, canonicalizes, validates under allowed base dirs
-    let validated_input = path_utils::validate_read_path(&input)?;
-
-    // Read JSONL file
-    // SAFETY: validated_input has been sanitized by validate_read_path which:
-    // 1. Checks for path traversal sequences (.., null bytes, newlines)
-    // 2. Canonicalizes the path (resolves symlinks)
-    // 3. Validates the path is under allowed directories (home, /tmp, /var/folders)
-    let content = tokio::fs::read_to_string(&validated_input).await?;
+    let (_validated_input, content) = path_utils::safe_read_to_string_async(&input).await?;
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
 
     if lines.is_empty() {
@@ -3211,7 +3194,10 @@ async fn run_import(
 
         // Check if record has embeddings
         if record.embeddings.is_some() {
-            let emb = record.embeddings.clone().unwrap();
+            let emb = record
+                .embeddings
+                .clone()
+                .ok_or_else(|| anyhow!("missing embeddings"))?;
             records_with_embeddings.push((record, emb));
         } else {
             records_to_embed.push((record, line_num));
@@ -5733,6 +5719,46 @@ async fn main() -> Result<()> {
                 ));
             }
 
+            // Build HTTP server security config
+            // Priority: CLI flag > env var > config file > default
+            let (file_cfg_ref, _) = load_or_discover_config(cli.config.as_deref())?;
+            let auth_token = cli
+                .auth_token
+                .clone()
+                .or_else(|| std::env::var("MEMEX_AUTH_TOKEN").ok())
+                .or_else(|| file_cfg_ref.auth_token.clone());
+
+            let bind_addr_str = cli
+                .bind_address
+                .clone()
+                .or_else(|| file_cfg_ref.bind_address.clone())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let bind_address: std::net::IpAddr = bind_addr_str.parse().unwrap_or_else(|_| {
+                eprintln!(
+                    "Invalid bind address '{}', falling back to 127.0.0.1",
+                    bind_addr_str
+                );
+                std::net::Ipv4Addr::LOCALHOST.into()
+            });
+
+            let cors_origins: Vec<String> = cli
+                .cors_origins
+                .clone()
+                .or_else(|| file_cfg_ref.cors_origins.clone())
+                .map(|s| {
+                    s.split(',')
+                        .map(|o| o.trim().to_string())
+                        .filter(|o| !o.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let http_server_config = rmcp_memex::http::HttpServerConfig {
+                auth_token,
+                cors_origins,
+                bind_address,
+            };
+
             let mut config = cli.into_server_config()?;
 
             // HTTP-only mode uses read-only BM25 (no lock contention for multi-agent access)
@@ -5761,7 +5787,7 @@ async fn main() -> Result<()> {
                 let port = http_port.expect("validated above");
                 let rag = server.rag();
                 info!("Starting HTTP-only server on port {} (no MCP stdio)", port);
-                rmcp_memex::http::start_server(rag, port).await?;
+                rmcp_memex::http::start_server(rag, port, http_server_config).await?;
                 return Ok(());
             }
 
@@ -5770,7 +5796,9 @@ async fn main() -> Result<()> {
                 let rag = server.rag();
                 info!("Starting HTTP/SSE server on port {}", port);
                 tokio::spawn(async move {
-                    if let Err(e) = rmcp_memex::http::start_server(rag, port).await {
+                    if let Err(e) =
+                        rmcp_memex::http::start_server(rag, port, http_server_config).await
+                    {
                         tracing::error!("HTTP server error: {}", e);
                     }
                 });

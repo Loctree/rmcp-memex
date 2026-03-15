@@ -1,4 +1,5 @@
 # rmcp-memex
+[![Crates.io](https://img.shields.io/crates/v/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![License](https://img.shields.io/crates/l/rmcp-memex)](LICENSE) [![Downloads](https://img.shields.io/crates/d/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![CI](https://github.com/VetCoders/rmcp-memex/actions/workflows/ci.yml/badge.svg)](https://github.com/VetCoders/rmcp-memex/actions)
 
 RAG/Memory MCP Server with LanceDB vector storage for AI agents.
 

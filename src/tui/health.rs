@@ -438,9 +438,9 @@ mod tests {
     fn test_db_path_check() {
         let checker = HealthChecker::new();
 
-        // Test with temp directory (should pass)
-        let temp_dir = std::env::temp_dir();
-        let temp_path = temp_dir.join("rmcp_memex_test");
+        // Test with unique temp directory (avoids predictable temp path)
+        let tmp = tempfile::tempdir().unwrap();
+        let temp_path = tmp.path().join("rmcp_memex_test");
         let item = checker.check_db_path(temp_path.to_str().unwrap());
         // Should either pass (writable) or indicate will create
         assert!(item.status.is_pass() || matches!(item.status, CheckStatus::Fail(_)));

@@ -421,11 +421,9 @@ fn extract_keywords(text: &str, max_keywords: usize) -> Vec<String> {
 
 /// Create short hash for document deduplication
 fn hash_content(text: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    text.hash(&mut hasher);
-    format!("{:x}", hasher.finish()).chars().take(12).collect()
+    let mut hash = compute_content_hash(text);
+    hash.truncate(16);
+    hash
 }
 
 /// Extract conversation documents from JSON with smart format detection.
@@ -1237,9 +1235,10 @@ impl RAGPipeline {
 
         let mut total_chunks = 0;
         let mut skipped_docs = 0;
-        // Path is validated by caller (index_document_with_dedup) via validate_read_path
-        let file_content_hash =
-            compute_content_hash(&tokio::fs::read_to_string(path).await.unwrap_or_default());
+        let file_content_hash = match crate::path_utils::safe_read_to_string_async(path).await {
+            Ok((_p, content)) => compute_content_hash(&content),
+            Err(_) => compute_content_hash(""),
+        };
 
         for (doc_id, content, mut doc_metadata) in documents {
             if content.len() < 50 {
@@ -2104,9 +2103,9 @@ impl RAGPipeline {
             return Ok(pdf_text);
         }
 
-        // Default: treat as UTF-8 text
-        // Path is validated by caller (handlers::validate_path) before reaching this private method
-        tokio::fs::read_to_string(path).await.map_err(|e| e.into())
+        // Default: treat as UTF-8 text (validated read)
+        let (_p, content) = crate::path_utils::safe_read_to_string_async(path).await?;
+        Ok(content)
     }
 
     /// Extract multiple documents from a JSON file if it contains an array.
@@ -2134,9 +2133,8 @@ impl RAGPipeline {
             return Ok(vec![(doc_id, text, metadata)]);
         }
 
-        // Try to parse as JSON
-        // Path is validated by caller (index_document_with_dedup) via validate_read_path
-        let raw = tokio::fs::read_to_string(path).await?;
+        // Try to parse as JSON (validated read)
+        let (_p, raw) = crate::path_utils::safe_read_to_string_async(path).await?;
         let parsed: serde_json::Value = match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(_) => {
@@ -2781,4 +2779,17 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash_content;
+
+    #[test]
+    fn short_hash_uses_sha256_prefix_with_minimum_length() {
+        let hash = hash_content("same content");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(hash, hash_content("same content"));
+    }
 }

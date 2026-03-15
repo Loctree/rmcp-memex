@@ -398,7 +398,7 @@ fn backup_timestamp() -> String {
 
 /// Create a backup of an existing config file
 fn create_backup(path: &Path) -> Result<PathBuf> {
-    use crate::path_utils::{validate_read_path, validate_write_path};
+    use crate::path_utils::validate_read_path;
 
     // Validate source path is safe to read
     let safe_src = validate_read_path(path).with_context(|| {
@@ -410,16 +410,8 @@ fn create_backup(path: &Path) -> Result<PathBuf> {
 
     let backup_path = PathBuf::from(format!("{}.bak.{}", safe_src.display(), backup_timestamp()));
 
-    // Validate backup destination is safe to write
-    let safe_dst = validate_write_path(&backup_path).with_context(|| {
-        format!(
-            "Cannot backup: destination path validation failed for {}",
-            backup_path.display()
-        )
-    })?;
-
-    // Path is validated by validate_read_path/validate_write_path above
-    std::fs::copy(&safe_src, &safe_dst)
+    // Atomic validated copy: validates both paths and copies in one step
+    let safe_dst = crate::path_utils::safe_copy(&safe_src, &backup_path)
         .with_context(|| format!("Failed to create backup of {}", safe_src.display()))?;
     Ok(safe_dst)
 }
@@ -523,20 +515,16 @@ pub fn write_host_config(
         None
     };
 
-    use crate::path_utils::{validate_read_path, validate_write_path};
+    use crate::path_utils::validate_write_path;
 
     // Read existing content or use empty string
     let existing_content = if host.exists {
         // Validate path before reading
-        let safe_read_path = validate_read_path(&host.path).with_context(|| {
-            format!(
-                "Cannot read config: path validation failed for {}",
-                host.path.display()
-            )
-        })?;
-        // Path is validated by validate_read_path above
-        std::fs::read_to_string(&safe_read_path)
-            .with_context(|| format!("Failed to read {}", safe_read_path.display()))?
+        let (_safe_path, content) = crate::path_utils::safe_read_to_string(
+            &host.path.to_string_lossy(),
+        )
+        .with_context(|| format!("Cannot read config: {}", host.path.display()))?;
+        content
     } else {
         String::new()
     };

@@ -4,8 +4,9 @@ version = "0.4.0"
 edition = "2024"
 build = "src/build.rs"
 description = "RAG/memory MCP server with LanceDB vector storage"
-license = "MIT"
-repository = "https://github.com/Loctree/rmcp-memex"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/VetCoders/rmcp-memex"
+homepage = "https://github.com/VetCoders/rmcp-memex"
 keywords = ["mcp", "rag", "embeddings", "lancedb", "vector-search"]
 categories = ["development-tools", "database"]
 

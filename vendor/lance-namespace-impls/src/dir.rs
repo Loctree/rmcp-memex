@@ -212,7 +212,6 @@ impl DirectoryNamespaceBuilder {
         Ok(DirectoryNamespace {
             root: self.root,
             storage_options: self.storage_options,
-            session: self.session,
             object_store,
             base_path,
         })
@@ -256,8 +255,6 @@ impl DirectoryNamespaceBuilder {
 pub struct DirectoryNamespace {
     root: String,
     storage_options: Option<HashMap<String, String>>,
-    #[allow(dead_code)]
-    session: Option<Arc<Session>>,
     object_store: Arc<ObjectStore>,
     base_path: Path,
 }
