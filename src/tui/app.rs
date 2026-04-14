@@ -247,11 +247,11 @@ impl EmbedderState {
             }
             DimensionTruth::Probed => format!(
                 "Verified live against the provider. {}",
-                dimension_explanation(self.dimension, self.selected_model().as_deref())
+                dimension_explanation(self.dimension)
             ),
             DimensionTruth::Manual => format!(
                 "Set manually by the operator. {}",
-                dimension_explanation(self.dimension, self.selected_model().as_deref())
+                dimension_explanation(self.dimension)
             ),
         }
     }

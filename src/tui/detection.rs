@@ -2,7 +2,6 @@
 //!
 //! Detects Ollama, MLX server, and other embedding providers automatically.
 
-use crate::embeddings::DEFAULT_REQUIRED_DIMENSION;
 use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
@@ -64,10 +63,6 @@ impl DetectedProvider {
         }
     }
 
-    /// Fallback dimension when no probe result is available.
-    pub fn suggested_dimension(&self) -> usize {
-        DEFAULT_REQUIRED_DIMENSION
-    }
 }
 
 fn looks_like_embedding_model(model: &str) -> bool {
@@ -399,7 +394,7 @@ pub async fn check_custom_endpoint(url: &str) -> Result<DetectedProvider> {
 
 /// Get dimension explanation for UI.
 /// Reports the verified dimension without guessing model variants.
-pub fn dimension_explanation(dim: usize, _model_name: Option<&str>) -> String {
+pub fn dimension_explanation(dim: usize) -> String {
     format!("{dim} dims — ensure all providers match this dimension")
 }
 
@@ -411,19 +406,6 @@ mod tests {
     fn test_provider_kind_display() {
         assert_eq!(ProviderKind::Ollama.label(), "Ollama");
         assert_eq!(ProviderKind::Mlx.label(), "MLX Server");
-    }
-
-    #[test]
-    fn suggested_dimension_returns_default_without_probe() {
-        let provider = DetectedProvider {
-            kind: ProviderKind::Ollama,
-            base_url: "http://localhost:11434".to_string(),
-            port: 11434,
-            models: vec![],
-            suggested_model: Some("qwen3-embedding:4b".to_string()),
-            status: ProviderStatus::Online("qwen3-embedding:4b".to_string()),
-        };
-        assert_eq!(provider.suggested_dimension(), DEFAULT_REQUIRED_DIMENSION);
     }
 
     #[test]
@@ -440,7 +422,7 @@ mod tests {
 
     #[test]
     fn dimension_explanation_is_dynamic() {
-        let explanation = dimension_explanation(1536, Some("custom-model"));
+        let explanation = dimension_explanation(1536);
         assert!(explanation.contains("1536"));
     }
 }

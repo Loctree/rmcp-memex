@@ -91,7 +91,9 @@ pub fn spawn_monitor(interval: Duration) -> (watch::Receiver<MonitorSnapshot>, J
             system.refresh_processes(ProcessesToUpdate::All, true);
 
             let snapshot = build_snapshot(&system, my_pid);
-            let _ = sender.send(snapshot);
+            if sender.send(snapshot).is_err() {
+                break;
+            }
             tokio::time::sleep(interval).await;
         }
     });
@@ -146,6 +148,11 @@ struct GpuMetrics {
 }
 
 fn probe_gpu() -> Result<GpuMetrics, GpuStatus> {
+    #[cfg(not(target_os = "macos"))]
+    return Err(GpuStatus::Unavailable {
+        reason: "GPU telemetry only supported on macOS via ioreg".to_string(),
+    });
+
     let mut reasons = Vec::new();
 
     for class_name in GPU_CLASSES {
