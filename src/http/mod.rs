@@ -1412,7 +1412,6 @@ async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
         );
     }
 }
-
 fn namespaces_response_from_discovery(discovery: &DiscoveryResponse) -> NamespacesResponse {
     NamespacesResponse {
         total: discovery.namespaces.len(),
@@ -2729,7 +2728,6 @@ mod tests {
         assert_eq!(second.namespace_count, 2);
         assert_eq!(namespace_ids, vec!["alpha", "beta"]);
     }
-
     #[test]
     fn test_chroma_document_maps_to_browse_json() {
         let doc = ChromaDocument {

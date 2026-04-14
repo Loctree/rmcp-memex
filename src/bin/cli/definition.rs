@@ -8,7 +8,6 @@ use rmcp_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
 pub const DEFAULT_SSE_PORT: u16 = 8997;
-
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
@@ -1098,7 +1097,6 @@ mod tests {
         assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
         assert_eq!(config.allowed_paths, defaults.allowed_paths);
     }
-
     #[test]
     fn dashboard_command_parses_without_explicit_port() {
         let cli = Cli::parse_from(["rmcp-memex", "dashboard"]);

@@ -631,10 +631,7 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
                     ProviderStatus::Offline => Color::DarkGray,
                 };
 
-                let dimension_note = provider
-                    .inferred_dimension()
-                    .map(|dim| format!("{dim} inferred"))
-                    .unwrap_or_else(|| "dimension probe required".to_string());
+                let dimension_note = "probe required".to_string();
 
                 lines.push(Line::from(vec![
                     Span::styled(prefix, style),
