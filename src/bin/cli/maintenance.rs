@@ -235,6 +235,58 @@ pub enum FileIndexResult {
     Failed,
 }
 
+fn pipeline_embed_rate(snapshot: &PipelineSnapshot) -> f64 {
+    let elapsed_secs = snapshot.elapsed.as_secs_f64();
+    if elapsed_secs > 0.0 {
+        snapshot.chunks_embedded as f64 / elapsed_secs
+    } else {
+        0.0
+    }
+}
+
+fn format_pipeline_status_line(snapshot: &PipelineSnapshot, total_files: usize) -> String {
+    let terminal_files = snapshot.files_committed + snapshot.files_skipped + snapshot.files_failed;
+    let eta = snapshot
+        .eta
+        .map(HumanDuration)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "--".to_string());
+
+    format!(
+        "{}/{} files | read {} | committed {} skipped {} failed {} | chunks created {} embedded {} ({:.1}/s) stored {} ({:.1}/s) | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
+        terminal_files.min(total_files),
+        total_files,
+        snapshot.files_read,
+        snapshot.files_committed,
+        snapshot.files_skipped,
+        snapshot.files_failed,
+        snapshot.chunks_created,
+        snapshot.chunks_embedded,
+        pipeline_embed_rate(snapshot),
+        snapshot.chunks_stored,
+        snapshot.chunks_per_sec,
+        eta,
+        snapshot.reader_queue_depth,
+        snapshot.chunker_queue_depth,
+        snapshot.storage_queue_depth,
+        snapshot.current_embed_batch_items,
+        snapshot.current_embed_batch_chars,
+        snapshot.bottleneck
+    )
+}
+
+fn format_pipeline_error_line(path: Option<&Path>, stage: &str, message: &str) -> String {
+    match path {
+        Some(path) => format!(
+            "[pipeline:error] {} [{}] {}",
+            stage,
+            path.display(),
+            message
+        ),
+        None => format!("[pipeline:error] {} {}", stage, message),
+    }
+}
+
 struct PipelineProgressRenderer {
     total_files: usize,
     progress_bar: Option<ProgressBar>,
@@ -263,33 +315,25 @@ impl PipelineProgressRenderer {
         }
     }
 
+    fn println(&self, line: &str) {
+        if let Some(progress_bar) = &self.progress_bar {
+            progress_bar.println(line);
+        } else {
+            eprintln!("{}", line);
+        }
+    }
+
     fn render(&mut self, snapshot: &PipelineSnapshot, force: bool) {
         let terminal_files =
             snapshot.files_committed + snapshot.files_skipped + snapshot.files_failed;
-        let eta = snapshot
-            .eta
-            .map(HumanDuration)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "--".to_string());
-        let message = format!(
-            "stored {} chunks | {:.1} chunks/s | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
-            snapshot.chunks_stored,
-            snapshot.chunks_per_sec,
-            eta,
-            snapshot.reader_queue_depth,
-            snapshot.chunker_queue_depth,
-            snapshot.storage_queue_depth,
-            snapshot.current_embed_batch_items,
-            snapshot.current_embed_batch_chars,
-            snapshot.bottleneck
-        );
+        let message = format_pipeline_status_line(snapshot, self.total_files);
 
         if let Some(progress_bar) = &self.progress_bar {
             progress_bar.set_length(self.total_files as u64);
             progress_bar.set_position(terminal_files.min(self.total_files) as u64);
-            progress_bar.set_message(message);
+            progress_bar.set_message(message.clone());
             if force && terminal_files >= self.total_files {
-                progress_bar.finish_with_message("complete");
+                progress_bar.finish_with_message(format!("complete | {}", message));
             }
             return;
         }
@@ -299,24 +343,7 @@ impl PipelineProgressRenderer {
         }
 
         self.last_line_at = Instant::now();
-        eprintln!(
-            "[pipeline] {}/{} files | committed {} skipped {} failed {} | chunks {} stored {} | {:.1} chunks/s | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
-            terminal_files.min(self.total_files),
-            self.total_files,
-            snapshot.files_committed,
-            snapshot.files_skipped,
-            snapshot.files_failed,
-            snapshot.chunks_created,
-            snapshot.chunks_stored,
-            snapshot.chunks_per_sec,
-            eta,
-            snapshot.reader_queue_depth,
-            snapshot.chunker_queue_depth,
-            snapshot.storage_queue_depth,
-            snapshot.current_embed_batch_items,
-            snapshot.current_embed_batch_chars,
-            snapshot.bottleneck
-        );
+        eprintln!("[pipeline] {}", message);
     }
 }
 
@@ -366,10 +393,20 @@ async fn consume_pipeline_events(
                     renderer.render(&latest_snapshot, false);
                 }
             }
+            PipelineEvent::Error {
+                path,
+                stage,
+                message,
+            } => {
+                if let Some(renderer) = &renderer {
+                    renderer.println(&format_pipeline_error_line(path.as_deref(), stage, &message));
+                } else {
+                    eprintln!("{}", format_pipeline_error_line(path.as_deref(), stage, &message));
+                }
+            }
             PipelineEvent::FileRead { .. }
             | PipelineEvent::ChunksCreated { .. }
-            | PipelineEvent::ChunksEmbedded { .. }
-            | PipelineEvent::Error { .. } => {}
+            | PipelineEvent::ChunksEmbedded { .. } => {}
         }
     }
 
@@ -556,6 +593,12 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         eprintln!("  Chunks stored:     {}", result.stats.chunks_stored);
         if result.stats.errors > 0 {
             eprintln!("  Errors:            {}", result.stats.errors);
+            for error in result.errors.iter().take(5) {
+                eprintln!("    - {}", error);
+            }
+            if result.errors.len() > 5 {
+                eprintln!("    - ... and {} more", result.errors.len() - 5);
+            }
         }
         eprintln!("  Bottleneck:        {}", snapshot.bottleneck);
         eprintln!("  Namespace:         {}", ns_name);
@@ -912,6 +955,59 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_pipeline_status_line_surfaces_stage_flow() {
+        let snapshot = PipelineSnapshot {
+            total_files: 6,
+            files_read: 4,
+            files_committed: 2,
+            files_skipped: 1,
+            files_failed: 1,
+            chunks_created: 24,
+            chunks_embedded: 20,
+            chunks_stored: 18,
+            errors: 0,
+            files_per_sec: 0.8,
+            chunks_per_sec: 3.6,
+            reader_queue_depth: 2,
+            chunker_queue_depth: 1,
+            storage_queue_depth: 3,
+            current_embed_batch_items: 8,
+            current_embed_batch_chars: 4096,
+            bottleneck: "storage".to_string(),
+            eta: Some(Duration::from_secs(12)),
+            elapsed: Duration::from_secs(5),
+        };
+
+        let line = format_pipeline_status_line(&snapshot, 6);
+
+        assert!(line.contains("4/6 files"));
+        assert!(line.contains("read 4"));
+        assert!(line.contains("embedded 20 (4.0/s)"));
+        assert!(line.contains("stored 18 (3.6/s)"));
+        assert!(line.contains("q 2/1/3"));
+        assert!(line.contains("storage"));
+    }
+
+    #[test]
+    fn format_pipeline_error_line_keeps_stage_and_path_visible() {
+        let line = format_pipeline_error_line(
+            Some(Path::new("/tmp/corpus/a.md")),
+            "embedder",
+            "connection reset",
+        );
+
+        assert_eq!(
+            line,
+            "[pipeline:error] embedder [/tmp/corpus/a.md] connection reset"
+        );
+    }
 }
 
 fn print_cross_store_recovery_report(report: &CrossStoreRecoveryReport, execute: bool) {
