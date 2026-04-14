@@ -31,7 +31,6 @@ use std::time::Duration;
 pub const DEFAULT_REQUIRED_DIMENSION: usize = 2560;
 pub const DEFAULT_OLLAMA_EMBEDDING_MODEL: &str = "qwen3-embedding:4b";
 
-
 // =============================================================================
 // REQUEST/RESPONSE TYPES (OpenAI-compatible)
 // =============================================================================
@@ -382,6 +381,7 @@ impl MlxConfig {
 // =============================================================================
 
 /// Universal embedding client with provider cascade
+#[derive(Clone)]
 pub struct EmbeddingClient {
     client: Client,
     embedder_url: String,
@@ -529,6 +529,19 @@ impl EmbeddingClient {
     /// Get required dimension
     pub fn required_dimension(&self) -> usize {
         self.required_dimension
+    }
+
+    /// Get the current runtime batch limits used for embedding requests.
+    pub fn batch_limits(&self) -> (usize, usize) {
+        (self.max_batch_chars, self.max_batch_items)
+    }
+
+    /// Clone the client while overriding the runtime batch limits.
+    pub fn clone_with_batch_limits(&self, max_chars: usize, max_items: usize) -> Self {
+        let mut cloned = self.clone();
+        cloned.max_batch_chars = max_chars.max(1);
+        cloned.max_batch_items = max_items.max(1);
+        cloned
     }
 
     /// Create a stub client for tests that don't need real embeddings.

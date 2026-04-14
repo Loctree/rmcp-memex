@@ -21,8 +21,8 @@ use crate::{
 pub mod pipeline;
 pub mod structured;
 pub use pipeline::{
-    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineResult,
-    PipelineSnapshot, PipelineStats, run_pipeline,
+    Chunk, EmbeddedChunk, FileContent, PipelineConfig, PipelineEvent, PipelineGovernorConfig,
+    PipelineResult, PipelineSnapshot, PipelineStats, run_pipeline,
 };
 
 const DEFAULT_NAMESPACE: &str = "rag";

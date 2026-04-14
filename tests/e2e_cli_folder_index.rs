@@ -345,6 +345,9 @@ async fn test_cli_pipeline_mode_supports_progress_and_resume() {
             "--slice-mode",
             "flat",
             "--pipeline",
+            "--pipeline-governor",
+            "--pipeline-embed-concurrency",
+            "2",
             "--resume",
             "--progress",
         ],
@@ -365,6 +368,11 @@ async fn test_cli_pipeline_mode_supports_progress_and_resume() {
     assert!(
         stderr.contains("[pipeline]"),
         "expected non-interactive pipeline progress output, got:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("governor: adaptive"),
+        "expected adaptive governor startup in stderr, got:\n{}",
         stderr
     );
     assert!(

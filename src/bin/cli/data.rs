@@ -165,7 +165,10 @@ fn should_replace_reprocess_candidate(
     candidate: &ReprocessDocument,
 ) -> bool {
     let current_rank = (current.text.len(), reprocess_layer_rank(&current.metadata));
-    let candidate_rank = (candidate.text.len(), reprocess_layer_rank(&candidate.metadata));
+    let candidate_rank = (
+        candidate.text.len(),
+        reprocess_layer_rank(&candidate.metadata),
+    );
     candidate_rank > current_rank
 }
 
@@ -374,7 +377,13 @@ async fn run_reprocess_documents(
         {
             skipped_existing_count += 1;
             if (idx + 1) % 250 == 0 {
-                eprintln!("  Progress: {}/{} (indexed:{} skipped:{})", idx + 1, total, indexed, skipped_existing_count);
+                eprintln!(
+                    "  Progress: {}/{} (indexed:{} skipped:{})",
+                    idx + 1,
+                    total,
+                    indexed,
+                    skipped_existing_count
+                );
             }
             continue;
         }
@@ -409,7 +418,10 @@ async fn run_reprocess_documents(
             replaced += 1;
         }
 
-        match rag.memory_upsert(&namespace, doc.canonical_id.clone(), text, metadata).await {
+        match rag
+            .memory_upsert(&namespace, doc.canonical_id.clone(), text, metadata)
+            .await
+        {
             Ok(()) => {
                 indexed += 1;
             }
@@ -420,7 +432,14 @@ async fn run_reprocess_documents(
         }
 
         if (idx + 1) % 250 == 0 {
-            eprintln!("  Progress: {}/{} (indexed:{} skipped:{} failed:{})", idx + 1, total, indexed, skipped_existing_count, failed_ids.len());
+            eprintln!(
+                "  Progress: {}/{} (indexed:{} skipped:{} failed:{})",
+                idx + 1,
+                total,
+                indexed,
+                skipped_existing_count,
+                failed_ids.len()
+            );
         }
     }
 
@@ -440,11 +459,17 @@ async fn run_reprocess_documents(
         eprintln!("  Skipped too short: {}", skipped_preprocess_short);
     }
     if !failed_ids.is_empty() {
-        eprintln!("  FAILED:          {} (IDs: {})", failed_ids.len(),
+        eprintln!(
+            "  FAILED:          {} (IDs: {})",
+            failed_ids.len(),
             if failed_ids.len() <= 10 {
                 failed_ids.join(", ")
             } else {
-                format!("{}... and {} more", failed_ids[..10].join(", "), failed_ids.len() - 10)
+                format!(
+                    "{}... and {} more",
+                    failed_ids[..10].join(", "),
+                    failed_ids.len() - 10
+                )
             }
         );
     }
@@ -473,7 +498,10 @@ pub async fn run_export(
             .await?;
         let page_len = page.len();
         if page_len > 0 {
-            eprintln!("  Loading: fetched {} documents (offset {})", page_len, offset);
+            eprintln!(
+                "  Loading: fetched {} documents (offset {})",
+                page_len, offset
+            );
         }
         docs.extend(page);
         if page_len < PAGE_SIZE {
@@ -611,7 +639,9 @@ pub async fn run_import(
 
         let mut docs = Vec::new();
         for (record, embedding) in records_with_embeddings {
-            let hash = record.content_hash.unwrap_or_else(|| compute_content_hash(&record.text));
+            let hash = record
+                .content_hash
+                .unwrap_or_else(|| compute_content_hash(&record.text));
             let doc = rmcp_memex::ChromaDocument::new_flat_with_hash(
                 record.id,
                 namespace.clone(),
@@ -643,7 +673,9 @@ pub async fn run_import(
 
         let mut docs = Vec::new();
         for ((record, _line_num), embedding) in records_to_embed.into_iter().zip(embeddings) {
-            let hash = record.content_hash.unwrap_or_else(|| compute_content_hash(&record.text));
+            let hash = record
+                .content_hash
+                .unwrap_or_else(|| compute_content_hash(&record.text));
             let doc = rmcp_memex::ChromaDocument::new_flat_with_hash(
                 record.id,
                 namespace.clone(),
@@ -760,7 +792,10 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
             .all_documents_page(Some(&source_namespace), offset, PAGE_SIZE)
             .await?;
         let page_len = page.len();
-        eprintln!("  Loading source: fetched {} documents (offset {})", page_len, offset);
+        eprintln!(
+            "  Loading source: fetched {} documents (offset {})",
+            page_len, offset
+        );
 
         for doc in page {
             records.push(ExportRecord {

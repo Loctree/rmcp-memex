@@ -161,6 +161,8 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             progress,
             resume,
             pipeline,
+            pipeline_embed_concurrency,
+            pipeline_governor,
             parallel,
         }) => {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
@@ -188,6 +190,8 @@ pub async fn run_command(cli: Cli) -> Result<()> {
                 show_progress: progress,
                 resume,
                 pipeline,
+                pipeline_embed_concurrency,
+                pipeline_governor,
                 parallel,
             })
             .await;

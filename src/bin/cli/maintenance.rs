@@ -13,7 +13,7 @@ use rmcp_memex::{
     BM25Config, BM25Index, CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig,
     IndexProgressTracker, PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig,
     RAGPipeline, SliceMode, StorageManager, inspect_cross_store_recovery, path_utils,
-    repair_cross_store_recovery,
+    rag::PipelineGovernorConfig, repair_cross_store_recovery,
 };
 
 #[allow(dead_code)]
@@ -218,6 +218,10 @@ pub struct BatchIndexConfig {
     pub resume: bool,
     /// Enable async pipeline mode for concurrent stages
     pub pipeline: bool,
+    /// Maximum embedding requests in flight for pipeline mode.
+    pub pipeline_embed_concurrency: u8,
+    /// Enable adaptive governor for pipeline embed throughput.
+    pub pipeline_governor: bool,
     /// Number of files to process in parallel (1-16, ignored in pipeline mode)
     pub parallel: u8,
 }
@@ -251,9 +255,13 @@ fn format_pipeline_status_line(snapshot: &PipelineSnapshot, total_files: usize) 
         .map(HumanDuration)
         .map(|value| value.to_string())
         .unwrap_or_else(|| "--".to_string());
+    let avg_embed_ms = snapshot
+        .avg_embed_batch_ms
+        .map(|value| format!("{value:.0}ms"))
+        .unwrap_or_else(|| "--".to_string());
 
     format!(
-        "{}/{} files | read {} | committed {} skipped {} failed {} | chunks created {} embedded {} ({:.1}/s) stored {} ({:.1}/s) | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
+        "{}/{} files | read {} | committed {} skipped {} failed {} | chunks created {} embedded {} ({:.1}/s) stored {} ({:.1}/s) | eta {} | q {}/{}/{} | embed {}/{} req @ {} | batch {}/{} items {} / {} chars | gov {} ({}) | {}",
         terminal_files.min(total_files),
         total_files,
         snapshot.files_read,
@@ -269,8 +277,15 @@ fn format_pipeline_status_line(snapshot: &PipelineSnapshot, total_files: usize) 
         snapshot.reader_queue_depth,
         snapshot.chunker_queue_depth,
         snapshot.storage_queue_depth,
+        snapshot.embed_active_requests,
+        snapshot.embed_concurrency_limit,
+        avg_embed_ms,
         snapshot.current_embed_batch_items,
+        snapshot.embed_batch_items_limit,
         snapshot.current_embed_batch_chars,
+        snapshot.embed_batch_chars_limit,
+        snapshot.governor_mode,
+        snapshot.governor_reason,
         snapshot.bottleneck
     )
 }
@@ -399,14 +414,23 @@ async fn consume_pipeline_events(
                 message,
             } => {
                 if let Some(renderer) = &renderer {
-                    renderer.println(&format_pipeline_error_line(path.as_deref(), stage, &message));
+                    renderer.println(&format_pipeline_error_line(
+                        path.as_deref(),
+                        stage,
+                        &message,
+                    ));
                 } else {
-                    eprintln!("{}", format_pipeline_error_line(path.as_deref(), stage, &message));
+                    eprintln!(
+                        "{}",
+                        format_pipeline_error_line(path.as_deref(), stage, &message)
+                    );
                 }
             }
             PipelineEvent::FileRead { .. }
+            | PipelineEvent::EmbedStarted { .. }
             | PipelineEvent::ChunksCreated { .. }
-            | PipelineEvent::ChunksEmbedded { .. } => {}
+            | PipelineEvent::ChunksEmbedded { .. }
+            | PipelineEvent::GovernorAdjusted { .. } => {}
         }
     }
 
@@ -434,6 +458,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         show_progress,
         resume,
         pipeline,
+        pipeline_embed_concurrency,
+        pipeline_governor,
         parallel,
     } = config;
     // Expand and canonicalize path - canonicalize validates path exists and resolves symlinks
@@ -539,11 +565,17 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         }
 
         eprintln!(
-            "Pipeline mode: {} files ({} discovered, {} resumed), slice mode: {:?}",
+            "Pipeline mode: {} files ({} discovered, {} resumed), slice mode: {:?}, embed concurrency ceiling: {}, governor: {}",
             pipeline_files.len(),
             total,
             resumed_count,
-            slice_mode
+            slice_mode,
+            pipeline_embed_concurrency,
+            if pipeline_governor {
+                "adaptive"
+            } else {
+                "fixed"
+            }
         );
         eprintln!("Running concurrent stages: reader -> chunker -> embedder -> storage");
 
@@ -560,6 +592,14 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         let pipeline_config = PipelineConfig {
             slice_mode,
             dedup_enabled: dedup && !disable_storage_dedup,
+            embed_concurrency: pipeline_embed_concurrency as usize,
+            governor: pipeline_governor.then(|| {
+                PipelineGovernorConfig::adaptive(
+                    embedding_config.max_batch_chars,
+                    embedding_config.max_batch_items,
+                    pipeline_embed_concurrency as usize,
+                )
+            }),
             event_sender: Some(event_tx),
             ..Default::default()
         };
@@ -600,6 +640,19 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                 eprintln!("    - ... and {} more", result.errors.len() - 5);
             }
         }
+        if let Some(avg_embed_ms) = snapshot.avg_embed_batch_ms {
+            eprintln!("  Avg embed batch:   {:.0} ms", avg_embed_ms);
+        }
+        eprintln!(
+            "  Embed ceiling:     {} req | {} items | {} chars",
+            snapshot.embed_concurrency_limit,
+            snapshot.embed_batch_items_limit,
+            snapshot.embed_batch_chars_limit
+        );
+        eprintln!(
+            "  Governor:          {} ({})",
+            snapshot.governor_mode, snapshot.governor_reason
+        );
         eprintln!("  Bottleneck:        {}", snapshot.bottleneck);
         eprintln!("  Namespace:         {}", ns_name);
         eprintln!("  DB path:           {}", expanded_db);
@@ -978,9 +1031,16 @@ mod tests {
             reader_queue_depth: 2,
             chunker_queue_depth: 1,
             storage_queue_depth: 3,
+            embed_active_requests: 1,
+            embed_concurrency_limit: 3,
             current_embed_batch_items: 8,
             current_embed_batch_chars: 4096,
+            embed_batch_items_limit: 16,
+            embed_batch_chars_limit: 8192,
+            avg_embed_batch_ms: Some(640.0),
             bottleneck: "storage".to_string(),
+            governor_mode: "adaptive".to_string(),
+            governor_reason: "backlog sustained".to_string(),
             eta: Some(Duration::from_secs(12)),
             elapsed: Duration::from_secs(5),
         };
@@ -992,6 +1052,9 @@ mod tests {
         assert!(line.contains("embedded 20 (4.0/s)"));
         assert!(line.contains("stored 18 (3.6/s)"));
         assert!(line.contains("q 2/1/3"));
+        assert!(line.contains("embed 1/3 req @ 640ms"));
+        assert!(line.contains("batch 8/16 items 4096 / 8192 chars"));
+        assert!(line.contains("gov adaptive (backlog sustained)"));
         assert!(line.contains("storage"));
     }
 

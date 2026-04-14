@@ -100,6 +100,311 @@ struct EmbeddedFile {
     chunks: Vec<EmbeddedChunk>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EmbedRuntimeSettings {
+    max_batch_chars: usize,
+    max_batch_items: usize,
+    concurrency: usize,
+}
+
+impl EmbedRuntimeSettings {
+    fn new(max_batch_chars: usize, max_batch_items: usize, concurrency: usize) -> Self {
+        Self {
+            max_batch_chars: max_batch_chars.max(1),
+            max_batch_items: max_batch_items.max(1),
+            concurrency: concurrency.max(1),
+        }
+    }
+}
+
+/// Adaptive governor envelope for pipeline embedding throughput.
+#[derive(Debug, Clone)]
+pub struct PipelineGovernorConfig {
+    pub min_batch_chars: usize,
+    pub max_batch_chars: usize,
+    pub min_batch_items: usize,
+    pub max_batch_items: usize,
+    pub min_concurrency: usize,
+    pub max_concurrency: usize,
+    pub target_latency: Duration,
+    pub pressure_latency: Duration,
+    pub growth_cooldown: Duration,
+    pub pressure_cooldown: Duration,
+    pub backlog_low_watermark: usize,
+    pub storage_backlog_high_watermark: usize,
+}
+
+impl PipelineGovernorConfig {
+    pub fn adaptive(
+        max_batch_chars: usize,
+        max_batch_items: usize,
+        max_concurrency: usize,
+    ) -> Self {
+        let max_batch_chars = max_batch_chars.max(1);
+        let max_batch_items = max_batch_items.max(1);
+        let max_concurrency = max_concurrency.max(1);
+
+        Self {
+            min_batch_chars: (max_batch_chars / 4).max(4_096).min(max_batch_chars),
+            max_batch_chars,
+            min_batch_items: (max_batch_items / 4).max(1).min(max_batch_items),
+            max_batch_items,
+            min_concurrency: 1,
+            max_concurrency,
+            target_latency: Duration::from_millis(900),
+            pressure_latency: Duration::from_millis(2_200),
+            growth_cooldown: Duration::from_secs(3),
+            pressure_cooldown: Duration::from_millis(750),
+            backlog_low_watermark: 2,
+            storage_backlog_high_watermark: 3,
+        }
+    }
+
+    fn initial_settings(&self) -> EmbedRuntimeSettings {
+        EmbedRuntimeSettings::new(
+            self.min_batch_chars,
+            self.min_batch_items,
+            self.min_concurrency,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PipelineGovernorAdjustment {
+    settings: EmbedRuntimeSettings,
+    mode: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct PipelineGovernor {
+    config: PipelineGovernorConfig,
+    current: EmbedRuntimeSettings,
+    last_growth_at: Option<Instant>,
+    last_pressure_at: Option<Instant>,
+}
+
+impl PipelineGovernor {
+    fn new(config: PipelineGovernorConfig) -> Self {
+        let current = config.initial_settings();
+        Self {
+            config,
+            current,
+            last_growth_at: None,
+            last_pressure_at: None,
+        }
+    }
+
+    fn current_settings(&self) -> EmbedRuntimeSettings {
+        self.current
+    }
+
+    fn initial_adjustment(&self) -> PipelineGovernorAdjustment {
+        PipelineGovernorAdjustment {
+            settings: self.current,
+            mode: "adaptive".to_string(),
+            reason: "warming up from conservative limits".to_string(),
+        }
+    }
+
+    fn on_success(
+        &mut self,
+        elapsed: Duration,
+        snapshot: &PipelineSnapshot,
+    ) -> Option<PipelineGovernorAdjustment> {
+        let backlog = snapshot.chunker_queue_depth + snapshot.reader_queue_depth;
+        let storage_pressure =
+            snapshot.storage_queue_depth >= self.config.storage_backlog_high_watermark;
+        let slow_batch = elapsed >= self.config.pressure_latency;
+
+        if (storage_pressure || slow_batch) && self.pressure_ready() {
+            let mut changed = false;
+            let mut reasons = Vec::new();
+
+            if self.current.max_batch_items > self.config.min_batch_items {
+                let next_items =
+                    ((self.current.max_batch_items * 2) / 3).max(self.config.min_batch_items);
+                if next_items != self.current.max_batch_items {
+                    self.current.max_batch_items = next_items;
+                    changed = true;
+                    reasons.push(format!("items {}", next_items));
+                }
+            }
+
+            if self.current.max_batch_chars > self.config.min_batch_chars {
+                let next_chars =
+                    ((self.current.max_batch_chars * 2) / 3).max(self.config.min_batch_chars);
+                if next_chars != self.current.max_batch_chars {
+                    self.current.max_batch_chars = next_chars;
+                    changed = true;
+                    reasons.push(format!("chars {}", next_chars));
+                }
+            }
+
+            if storage_pressure && self.current.concurrency > self.config.min_concurrency {
+                self.current.concurrency -= 1;
+                changed = true;
+                reasons.push(format!("concurrency {}", self.current.concurrency));
+            }
+
+            if changed {
+                self.last_pressure_at = Some(Instant::now());
+                let reason = if storage_pressure {
+                    format!(
+                        "pressure: storage backlog {} -> {}",
+                        snapshot.storage_queue_depth,
+                        reasons.join(", ")
+                    )
+                } else {
+                    format!(
+                        "pressure: embed {:.0}ms -> {}",
+                        elapsed.as_secs_f64() * 1_000.0,
+                        reasons.join(", ")
+                    )
+                };
+                return Some(PipelineGovernorAdjustment {
+                    settings: self.current,
+                    mode: "adaptive".to_string(),
+                    reason,
+                });
+            }
+        }
+
+        if elapsed > self.config.target_latency
+            || backlog < self.config.backlog_low_watermark
+            || snapshot.storage_queue_depth > 1
+            || !self.growth_ready()
+        {
+            return None;
+        }
+
+        if self.current.max_batch_items < self.config.max_batch_items {
+            let step = (self.current.max_batch_items / 4).max(1);
+            let next_items = (self.current.max_batch_items + step).min(self.config.max_batch_items);
+            if next_items != self.current.max_batch_items {
+                self.current.max_batch_items = next_items;
+                self.last_growth_at = Some(Instant::now());
+                return Some(PipelineGovernorAdjustment {
+                    settings: self.current,
+                    mode: "adaptive".to_string(),
+                    reason: format!(
+                        "backlog {} with fast embed {:.0}ms -> items {}",
+                        backlog,
+                        elapsed.as_secs_f64() * 1_000.0,
+                        next_items
+                    ),
+                });
+            }
+        }
+
+        if self.current.max_batch_chars < self.config.max_batch_chars {
+            let step = (self.current.max_batch_chars / 4).max(4_096);
+            let next_chars = (self.current.max_batch_chars + step).min(self.config.max_batch_chars);
+            if next_chars != self.current.max_batch_chars {
+                self.current.max_batch_chars = next_chars;
+                self.last_growth_at = Some(Instant::now());
+                return Some(PipelineGovernorAdjustment {
+                    settings: self.current,
+                    mode: "adaptive".to_string(),
+                    reason: format!(
+                        "backlog {} with fast embed {:.0}ms -> chars {}",
+                        backlog,
+                        elapsed.as_secs_f64() * 1_000.0,
+                        next_chars
+                    ),
+                });
+            }
+        }
+
+        let concurrency_backlog = self
+            .current
+            .concurrency
+            .saturating_mul(2)
+            .max(self.config.backlog_low_watermark);
+        if backlog >= concurrency_backlog && self.current.concurrency < self.config.max_concurrency
+        {
+            self.current.concurrency += 1;
+            self.last_growth_at = Some(Instant::now());
+            return Some(PipelineGovernorAdjustment {
+                settings: self.current,
+                mode: "adaptive".to_string(),
+                reason: format!(
+                    "backlog {} sustained with fast embed {:.0}ms -> concurrency {}",
+                    backlog,
+                    elapsed.as_secs_f64() * 1_000.0,
+                    self.current.concurrency
+                ),
+            });
+        }
+
+        None
+    }
+
+    fn on_error(
+        &mut self,
+        snapshot: &PipelineSnapshot,
+        message: &str,
+    ) -> Option<PipelineGovernorAdjustment> {
+        if !self.pressure_ready() {
+            return None;
+        }
+
+        let mut changed = false;
+
+        if self.current.concurrency > self.config.min_concurrency {
+            self.current.concurrency = self.config.min_concurrency;
+            changed = true;
+        }
+        if self.current.max_batch_items > self.config.min_batch_items {
+            self.current.max_batch_items = self.config.min_batch_items;
+            changed = true;
+        }
+        if self.current.max_batch_chars > self.config.min_batch_chars {
+            self.current.max_batch_chars = self.config.min_batch_chars;
+            changed = true;
+        }
+
+        if !changed {
+            return None;
+        }
+
+        self.last_pressure_at = Some(Instant::now());
+        Some(PipelineGovernorAdjustment {
+            settings: self.current,
+            mode: "adaptive".to_string(),
+            reason: format!(
+                "error with backlog {} and storage {}: {}",
+                snapshot.chunker_queue_depth + snapshot.reader_queue_depth,
+                snapshot.storage_queue_depth,
+                message
+            ),
+        })
+    }
+
+    fn growth_ready(&self) -> bool {
+        self.last_growth_at
+            .map(|instant| instant.elapsed() >= self.config.growth_cooldown)
+            .unwrap_or(true)
+    }
+
+    fn pressure_ready(&self) -> bool {
+        self.last_pressure_at
+            .map(|instant| instant.elapsed() >= self.config.pressure_cooldown)
+            .unwrap_or(true)
+    }
+}
+
+#[derive(Debug)]
+struct EmbedWorkerResult {
+    path: PathBuf,
+    content_hash: String,
+    count: usize,
+    chars: usize,
+    elapsed: Duration,
+    chunks: Option<Vec<EmbeddedChunk>>,
+    error: Option<String>,
+}
+
 /// Pipeline configuration.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -113,6 +418,10 @@ pub struct PipelineConfig {
     pub slice_mode: SliceMode,
     /// Enable storage-backed deduplication.
     pub dedup_enabled: bool,
+    /// Maximum number of embedding requests allowed in flight.
+    pub embed_concurrency: usize,
+    /// Optional adaptive governor for runtime batch/concurrency tuning.
+    pub governor: Option<PipelineGovernorConfig>,
     /// Optional event stream for progress/reporting consumers.
     pub event_sender: Option<mpsc::UnboundedSender<PipelineEvent>>,
 }
@@ -125,6 +434,8 @@ impl Default for PipelineConfig {
             embedder_buffer: CHANNEL_BUFFER_SIZE,
             slice_mode: SliceMode::default(),
             dedup_enabled: true,
+            embed_concurrency: 1,
+            governor: None,
             event_sender: None,
         }
     }
@@ -170,11 +481,18 @@ pub struct PipelineSnapshot {
     pub storage_queue_depth: usize,
     pub current_embed_batch_items: usize,
     pub current_embed_batch_chars: usize,
+    pub embed_batch_items_limit: usize,
+    pub embed_batch_chars_limit: usize,
+    pub embed_active_requests: usize,
+    pub embed_concurrency_limit: usize,
+    pub avg_embed_batch_ms: Option<f64>,
     pub files_per_sec: f64,
     pub chunks_per_sec: f64,
     pub eta: Option<Duration>,
     pub elapsed: Duration,
     pub bottleneck: String,
+    pub governor_mode: String,
+    pub governor_reason: String,
 }
 
 impl PipelineSnapshot {
@@ -211,12 +529,28 @@ pub enum PipelineEvent {
         content_hash: String,
         count: usize,
     },
+    EmbedStarted {
+        path: PathBuf,
+        content_hash: String,
+        count: usize,
+        chars: usize,
+        batch_items_limit: usize,
+        batch_chars_limit: usize,
+        concurrency_limit: usize,
+    },
     ChunksEmbedded {
         path: PathBuf,
         content_hash: String,
         count: usize,
         chars: usize,
         elapsed: Duration,
+    },
+    GovernorAdjusted {
+        batch_items_limit: usize,
+        batch_chars_limit: usize,
+        concurrency_limit: usize,
+        mode: String,
+        reason: String,
     },
     FileCommitted {
         path: PathBuf,
@@ -249,10 +583,20 @@ struct PipelineProgressState {
 }
 
 impl PipelineProgressState {
-    fn new(total_files: usize) -> Self {
+    fn new(
+        total_files: usize,
+        initial_runtime: EmbedRuntimeSettings,
+        governor_mode: String,
+        governor_reason: String,
+    ) -> Self {
         let snapshot = PipelineSnapshot {
             total_files,
+            embed_batch_items_limit: initial_runtime.max_batch_items,
+            embed_batch_chars_limit: initial_runtime.max_batch_chars,
+            embed_concurrency_limit: initial_runtime.concurrency,
             bottleneck: "reader".to_string(),
+            governor_mode,
+            governor_reason,
             ..Default::default()
         };
 
@@ -286,18 +630,51 @@ impl PipelineProgressState {
                     self.snapshot.reader_queue_depth.saturating_sub(1);
                 self.snapshot.chunker_queue_depth += 1;
             }
+            PipelineEvent::EmbedStarted {
+                batch_items_limit,
+                batch_chars_limit,
+                concurrency_limit,
+                ..
+            } => {
+                self.snapshot.embed_batch_items_limit = *batch_items_limit;
+                self.snapshot.embed_batch_chars_limit = *batch_chars_limit;
+                self.snapshot.embed_concurrency_limit = *concurrency_limit;
+                self.snapshot.embed_active_requests += 1;
+            }
             PipelineEvent::ChunksEmbedded {
                 count,
                 chars,
-                elapsed: _,
+                elapsed,
                 ..
             } => {
                 self.snapshot.chunks_embedded += count;
                 self.snapshot.chunker_queue_depth =
                     self.snapshot.chunker_queue_depth.saturating_sub(1);
                 self.snapshot.storage_queue_depth += 1;
+                self.snapshot.embed_active_requests =
+                    self.snapshot.embed_active_requests.saturating_sub(1);
                 self.snapshot.current_embed_batch_items = *count;
                 self.snapshot.current_embed_batch_chars = *chars;
+                let latency_ms = elapsed.as_secs_f64() * 1_000.0;
+                self.snapshot.avg_embed_batch_ms = Some(
+                    self.snapshot
+                        .avg_embed_batch_ms
+                        .map(|existing| (existing * 0.7) + (latency_ms * 0.3))
+                        .unwrap_or(latency_ms),
+                );
+            }
+            PipelineEvent::GovernorAdjusted {
+                batch_items_limit,
+                batch_chars_limit,
+                concurrency_limit,
+                mode,
+                reason,
+            } => {
+                self.snapshot.embed_batch_items_limit = *batch_items_limit;
+                self.snapshot.embed_batch_chars_limit = *batch_chars_limit;
+                self.snapshot.embed_concurrency_limit = *concurrency_limit;
+                self.snapshot.governor_mode = mode.clone();
+                self.snapshot.governor_reason = reason.clone();
             }
             PipelineEvent::FileCommitted { chunk_count, .. } => {
                 self.snapshot.files_committed += 1;
@@ -315,6 +692,8 @@ impl PipelineProgressState {
                     "embedder" => {
                         self.snapshot.chunker_queue_depth =
                             self.snapshot.chunker_queue_depth.saturating_sub(1);
+                        self.snapshot.embed_active_requests =
+                            self.snapshot.embed_active_requests.saturating_sub(1);
                     }
                     "storage" => {
                         self.snapshot.storage_queue_depth =
@@ -392,6 +771,13 @@ fn determine_bottleneck(snapshot: &PipelineSnapshot) -> String {
         stage = "storage";
         depth = snapshot.storage_queue_depth;
     }
+    if snapshot.embed_active_requests > 0
+        && snapshot.embed_active_requests >= snapshot.embed_concurrency_limit.max(1)
+        && depth <= snapshot.chunker_queue_depth
+    {
+        stage = "embedder";
+        depth = snapshot.embed_active_requests;
+    }
     if depth == 0 && snapshot.files_read < snapshot.total_files {
         stage = "reader";
     }
@@ -406,10 +792,21 @@ struct PipelineObserver {
 }
 
 impl PipelineObserver {
-    fn new(total_files: usize, sender: Option<mpsc::UnboundedSender<PipelineEvent>>) -> Self {
+    fn new(
+        total_files: usize,
+        sender: Option<mpsc::UnboundedSender<PipelineEvent>>,
+        initial_runtime: EmbedRuntimeSettings,
+        governor_mode: String,
+        governor_reason: String,
+    ) -> Self {
         Self {
             sender,
-            state: Arc::new(Mutex::new(PipelineProgressState::new(total_files))),
+            state: Arc::new(Mutex::new(PipelineProgressState::new(
+                total_files,
+                initial_runtime,
+                governor_mode,
+                governor_reason,
+            ))),
         }
     }
 
@@ -442,6 +839,11 @@ impl PipelineObserver {
             stats: state.snapshot.to_stats(),
             errors: state.error_messages.clone(),
         }
+    }
+
+    async fn snapshot(&self) -> PipelineSnapshot {
+        let state = self.state.lock().await;
+        state.snapshot.clone()
     }
 }
 
@@ -727,77 +1129,243 @@ fn split_into_chunks(text: &str, target_size: usize, overlap: usize) -> Vec<Stri
 async fn stage_embed_chunks(
     mut rx: mpsc::Receiver<ChunkBatch>,
     tx: mpsc::Sender<EmbeddedFile>,
-    client: Arc<Mutex<EmbeddingClient>>,
+    base_client: EmbeddingClient,
+    embed_concurrency: usize,
+    governor_config: Option<PipelineGovernorConfig>,
     observer: PipelineObserver,
 ) {
-    while let Some(chunk_batch) = rx.recv().await {
-        if chunk_batch.chunks.is_empty() {
-            continue;
-        }
+    let fixed_settings = {
+        let (max_batch_chars, max_batch_items) = base_client.batch_limits();
+        EmbedRuntimeSettings::new(max_batch_chars, max_batch_items, embed_concurrency)
+    };
+    let mut governor = governor_config.map(PipelineGovernor::new);
+    let initial_adjustment = governor
+        .as_ref()
+        .map(PipelineGovernor::initial_adjustment)
+        .unwrap_or_else(|| PipelineGovernorAdjustment {
+            settings: fixed_settings,
+            mode: "fixed".to_string(),
+            reason: "operator-configured limits".to_string(),
+        });
+    observer
+        .emit(PipelineEvent::GovernorAdjusted {
+            batch_items_limit: initial_adjustment.settings.max_batch_items,
+            batch_chars_limit: initial_adjustment.settings.max_batch_chars,
+            concurrency_limit: initial_adjustment.settings.concurrency,
+            mode: initial_adjustment.mode,
+            reason: initial_adjustment.reason,
+        })
+        .await;
 
-        let path = chunk_batch.path.clone();
-        let content_hash = chunk_batch.content_hash.clone();
-        let batch_chars: usize = chunk_batch
-            .chunks
-            .iter()
-            .map(|chunk| chunk.content.chars().count())
-            .sum();
-        let texts: Vec<String> = chunk_batch
-            .chunks
-            .iter()
-            .map(|chunk| chunk.content.clone())
-            .collect();
+    let result_capacity = embed_concurrency.max(1).saturating_mul(2);
+    let (result_tx, mut result_rx) = mpsc::channel::<EmbedWorkerResult>(result_capacity.max(2));
+    let mut input_closed = false;
+    let mut in_flight = 0usize;
 
-        let start = Instant::now();
-        let embeddings = match client.lock().await.embed_batch(&texts).await {
-            Ok(embeddings) => embeddings,
-            Err(err) => {
-                error!("Embedding batch failed for {:?}: {}", path, err);
-                observer
-                    .emit(PipelineEvent::Error {
-                        path: Some(path),
-                        stage: "embedder",
-                        message: err.to_string(),
-                    })
-                    .await;
-                continue;
-            }
-        };
-        let elapsed = start.elapsed();
-
-        let count = embeddings.len();
-        let embedded_chunks: Vec<EmbeddedChunk> = chunk_batch
-            .chunks
-            .into_iter()
-            .zip(embeddings)
-            .map(|(chunk, embedding)| EmbeddedChunk { chunk, embedding })
-            .collect();
-
-        if tx
-            .send(EmbeddedFile {
-                path: path.clone(),
-                content_hash: content_hash.clone(),
-                chunks: embedded_chunks,
-            })
-            .await
-            .is_err()
-        {
-            debug!("Embedder: channel closed, stopping");
+    loop {
+        if input_closed && in_flight == 0 {
             break;
         }
 
-        observer
-            .emit(PipelineEvent::ChunksEmbedded {
-                path,
-                content_hash,
-                count,
-                chars: batch_chars,
-                elapsed,
-            })
-            .await;
+        let settings = governor
+            .as_ref()
+            .map(PipelineGovernor::current_settings)
+            .unwrap_or(fixed_settings);
+
+        if !input_closed && in_flight < settings.concurrency {
+            tokio::select! {
+                maybe_batch = rx.recv() => {
+                    match maybe_batch {
+                        Some(chunk_batch) => {
+                            if chunk_batch.chunks.is_empty() {
+                                continue;
+                            }
+
+                            let batch_chars: usize = chunk_batch
+                                .chunks
+                                .iter()
+                                .map(|chunk| chunk.content.chars().count())
+                                .sum();
+                            observer
+                                .emit(PipelineEvent::EmbedStarted {
+                                    path: chunk_batch.path.clone(),
+                                    content_hash: chunk_batch.content_hash.clone(),
+                                    count: chunk_batch.chunks.len(),
+                                    chars: batch_chars,
+                                    batch_items_limit: settings.max_batch_items,
+                                    batch_chars_limit: settings.max_batch_chars,
+                                    concurrency_limit: settings.concurrency,
+                                })
+                                .await;
+
+                            in_flight += 1;
+                            let worker_tx = result_tx.clone();
+                            let worker_client = base_client
+                                .clone_with_batch_limits(settings.max_batch_chars, settings.max_batch_items);
+                            tokio::spawn(async move {
+                                let result = embed_chunk_batch(worker_client, chunk_batch).await;
+                                let _ = worker_tx.send(result).await;
+                            });
+                        }
+                        None => input_closed = true,
+                    }
+                }
+                Some(result) = result_rx.recv(), if in_flight > 0 => {
+                    in_flight = in_flight.saturating_sub(1);
+                    if !handle_embed_result(result, &tx, &observer, governor.as_mut()).await {
+                        break;
+                    }
+                }
+            }
+        } else if let Some(result) = result_rx.recv().await {
+            in_flight = in_flight.saturating_sub(1);
+            if !handle_embed_result(result, &tx, &observer, governor.as_mut()).await {
+                break;
+            }
+        } else {
+            break;
+        }
     }
 
     info!("Embedder stage complete");
+}
+
+async fn embed_chunk_batch(
+    mut client: EmbeddingClient,
+    chunk_batch: ChunkBatch,
+) -> EmbedWorkerResult {
+    let path = chunk_batch.path;
+    let content_hash = chunk_batch.content_hash;
+    let chars: usize = chunk_batch
+        .chunks
+        .iter()
+        .map(|chunk| chunk.content.chars().count())
+        .sum();
+    let texts: Vec<String> = chunk_batch
+        .chunks
+        .iter()
+        .map(|chunk| chunk.content.clone())
+        .collect();
+
+    let start = Instant::now();
+    match client.embed_batch(&texts).await {
+        Ok(embeddings) => {
+            let count = embeddings.len();
+            let chunks = chunk_batch
+                .chunks
+                .into_iter()
+                .zip(embeddings)
+                .map(|(chunk, embedding)| EmbeddedChunk { chunk, embedding })
+                .collect();
+
+            EmbedWorkerResult {
+                path,
+                content_hash,
+                count,
+                chars,
+                elapsed: start.elapsed(),
+                chunks: Some(chunks),
+                error: None,
+            }
+        }
+        Err(err) => EmbedWorkerResult {
+            path,
+            content_hash,
+            count: chunk_batch.chunks.len(),
+            chars,
+            elapsed: start.elapsed(),
+            chunks: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+async fn handle_embed_result(
+    result: EmbedWorkerResult,
+    tx: &mpsc::Sender<EmbeddedFile>,
+    observer: &PipelineObserver,
+    governor: Option<&mut PipelineGovernor>,
+) -> bool {
+    if let Some(error_message) = result.error {
+        error!(
+            "Embedding batch failed for {:?}: {}",
+            result.path, error_message
+        );
+        observer
+            .emit(PipelineEvent::Error {
+                path: Some(result.path.clone()),
+                stage: "embedder",
+                message: error_message.clone(),
+            })
+            .await;
+
+        if let Some(governor) = governor {
+            let snapshot = observer.snapshot().await;
+            if let Some(adjustment) = governor.on_error(&snapshot, &error_message) {
+                observer
+                    .emit(PipelineEvent::GovernorAdjusted {
+                        batch_items_limit: adjustment.settings.max_batch_items,
+                        batch_chars_limit: adjustment.settings.max_batch_chars,
+                        concurrency_limit: adjustment.settings.concurrency,
+                        mode: adjustment.mode,
+                        reason: adjustment.reason,
+                    })
+                    .await;
+            }
+        }
+        return true;
+    }
+
+    let Some(chunks) = result.chunks else {
+        return true;
+    };
+
+    if tx
+        .send(EmbeddedFile {
+            path: result.path.clone(),
+            content_hash: result.content_hash.clone(),
+            chunks,
+        })
+        .await
+        .is_err()
+    {
+        debug!("Embedder: channel closed, stopping");
+        observer
+            .emit(PipelineEvent::Error {
+                path: Some(result.path),
+                stage: "embedder",
+                message: "storage channel closed".to_string(),
+            })
+            .await;
+        return false;
+    }
+
+    observer
+        .emit(PipelineEvent::ChunksEmbedded {
+            path: result.path.clone(),
+            content_hash: result.content_hash.clone(),
+            count: result.count,
+            chars: result.chars,
+            elapsed: result.elapsed,
+        })
+        .await;
+
+    if let Some(governor) = governor {
+        let snapshot = observer.snapshot().await;
+        if let Some(adjustment) = governor.on_success(result.elapsed, &snapshot) {
+            observer
+                .emit(PipelineEvent::GovernorAdjusted {
+                    batch_items_limit: adjustment.settings.max_batch_items,
+                    batch_chars_limit: adjustment.settings.max_batch_chars,
+                    concurrency_limit: adjustment.settings.concurrency,
+                    mode: adjustment.mode,
+                    reason: adjustment.reason,
+                })
+                .await;
+        }
+    }
+
+    true
 }
 
 // =============================================================================
@@ -909,7 +1477,36 @@ pub async fn run_pipeline(
         total_files, config.slice_mode
     );
 
-    let observer = PipelineObserver::new(total_files, config.event_sender.clone());
+    let base_client = {
+        let guard = client.lock().await;
+        guard.clone()
+    };
+    let initial_runtime = config
+        .governor
+        .as_ref()
+        .map(PipelineGovernorConfig::initial_settings)
+        .unwrap_or_else(|| {
+            let (max_batch_chars, max_batch_items) = base_client.batch_limits();
+            EmbedRuntimeSettings::new(max_batch_chars, max_batch_items, config.embed_concurrency)
+        });
+    let (governor_mode, governor_reason) = if config.governor.is_some() {
+        (
+            "adaptive".to_string(),
+            "warming up from conservative limits".to_string(),
+        )
+    } else {
+        (
+            "fixed".to_string(),
+            "operator-configured limits".to_string(),
+        )
+    };
+    let observer = PipelineObserver::new(
+        total_files,
+        config.event_sender.clone(),
+        initial_runtime,
+        governor_mode,
+        governor_reason,
+    );
     observer.emit_initial_snapshot().await;
 
     let (tx1, rx1) = mpsc::channel::<FileContent>(config.reader_buffer);
@@ -932,7 +1529,14 @@ pub async fn run_pipeline(
     ));
 
     let chunker_handle = tokio::spawn(stage_chunk_content(rx1, tx2, slice_mode, observer.clone()));
-    let embedder_handle = tokio::spawn(stage_embed_chunks(rx2, tx3, client, observer.clone()));
+    let embedder_handle = tokio::spawn(stage_embed_chunks(
+        rx2,
+        tx3,
+        base_client,
+        config.embed_concurrency.max(1),
+        config.governor.clone(),
+        observer.clone(),
+    ));
     let storage_handle = tokio::spawn(stage_store_chunks(
         rx3,
         storage_for_storage,
@@ -984,12 +1588,20 @@ mod tests {
         assert_eq!(config.reader_buffer, CHANNEL_BUFFER_SIZE);
         assert_eq!(config.slice_mode, SliceMode::default());
         assert!(config.dedup_enabled);
+        assert_eq!(config.embed_concurrency, 1);
+        assert!(config.governor.is_none());
         assert!(config.event_sender.is_none());
     }
 
     #[tokio::test]
     async fn test_pipeline_observer_tracks_snapshot_and_failures() {
-        let observer = PipelineObserver::new(3, None);
+        let observer = PipelineObserver::new(
+            3,
+            None,
+            EmbedRuntimeSettings::new(8_192, 16, 2),
+            "fixed".to_string(),
+            "operator-configured limits".to_string(),
+        );
         observer.emit_initial_snapshot().await;
 
         let path_a = PathBuf::from("a.md");
@@ -1007,6 +1619,17 @@ mod tests {
                 path: path_a.clone(),
                 content_hash: "hash-a".to_string(),
                 count: 4,
+            })
+            .await;
+        observer
+            .emit(PipelineEvent::EmbedStarted {
+                path: path_a.clone(),
+                content_hash: "hash-a".to_string(),
+                count: 4,
+                chars: 1200,
+                batch_items_limit: 16,
+                batch_chars_limit: 8_192,
+                concurrency_limit: 2,
             })
             .await;
         observer
@@ -1051,6 +1674,67 @@ mod tests {
         assert_eq!(result.stats.chunks_stored, 4);
         assert_eq!(result.stats.errors, 1);
         assert_eq!(result.errors.len(), 1);
+
+        let snapshot = observer.snapshot().await;
+        assert_eq!(snapshot.embed_concurrency_limit, 2);
+        assert_eq!(snapshot.embed_batch_items_limit, 16);
+        assert_eq!(snapshot.embed_batch_chars_limit, 8_192);
+        assert!(snapshot.avg_embed_batch_ms.is_some());
+        assert_eq!(snapshot.governor_mode, "fixed");
+    }
+
+    #[test]
+    fn test_pipeline_governor_scales_up_only_when_backlog_stays_fast() {
+        let config = PipelineGovernorConfig::adaptive(64_000, 32, 4);
+        let initial_items = config.min_batch_items;
+        let initial_chars = config.min_batch_chars;
+        let mut governor = PipelineGovernor::new(config);
+
+        governor.last_growth_at = Some(Instant::now() - governor.config.growth_cooldown);
+        let snapshot = PipelineSnapshot {
+            reader_queue_depth: 1,
+            chunker_queue_depth: 4,
+            storage_queue_depth: 0,
+            ..Default::default()
+        };
+
+        let first = governor
+            .on_success(Duration::from_millis(320), &snapshot)
+            .expect("first growth adjustment");
+        assert!(first.settings.max_batch_items > initial_items);
+
+        governor.last_growth_at = Some(Instant::now() - governor.config.growth_cooldown);
+        governor.current.max_batch_items = governor.config.max_batch_items;
+        let second = governor
+            .on_success(Duration::from_millis(320), &snapshot)
+            .expect("second growth adjustment");
+        assert!(second.settings.max_batch_chars > initial_chars);
+    }
+
+    #[test]
+    fn test_pipeline_governor_throttles_quickly_on_pressure() {
+        let config = PipelineGovernorConfig::adaptive(96_000, 48, 3);
+        let mut governor = PipelineGovernor::new(config.clone());
+        governor.current =
+            EmbedRuntimeSettings::new(config.max_batch_chars, config.max_batch_items, 3);
+
+        let snapshot = PipelineSnapshot {
+            reader_queue_depth: 2,
+            chunker_queue_depth: 5,
+            storage_queue_depth: 4,
+            ..Default::default()
+        };
+
+        let adjustment = governor
+            .on_success(
+                config.pressure_latency + Duration::from_millis(10),
+                &snapshot,
+            )
+            .expect("pressure adjustment");
+        assert!(adjustment.settings.max_batch_items < config.max_batch_items);
+        assert!(adjustment.settings.max_batch_chars < config.max_batch_chars);
+        assert!(adjustment.settings.concurrency < 3);
+        assert!(adjustment.reason.contains("pressure"));
     }
 
     #[test]

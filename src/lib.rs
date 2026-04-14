@@ -30,8 +30,8 @@ use tracing::Level;
 pub use embeddings::{
     DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
     MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
-    cross_dimension_search_adapt, estimate_tokens, safe_chunk_size,
-    truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
+    cross_dimension_search_adapt, estimate_tokens, safe_chunk_size, truncate_to_token_limit,
+    validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
 pub use mcp_core::{
@@ -61,6 +61,7 @@ pub use rag::{
     OnionSliceConfig,
     PipelineConfig,
     PipelineEvent,
+    PipelineGovernorConfig,
     PipelineResult,
     PipelineSnapshot,
     PipelineStats,

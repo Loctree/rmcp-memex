@@ -62,7 +62,6 @@ impl DetectedProvider {
             self.suggested_model.as_deref()
         }
     }
-
 }
 
 fn looks_like_embedding_model(model: &str) -> bool {
@@ -410,10 +409,7 @@ mod tests {
 
     #[test]
     fn pick_embedding_model_finds_embedding_keyword() {
-        let models = vec![
-            "llama3:8b".to_string(),
-            "qwen3-embedding:8b".to_string(),
-        ];
+        let models = vec!["llama3:8b".to_string(), "qwen3-embedding:8b".to_string()];
         assert_eq!(
             pick_embedding_model(&models).as_deref(),
             Some("qwen3-embedding:8b")

@@ -240,7 +240,9 @@ impl EmbedderState {
         match self.dimension_truth {
             DimensionTruth::Pending => {
                 if let Some(model) = self.selected_model() {
-                    format!("No verified dimension for `{model}` yet. Run a probe or enter the dimension manually.")
+                    format!(
+                        "No verified dimension for `{model}` yet. Run a probe or enter the dimension manually."
+                    )
                 } else {
                     "Select an embedding model or enter one manually.".to_string()
                 }

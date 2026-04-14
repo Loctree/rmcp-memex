@@ -534,7 +534,10 @@ impl StorageManager {
             .only_if(predicate.as_str())
             .execute()
             .await?
-            .try_fold(0usize, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
             .await?;
         if pre_count == 0 {
             return Ok(0);
@@ -554,7 +557,10 @@ impl StorageManager {
             .only_if(predicate.as_str())
             .execute()
             .await?
-            .try_fold(0usize, |acc, batch| async move { Ok(acc + batch.num_rows()) })
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
             .await?;
         if pre_count == 0 {
             return Ok(0);

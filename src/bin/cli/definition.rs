@@ -291,6 +291,17 @@ pub enum Commands {
         #[arg(long)]
         pipeline: bool,
 
+        /// Maximum number of embedding requests to keep in flight in pipeline mode.
+        /// With --pipeline-governor disabled this is a fixed concurrency limit.
+        /// With --pipeline-governor enabled this becomes the governor's ceiling.
+        #[arg(long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=8))]
+        pipeline_embed_concurrency: u8,
+
+        /// Enable adaptive pipeline flow control for embedding batch sizes and concurrency.
+        /// Uses embed latency and queue pressure to increase slowly and back off quickly.
+        #[arg(long)]
+        pipeline_governor: bool,
+
         /// Number of files to process in parallel (default: 4, max: 16).
         /// Higher values can speed up indexing on multi-core systems,
         /// but may increase memory usage and API pressure.
