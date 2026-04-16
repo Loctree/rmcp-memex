@@ -202,6 +202,8 @@ async fn run_scheduler_with_processor(
     });
     emit_stats_tick(&state, &sink);
 
+    let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+
     loop {
         drain_control_queue(&mut state, &sink, &mut control_rx);
 
@@ -211,6 +213,9 @@ async fn run_scheduler_with_processor(
             }
 
             tokio::select! {
+                _ = stats_interval.tick() => {
+                    emit_stats_tick(&state, &sink);
+                }
                 Some(control) = control_rx.recv() => {
                     handle_control(&mut state, &sink, control);
                 }
@@ -227,6 +232,9 @@ async fn run_scheduler_with_processor(
             tokio::pin!(resume_wait);
 
             tokio::select! {
+                _ = stats_interval.tick() => {
+                    emit_stats_tick(&state, &sink);
+                }
                 Some(control) = control_rx.recv() => {
                     handle_control(&mut state, &sink, control);
                 }
@@ -245,6 +253,9 @@ async fn run_scheduler_with_processor(
         }
 
         tokio::select! {
+            _ = stats_interval.tick() => {
+                emit_stats_tick(&state, &sink);
+            }
             Some(control) = control_rx.recv() => {
                 handle_control(&mut state, &sink, control);
             }
