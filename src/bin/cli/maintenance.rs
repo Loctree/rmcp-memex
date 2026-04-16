@@ -302,6 +302,10 @@ fn format_pipeline_error_line(path: Option<&Path>, stage: &str, message: &str) -
     }
 }
 
+fn should_disable_pipeline_storage_dedup(existing_checkpoint_loaded: bool) -> bool {
+    existing_checkpoint_loaded
+}
+
 struct PipelineProgressRenderer {
     total_files: usize,
     progress_bar: Option<ProgressBar>,
@@ -520,20 +524,26 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             eprintln!("Warning: --preprocess is not supported in pipeline mode (ignoring)");
         }
 
-        let checkpoint = if resume {
+        let (checkpoint, existing_checkpoint_loaded) = if resume {
             if let Some(cp) = IndexCheckpoint::load(&db_path, ns_name) {
                 let resumed_count = cp.indexed_files.len();
                 eprintln!(
                     "Resuming from checkpoint: {} files already committed",
                     resumed_count
                 );
-                Arc::new(Mutex::new(cp))
+                (Arc::new(Mutex::new(cp)), true)
             } else {
-                Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
+                (
+                    Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path))),
+                    false,
+                )
             }
         } else {
             IndexCheckpoint::delete(&db_path, ns_name);
-            Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
+            (
+                Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path))),
+                false,
+            )
         };
 
         let (pipeline_files, resumed_count, disable_storage_dedup) = if resume {
@@ -544,7 +554,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                 .filter(|path| !checkpoint_guard.is_indexed(path))
                 .cloned()
                 .collect();
-            let disable_storage_dedup = resumed_count > 0;
+            let disable_storage_dedup =
+                should_disable_pipeline_storage_dedup(existing_checkpoint_loaded);
             (filtered_files, resumed_count, disable_storage_dedup)
         } else {
             (files.clone(), 0, false)
@@ -816,6 +827,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     .map(|()| rmcp_memex::IndexResult::Indexed {
                         chunks_indexed: (file_bytes as usize / 500).max(1),
                         content_hash: String::new(),
+                        embedder_ms: None,
+                        tokens_estimated: None,
                     })
                 } else {
                     rag.index_document_with_mode(&file_path, ns.as_deref(), effective_mode)
@@ -823,6 +836,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         .map(|()| rmcp_memex::IndexResult::Indexed {
                             chunks_indexed: (file_bytes as usize / 500).max(1),
                             content_hash: String::new(),
+                            embedder_ms: None,
+                            tokens_estimated: None,
                         })
                 }
             };
@@ -1070,6 +1085,12 @@ mod tests {
             line,
             "[pipeline:error] embedder [/tmp/corpus/a.md] connection reset"
         );
+    }
+
+    #[test]
+    fn resume_checkpoint_disables_pipeline_storage_dedup_even_without_committed_files() {
+        assert!(should_disable_pipeline_storage_dedup(true));
+        assert!(!should_disable_pipeline_storage_dedup(false));
     }
 }
 

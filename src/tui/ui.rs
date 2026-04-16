@@ -879,8 +879,16 @@ fn render_indexing_dashboard(
             "running"
         };
         vec![
-            Line::from(format!("Rate: {:.2} files/sec", snapshot.files_per_sec)),
-            Line::from(format!("ETA: {}", format_eta(snapshot.eta_secs))),
+            Line::from(format!(
+                "Rate: {:.2} files/sec | Avg Embed: {}",
+                snapshot.files_per_sec,
+                snapshot.avg_embedder_ms.map(|ms| format!("{ms:.0}ms")).unwrap_or_else(|| "--".to_string())
+            )),
+            Line::from(format!(
+                "ETA: {} | Tokens: {}",
+                format_eta(snapshot.eta_secs),
+                snapshot.total_tokens_estimated
+            )),
             Line::from(format!("State: {}", status)),
             Line::from(format!(
                 "Parallelism: {} | Inflight: {}",

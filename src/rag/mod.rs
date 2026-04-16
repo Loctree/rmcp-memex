@@ -167,6 +167,10 @@ pub enum IndexResult {
         chunks_indexed: usize,
         /// Content hash for the indexed content
         content_hash: String,
+        /// Time spent in embedding calls (ms)
+        embedder_ms: Option<u64>,
+        /// Estimated total tokens for this content
+        tokens_estimated: Option<usize>,
     },
     /// Content was skipped because it already exists (exact-match duplicate)
     Skipped {
@@ -2029,13 +2033,15 @@ impl RAGPipeline {
             "content_hash": &content_hash,
         });
 
-        let chunks_indexed = self
+        let (chunks_indexed, embedder_ms, tokens_estimated) = self
             .index_with_flat_chunking_and_hash(&text, ns, path, base_metadata, &content_hash)
             .await?;
 
         Ok(IndexResult::Indexed {
             chunks_indexed,
             content_hash,
+            embedder_ms: Some(embedder_ms),
+            tokens_estimated: Some(tokens_estimated),
         })
     }
 
@@ -2054,6 +2060,9 @@ impl RAGPipeline {
         let documents = self.extract_json_documents(path).await?;
 
         let mut total_chunks = 0;
+        let mut total_embedder_ms = 0u64;
+        let mut total_tokens_estimated = 0usize;
+        let mut saw_metrics = false;
         let mut skipped_docs = 0;
         let file_content_hash = match crate::path_utils::safe_read_to_string_async(path).await {
             Ok((_p, content)) => compute_content_hash(&content),
@@ -2089,38 +2098,52 @@ impl RAGPipeline {
                 );
             }
 
-            let chunks = match slice_mode {
+            let (chunks, embedder_ms, tokens_estimated) = match slice_mode {
                 SliceMode::Onion => {
-                    self.index_with_onion_slicing_and_hash(
-                        &content,
-                        namespace,
-                        doc_metadata,
-                        &doc_hash,
-                    )
-                    .await?
+                    let (chunks, embedder_ms, tokens_estimated) = self
+                        .index_with_onion_slicing_and_hash(
+                            &content,
+                            namespace,
+                            doc_metadata,
+                            &doc_hash,
+                        )
+                        .await?;
+                    (chunks, Some(embedder_ms), Some(tokens_estimated))
                 }
                 SliceMode::OnionFast => {
-                    self.index_with_onion_slicing_fast_and_hash(
-                        &content,
-                        namespace,
-                        doc_metadata,
-                        &doc_hash,
-                    )
-                    .await?
+                    let (chunks, embedder_ms, tokens_estimated) = self
+                        .index_with_onion_slicing_fast_and_hash(
+                            &content,
+                            namespace,
+                            doc_metadata,
+                            &doc_hash,
+                        )
+                        .await?;
+                    (chunks, Some(embedder_ms), Some(tokens_estimated))
                 }
                 SliceMode::Flat => {
-                    self.index_with_flat_chunking_and_hash(
-                        &content,
-                        namespace,
-                        path,
-                        doc_metadata,
-                        &doc_hash,
-                    )
-                    .await?
+                    let (chunks, embedder_ms, tokens_estimated) = self
+                        .index_with_flat_chunking_and_hash(
+                            &content,
+                            namespace,
+                            path,
+                            doc_metadata,
+                            &doc_hash,
+                        )
+                        .await?;
+                    (chunks, Some(embedder_ms), Some(tokens_estimated))
                 }
             };
 
             total_chunks += chunks;
+            if let Some(embedder_ms) = embedder_ms {
+                total_embedder_ms += embedder_ms;
+                saw_metrics = true;
+            }
+            if let Some(tokens_estimated) = tokens_estimated {
+                total_tokens_estimated += tokens_estimated;
+                saw_metrics = true;
+            }
         }
 
         if total_chunks == 0 && skipped_docs > 0 {
@@ -2140,6 +2163,8 @@ impl RAGPipeline {
         Ok(IndexResult::Indexed {
             chunks_indexed: total_chunks,
             content_hash: file_content_hash,
+            embedder_ms: saw_metrics.then_some(total_embedder_ms),
+            tokens_estimated: saw_metrics.then_some(total_tokens_estimated),
         })
     }
 
@@ -2185,13 +2210,15 @@ impl RAGPipeline {
             "content_hash": &content_hash,
         });
 
-        let chunks_indexed = self
+        let (chunks_indexed, embedder_ms, tokens_estimated) = self
             .index_with_flat_chunking_and_hash(&cleaned, ns, path, base_metadata, &content_hash)
             .await?;
 
         Ok(IndexResult::Indexed {
             chunks_indexed,
             content_hash,
+            embedder_ms: Some(embedder_ms),
+            tokens_estimated: Some(tokens_estimated),
         })
     }
 
@@ -2352,10 +2379,12 @@ impl RAGPipeline {
         namespace: &str,
         base_metadata: serde_json::Value,
         content_hash: &str,
-    ) -> Result<usize> {
+    ) -> Result<(usize, u64, usize)> {
         let config = OnionSliceConfig::default();
         let slices = create_onion_slices(text, &base_metadata, &config);
         let total_slices = slices.len();
+        let mut tokens_estimated = 0;
+        let token_config = crate::embeddings::TokenConfig::default();
 
         tracing::info!(
             "Onion slicing: {} chars -> {} slices (outer/middle/inner/core)",
@@ -2365,10 +2394,19 @@ impl RAGPipeline {
 
         // Process in batches to avoid RAM explosion for large files
         let mut total_stored = 0;
+        let mut total_embedder_ms = 0;
         for batch in slices.chunks(STORAGE_BATCH_SIZE) {
+            // Estimate tokens for this batch
+            for slice in batch {
+                tokens_estimated +=
+                    crate::embeddings::estimate_tokens(&slice.content, &token_config);
+            }
+
             // Embed this batch
             let batch_contents: Vec<String> = batch.iter().map(|s| s.content.clone()).collect();
+            let embed_started_at = std::time::Instant::now();
             let embeddings = self.embed_chunks(&batch_contents).await?;
+            total_embedder_ms += embed_started_at.elapsed().as_millis() as u64;
 
             // Create documents from this batch with content hash
             let mut batch_docs = Vec::with_capacity(batch.len());
@@ -2400,7 +2438,7 @@ impl RAGPipeline {
             tracing::info!("Stored {}/{} slices", total_stored, total_slices);
         }
 
-        Ok(total_slices)
+        Ok((total_slices, total_embedder_ms, tokens_estimated))
     }
 
     /// Index using fast onion slice architecture (outer + core only)
@@ -2411,10 +2449,12 @@ impl RAGPipeline {
         namespace: &str,
         base_metadata: serde_json::Value,
         content_hash: &str,
-    ) -> Result<usize> {
+    ) -> Result<(usize, u64, usize)> {
         let config = OnionSliceConfig::default();
         let slices = create_onion_slices_fast(text, &base_metadata, &config);
         let total_slices = slices.len();
+        let mut tokens_estimated = 0;
+        let token_config = crate::embeddings::TokenConfig::default();
 
         tracing::info!(
             "Fast onion slicing: {} chars -> {} slices (outer/core only)",
@@ -2424,10 +2464,21 @@ impl RAGPipeline {
 
         // Process in batches
         let mut total_stored = 0;
+        let mut total_embedder_ms = 0;
         for batch in slices.chunks(STORAGE_BATCH_SIZE) {
-            let batch_contents: Vec<String> = batch.iter().map(|s| s.content.clone()).collect();
-            let embeddings = self.embed_chunks(&batch_contents).await?;
+            // Estimate tokens for this batch
+            for slice in batch {
+                tokens_estimated +=
+                    crate::embeddings::estimate_tokens(&slice.content, &token_config);
+            }
 
+            // Embed this batch
+            let batch_contents: Vec<String> = batch.iter().map(|s| s.content.clone()).collect();
+            let embed_started_at = std::time::Instant::now();
+            let embeddings = self.embed_chunks(&batch_contents).await?;
+            total_embedder_ms += embed_started_at.elapsed().as_millis() as u64;
+
+            // Create documents from this batch with content hash
             let mut batch_docs = Vec::with_capacity(batch.len());
             for (slice, embedding) in batch.iter().zip(embeddings.iter()) {
                 let mut metadata = base_metadata.clone();
@@ -2456,7 +2507,7 @@ impl RAGPipeline {
             tracing::info!("Stored {}/{} slices", total_stored, total_slices);
         }
 
-        Ok(total_slices)
+        Ok((total_slices, total_embedder_ms, tokens_estimated))
     }
 
     /// Index using traditional flat chunking (backward compatible)
@@ -2521,10 +2572,12 @@ impl RAGPipeline {
         path: &Path,
         base_metadata: serde_json::Value,
         content_hash: &str,
-    ) -> Result<usize> {
+    ) -> Result<(usize, u64, usize)> {
         // Chunk the text
         let chunks = self.chunk_text(text, 512, 128)?;
         let total_chunks = chunks.len();
+        let mut tokens_estimated = 0;
+        let token_config = crate::embeddings::TokenConfig::default();
 
         tracing::info!(
             "Flat chunking: {} chars -> {} chunks",
@@ -2535,9 +2588,16 @@ impl RAGPipeline {
         // Process in batches to avoid RAM explosion for large files
         let mut total_stored = 0;
         let mut global_idx = 0;
+        let mut total_embedder_ms = 0;
         for batch in chunks.chunks(STORAGE_BATCH_SIZE) {
             // Embed this batch
+            tokens_estimated += batch
+                .iter()
+                .map(|chunk| crate::embeddings::estimate_tokens(chunk, &token_config))
+                .sum::<usize>();
+            let embed_started_at = std::time::Instant::now();
             let embeddings = self.embed_chunks(batch).await?;
+            total_embedder_ms += embed_started_at.elapsed().as_millis() as u64;
 
             // Create documents from this batch with content hash
             let mut batch_docs = Vec::with_capacity(batch.len());
@@ -2571,7 +2631,7 @@ impl RAGPipeline {
             tracing::info!("Stored {}/{} chunks", total_stored, total_chunks);
         }
 
-        Ok(total_chunks)
+        Ok((total_chunks, total_embedder_ms, tokens_estimated))
     }
 
     async fn index_flat_memory_family_with_hash(

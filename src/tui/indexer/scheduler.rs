@@ -123,14 +123,16 @@ pub fn start_indexing(
                     Ok(IndexResult::Indexed {
                         chunks_indexed,
                         content_hash,
+                        embedder_ms,
+                        tokens_estimated,
                     }) => FileOutcome::Indexed {
                         file_index,
                         path,
                         chunks_indexed,
                         content_hash,
                         duration_ms: started_at.elapsed().as_millis() as u64,
-                        embedder_ms: None,
-                        tokens_estimated: None,
+                        embedder_ms,
+                        tokens_estimated,
                     },
                     Ok(IndexResult::Skipped {
                         reason,

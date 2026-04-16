@@ -1383,20 +1383,41 @@ async fn stage_store_chunks(
         let content_hash = embedded_file.content_hash.clone();
         let mut stored_for_file = 0usize;
         let mut storage_failed = false;
+        let mut stored_doc_refs: Vec<(String, String)> = Vec::new();
 
         while !embedded_file.chunks.is_empty() {
             let take = embedded_file.chunks.len().min(STORAGE_BATCH_SIZE);
             let batch: Vec<EmbeddedChunk> = embedded_file.chunks.drain(..take).collect();
+            let batch_refs: Vec<(String, String)> = batch
+                .iter()
+                .map(|embedded| (embedded.chunk.namespace.clone(), embedded.chunk.id.clone()))
+                .collect();
 
             match store_batch(&storage, batch).await {
-                Ok(count) => stored_for_file += count,
+                Ok(count) => {
+                    stored_for_file += count;
+                    stored_doc_refs.extend(batch_refs);
+                }
                 Err(err) => {
+                    let (rolled_back, rollback_failures) =
+                        rollback_stored_file_chunks(&storage, &stored_doc_refs).await;
+                    let rollback_suffix = if rollback_failures == 0 {
+                        format!(
+                            "rolled back {} previously stored chunks for file",
+                            rolled_back
+                        )
+                    } else {
+                        format!(
+                            "rolled back {} previously stored chunks for file, {} rollback deletes failed",
+                            rolled_back, rollback_failures
+                        )
+                    };
                     error!("Storage batch failed for {:?}: {}", path, err);
                     observer
                         .emit(PipelineEvent::Error {
                             path: Some(path.clone()),
                             stage: "storage",
-                            message: err.to_string(),
+                            message: format!("{err}; {rollback_suffix}"),
                         })
                         .await;
                     storage_failed = true;
@@ -1417,6 +1438,29 @@ async fn stage_store_chunks(
     }
 
     info!("Storage stage complete");
+}
+
+async fn rollback_stored_file_chunks(
+    storage: &StorageManager,
+    stored_doc_refs: &[(String, String)],
+) -> (usize, usize) {
+    let mut deleted = 0usize;
+    let mut failures = 0usize;
+
+    for (namespace, id) in stored_doc_refs.iter().rev() {
+        match storage.delete_document(namespace, id).await {
+            Ok(count) => deleted += count,
+            Err(err) => {
+                failures += 1;
+                warn!(
+                    "Failed to roll back partially stored chunk {}/{}: {}",
+                    namespace, id, err
+                );
+            }
+        }
+    }
+
+    (deleted, failures)
 }
 
 /// Store a batch of embedded chunks.
@@ -1564,6 +1608,7 @@ pub async fn run_pipeline(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     #[test]
     fn test_split_into_chunks_short_text() {
@@ -1762,5 +1807,64 @@ mod tests {
         assert_eq!(stats.chunks_embedded, 10);
         assert_eq!(stats.chunks_stored, 8);
         assert_eq!(stats.errors, 3);
+    }
+
+    #[tokio::test]
+    async fn test_rollback_stored_file_chunks_removes_partial_file_writes() {
+        let tmp = TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("lancedb");
+        let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
+            .await
+            .expect("storage");
+        storage.ensure_collection().await.expect("collection");
+
+        let namespace = "rollback-ns".to_string();
+        let doc_a = ChromaDocument::new_flat_with_hash(
+            "chunk-a".to_string(),
+            namespace.clone(),
+            vec![0.1_f32; 8],
+            serde_json::json!({"path": "doc-a.md"}),
+            "alpha".to_string(),
+            "file-hash".to_string(),
+        );
+        let doc_b = ChromaDocument::new_flat_with_hash(
+            "chunk-b".to_string(),
+            namespace.clone(),
+            vec![0.2_f32; 8],
+            serde_json::json!({"path": "doc-a.md"}),
+            "beta".to_string(),
+            "file-hash".to_string(),
+        );
+
+        storage
+            .add_to_store(vec![doc_a, doc_b])
+            .await
+            .expect("seed partial writes");
+
+        let (deleted, failures) = rollback_stored_file_chunks(
+            &storage,
+            &[
+                (namespace.clone(), "chunk-a".to_string()),
+                (namespace.clone(), "chunk-b".to_string()),
+            ],
+        )
+        .await;
+
+        assert_eq!(deleted, 2);
+        assert_eq!(failures, 0);
+        assert!(
+            storage
+                .get_document(&namespace, "chunk-a")
+                .await
+                .expect("lookup chunk-a")
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_document(&namespace, "chunk-b")
+                .await
+                .expect("lookup chunk-b")
+                .is_none()
+        );
     }
 }
