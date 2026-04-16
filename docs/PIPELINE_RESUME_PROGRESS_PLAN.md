@@ -1,5 +1,18 @@
 # Pipeline Resume + Progress Plan
 
+## Status Note
+
+This document started as a forward plan. The core work is now implemented:
+
+- `--pipeline` supports `--progress`
+- `--pipeline` supports `--resume`
+- adaptive pipeline governor controls batch size, batch chars, and embed concurrency
+- pipeline progress snapshots stream live queue depths, rates, ETA, and governor state
+
+What remained worth tightening after the original implementation was operator truth
+during resumed runs: live progress now carries discovered-file and resumed-file counts
+so the runtime stream reflects the whole run, not only the remaining scheduled subset.
+
 ## Current State
 
 The async pipeline path already has the right broad shape:
@@ -11,12 +24,8 @@ The async pipeline path already has the right broad shape:
 
 It overlaps I/O, chunk creation, embedding, and writes through bounded channels in `src/rag/pipeline.rs`.
 
-What is still false today:
-
-- `--pipeline` disables `--progress`
-- `--pipeline` disables `--resume`
-- throughput is not adaptively governed based on real embedder / GPU conditions
-- final stats exist, but there is no truthful runtime stream for operators
+The remaining work from the original plan is mostly future refinement, not baseline
+capability recovery.
 
 Relevant code:
 

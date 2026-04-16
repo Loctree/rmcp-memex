@@ -85,6 +85,8 @@ use crate::cli::definition::*;
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct IndexCheckpointStats {
     pub total_files: usize,
+    pub discovered_files: usize,
+    pub resumed_files: usize,
     pub files_read: usize,
     pub files_skipped: usize,
     pub files_committed: usize,
@@ -99,6 +101,8 @@ impl From<&PipelineSnapshot> for IndexCheckpointStats {
     fn from(snapshot: &PipelineSnapshot) -> Self {
         Self {
             total_files: snapshot.total_files,
+            discovered_files: snapshot.discovered_files,
+            resumed_files: snapshot.resumed_files,
             files_read: snapshot.files_read,
             files_skipped: snapshot.files_skipped,
             files_committed: snapshot.files_committed,
@@ -248,8 +252,15 @@ fn pipeline_embed_rate(snapshot: &PipelineSnapshot) -> f64 {
     }
 }
 
-fn format_pipeline_status_line(snapshot: &PipelineSnapshot, total_files: usize) -> String {
+fn format_pipeline_status_line(snapshot: &PipelineSnapshot, scheduled_files: usize) -> String {
     let terminal_files = snapshot.files_committed + snapshot.files_skipped + snapshot.files_failed;
+    let discovered_files = snapshot
+        .discovered_files
+        .max(scheduled_files.saturating_add(snapshot.resumed_files))
+        .max(scheduled_files);
+    let completed_discovered = terminal_files
+        .saturating_add(snapshot.resumed_files)
+        .min(discovered_files);
     let eta = snapshot
         .eta
         .map(HumanDuration)
@@ -261,9 +272,11 @@ fn format_pipeline_status_line(snapshot: &PipelineSnapshot, total_files: usize) 
         .unwrap_or_else(|| "--".to_string());
 
     format!(
-        "{}/{} files | read {} | committed {} skipped {} failed {} | chunks created {} embedded {} ({:.1}/s) stored {} ({:.1}/s) | eta {} | q {}/{}/{} | embed {}/{} req @ {} | batch {}/{} items {} / {} chars | gov {} ({}) | {}",
-        terminal_files.min(total_files),
-        total_files,
+        "{}/{} discovered | scheduled {} resumed {} | read {} | committed {} skipped {} failed {} | chunks created {} embedded {} ({:.1}/s) stored {} ({:.1}/s) | eta {} | q {}/{}/{} | embed {}/{} req @ {} | batch {}/{} items {} / {} chars | gov {} ({}) | {}",
+        completed_discovered,
+        discovered_files,
+        scheduled_files,
+        snapshot.resumed_files,
         snapshot.files_read,
         snapshot.files_committed,
         snapshot.files_skipped,
@@ -345,13 +358,20 @@ impl PipelineProgressRenderer {
     fn render(&mut self, snapshot: &PipelineSnapshot, force: bool) {
         let terminal_files =
             snapshot.files_committed + snapshot.files_skipped + snapshot.files_failed;
+        let discovered_files = snapshot
+            .discovered_files
+            .max(self.total_files.saturating_add(snapshot.resumed_files))
+            .max(self.total_files);
+        let completed_discovered = terminal_files
+            .saturating_add(snapshot.resumed_files)
+            .min(discovered_files);
         let message = format_pipeline_status_line(snapshot, self.total_files);
 
         if let Some(progress_bar) = &self.progress_bar {
-            progress_bar.set_length(self.total_files as u64);
-            progress_bar.set_position(terminal_files.min(self.total_files) as u64);
+            progress_bar.set_length(discovered_files as u64);
+            progress_bar.set_position(completed_discovered as u64);
             progress_bar.set_message(message.clone());
-            if force && terminal_files >= self.total_files {
+            if force && completed_discovered >= discovered_files {
                 progress_bar.finish_with_message(format!("complete | {}", message));
             }
             return;
@@ -366,18 +386,36 @@ impl PipelineProgressRenderer {
     }
 }
 
-async fn consume_pipeline_events(
-    mut rx: mpsc::UnboundedReceiver<PipelineEvent>,
+struct PipelineEventConsumerConfig {
     checkpoint: Option<Arc<Mutex<IndexCheckpoint>>>,
     db_path: String,
     show_progress: bool,
     interactive_progress: bool,
-    total_files: usize,
+    scheduled_files: usize,
+    discovered_files: usize,
+    resumed_files: usize,
+}
+
+async fn consume_pipeline_events(
+    mut rx: mpsc::UnboundedReceiver<PipelineEvent>,
+    config: PipelineEventConsumerConfig,
 ) -> PipelineSnapshot {
+    let PipelineEventConsumerConfig {
+        checkpoint,
+        db_path,
+        show_progress,
+        interactive_progress,
+        scheduled_files,
+        discovered_files,
+        resumed_files,
+    } = config;
+
     let mut renderer =
-        show_progress.then(|| PipelineProgressRenderer::new(total_files, interactive_progress));
+        show_progress.then(|| PipelineProgressRenderer::new(scheduled_files, interactive_progress));
     let mut latest_snapshot = PipelineSnapshot {
-        total_files,
+        total_files: scheduled_files,
+        discovered_files,
+        resumed_files,
         ..Default::default()
     };
 
@@ -402,7 +440,7 @@ async fn consume_pipeline_events(
                 }
             }
             PipelineEvent::Snapshot(snapshot) => {
-                latest_snapshot = snapshot;
+                latest_snapshot = *snapshot;
                 if let Some(checkpoint) = &checkpoint {
                     let mut checkpoint = checkpoint.lock().await;
                     checkpoint.update_from_snapshot(&latest_snapshot);
@@ -593,11 +631,15 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let event_task = tokio::spawn(consume_pipeline_events(
             event_rx,
-            resume.then_some(Arc::clone(&checkpoint)),
-            db_path.clone(),
-            show_progress,
-            use_progress_bar,
-            pipeline_files.len(),
+            PipelineEventConsumerConfig {
+                checkpoint: resume.then_some(Arc::clone(&checkpoint)),
+                db_path: db_path.clone(),
+                show_progress,
+                interactive_progress: use_progress_bar,
+                scheduled_files: pipeline_files.len(),
+                discovered_files: total,
+                resumed_files: resumed_count,
+            },
         ));
 
         let pipeline_config = PipelineConfig {
@@ -612,6 +654,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                 )
             }),
             event_sender: Some(event_tx),
+            discovered_files: total,
+            resumed_files: resumed_count,
             ..Default::default()
         };
 
@@ -1033,6 +1077,8 @@ mod tests {
     fn format_pipeline_status_line_surfaces_stage_flow() {
         let snapshot = PipelineSnapshot {
             total_files: 6,
+            discovered_files: 8,
+            resumed_files: 2,
             files_read: 4,
             files_committed: 2,
             files_skipped: 1,
@@ -1062,7 +1108,8 @@ mod tests {
 
         let line = format_pipeline_status_line(&snapshot, 6);
 
-        assert!(line.contains("4/6 files"));
+        assert!(line.contains("6/8 discovered"));
+        assert!(line.contains("scheduled 6 resumed 2"));
         assert!(line.contains("read 4"));
         assert!(line.contains("embedded 20 (4.0/s)"));
         assert!(line.contains("stored 18 (3.6/s)"));

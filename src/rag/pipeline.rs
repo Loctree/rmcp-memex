@@ -424,6 +424,13 @@ pub struct PipelineConfig {
     pub governor: Option<PipelineGovernorConfig>,
     /// Optional event stream for progress/reporting consumers.
     pub event_sender: Option<mpsc::UnboundedSender<PipelineEvent>>,
+    /// Total files discovered for this operator-visible run.
+    ///
+    /// This can be larger than the scheduled pipeline file count when resume
+    /// filtered out already committed files before entering the pipeline.
+    pub discovered_files: usize,
+    /// Files already satisfied before this pipeline run started.
+    pub resumed_files: usize,
 }
 
 impl Default for PipelineConfig {
@@ -437,6 +444,8 @@ impl Default for PipelineConfig {
             embed_concurrency: 1,
             governor: None,
             event_sender: None,
+            discovered_files: 0,
+            resumed_files: 0,
         }
     }
 }
@@ -446,6 +455,10 @@ impl Default for PipelineConfig {
 pub struct PipelineStats {
     /// Total files scheduled for this pipeline run.
     pub total_files: usize,
+    /// Total files discovered for this operator-visible run.
+    pub discovered_files: usize,
+    /// Files already satisfied before this pipeline run started.
+    pub resumed_files: usize,
     /// Files successfully read and handed to the chunker.
     pub files_read: usize,
     /// Files skipped before chunking (for example exact duplicates).
@@ -468,6 +481,8 @@ pub struct PipelineStats {
 #[derive(Debug, Clone, Default)]
 pub struct PipelineSnapshot {
     pub total_files: usize,
+    pub discovered_files: usize,
+    pub resumed_files: usize,
     pub files_read: usize,
     pub files_skipped: usize,
     pub files_committed: usize,
@@ -499,6 +514,8 @@ impl PipelineSnapshot {
     pub fn to_stats(&self) -> PipelineStats {
         PipelineStats {
             total_files: self.total_files,
+            discovered_files: self.discovered_files,
+            resumed_files: self.resumed_files,
             files_read: self.files_read,
             files_skipped: self.files_skipped,
             files_committed: self.files_committed,
@@ -562,7 +579,7 @@ pub enum PipelineEvent {
         stage: &'static str,
         message: String,
     },
-    Snapshot(PipelineSnapshot),
+    Snapshot(Box<PipelineSnapshot>),
 }
 
 /// Result of pipeline execution.
@@ -585,12 +602,16 @@ struct PipelineProgressState {
 impl PipelineProgressState {
     fn new(
         total_files: usize,
+        discovered_files: usize,
+        resumed_files: usize,
         initial_runtime: EmbedRuntimeSettings,
         governor_mode: String,
         governor_reason: String,
     ) -> Self {
         let snapshot = PipelineSnapshot {
             total_files,
+            discovered_files,
+            resumed_files,
             embed_batch_items_limit: initial_runtime.max_batch_items,
             embed_batch_chars_limit: initial_runtime.max_batch_chars,
             embed_concurrency_limit: initial_runtime.concurrency,
@@ -710,7 +731,7 @@ impl PipelineProgressState {
                 });
             }
             PipelineEvent::Snapshot(snapshot) => {
-                self.snapshot = snapshot.clone();
+                self.snapshot = snapshot.as_ref().clone();
             }
         }
 
@@ -794,6 +815,8 @@ struct PipelineObserver {
 impl PipelineObserver {
     fn new(
         total_files: usize,
+        discovered_files: usize,
+        resumed_files: usize,
         sender: Option<mpsc::UnboundedSender<PipelineEvent>>,
         initial_runtime: EmbedRuntimeSettings,
         governor_mode: String,
@@ -803,6 +826,8 @@ impl PipelineObserver {
             sender,
             state: Arc::new(Mutex::new(PipelineProgressState::new(
                 total_files,
+                discovered_files,
+                resumed_files,
                 initial_runtime,
                 governor_mode,
                 governor_reason,
@@ -818,7 +843,7 @@ impl PipelineObserver {
 
         if let Some(sender) = &self.sender {
             let _ = sender.send(event);
-            let _ = sender.send(PipelineEvent::Snapshot(snapshot));
+            let _ = sender.send(PipelineEvent::Snapshot(Box::new(snapshot)));
         }
     }
 
@@ -829,7 +854,7 @@ impl PipelineObserver {
         };
 
         if let Some(sender) = &self.sender {
-            let _ = sender.send(PipelineEvent::Snapshot(snapshot));
+            let _ = sender.send(PipelineEvent::Snapshot(Box::new(snapshot)));
         }
     }
 
@@ -1516,9 +1541,13 @@ pub async fn run_pipeline(
     config: PipelineConfig,
 ) -> Result<PipelineResult> {
     let total_files = files.len();
+    let discovered_files = config
+        .discovered_files
+        .max(total_files.saturating_add(config.resumed_files))
+        .max(total_files);
     info!(
-        "Starting pipeline: {} files, mode: {:?}",
-        total_files, config.slice_mode
+        "Starting pipeline: {} scheduled files ({} discovered, {} resumed), mode: {:?}",
+        total_files, discovered_files, config.resumed_files, config.slice_mode
     );
 
     let base_client = {
@@ -1546,6 +1575,8 @@ pub async fn run_pipeline(
     };
     let observer = PipelineObserver::new(
         total_files,
+        discovered_files,
+        config.resumed_files,
         config.event_sender.clone(),
         initial_runtime,
         governor_mode,
@@ -1642,6 +1673,8 @@ mod tests {
     async fn test_pipeline_observer_tracks_snapshot_and_failures() {
         let observer = PipelineObserver::new(
             3,
+            3,
+            0,
             None,
             EmbedRuntimeSettings::new(8_192, 16, 2),
             "fixed".to_string(),
@@ -1710,6 +1743,8 @@ mod tests {
 
         let result = observer.result().await;
         assert_eq!(result.stats.total_files, 3);
+        assert_eq!(result.stats.discovered_files, 3);
+        assert_eq!(result.stats.resumed_files, 0);
         assert_eq!(result.stats.files_read, 1);
         assert_eq!(result.stats.files_skipped, 1);
         assert_eq!(result.stats.files_committed, 1);
@@ -1786,6 +1821,8 @@ mod tests {
     fn test_snapshot_to_stats_carries_runtime_truth() {
         let snapshot = PipelineSnapshot {
             total_files: 5,
+            discovered_files: 7,
+            resumed_files: 2,
             files_read: 4,
             files_skipped: 1,
             files_committed: 2,
@@ -1799,6 +1836,8 @@ mod tests {
 
         let stats = snapshot.to_stats();
         assert_eq!(stats.total_files, 5);
+        assert_eq!(stats.discovered_files, 7);
+        assert_eq!(stats.resumed_files, 2);
         assert_eq!(stats.files_read, 4);
         assert_eq!(stats.files_skipped, 1);
         assert_eq!(stats.files_committed, 2);
