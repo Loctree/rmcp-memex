@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+#[allow(deprecated)]
 use crate::{
     embeddings::EmbeddingClient,
     query::{QueryRouter, SearchModeRecommendation},
@@ -381,6 +382,7 @@ pub fn shared_tools_list_result() -> Value {
 }
 
 #[derive(Clone)]
+#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 pub struct McpCore {
     rag: Arc<RAGPipeline>,
     hybrid_searcher: Option<Arc<HybridSearcher>>,
@@ -390,6 +392,7 @@ pub struct McpCore {
     access_manager: Arc<NamespaceAccessManager>,
 }
 
+#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 impl McpCore {
     pub fn new(
         rag: Arc<RAGPipeline>,
@@ -411,6 +414,17 @@ impl McpCore {
 
     pub fn rag(&self) -> Arc<RAGPipeline> {
         self.rag.clone()
+    }
+
+    /// Access the namespace access manager (if security is enabled).
+    /// Returns None when the manager exists but security is disabled.
+    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; still needed during transition
+    pub fn access_manager(&self) -> Option<&NamespaceAccessManager> {
+        if self.access_manager.is_enabled() {
+            Some(&self.access_manager)
+        } else {
+            None
+        }
     }
 
     pub fn hybrid_searcher(&self) -> Option<Arc<HybridSearcher>> {

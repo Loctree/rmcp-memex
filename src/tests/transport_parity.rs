@@ -271,6 +271,7 @@ fn jsonrpc_error_omits_id_when_none() {
 
 /// Build a McpCore backed by a temporary LanceDB + the configured embedding server.
 /// Returns None if the embedding server is unreachable (test should skip).
+#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 async fn try_build_mcp_core() -> Option<McpCore> {
     use crate::{
         EmbeddingClient, EmbeddingConfig, ProviderConfig,
@@ -608,6 +609,7 @@ async fn health_tool_transport_field_difference_is_intentional() {
 
 /// Build an McpCore with a stub embedding client.
 /// These tests cover protocol dispatch paths that don't touch embeddings.
+#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 async fn build_mcp_core_stub() -> McpCore {
     use crate::{
         EmbeddingClient,

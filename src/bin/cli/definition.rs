@@ -147,6 +147,25 @@ pub struct Cli {
     /// when bound to non-localhost, or permissive when bound to localhost.
     #[arg(long, global = true)]
     pub cors_origins: Option<String>,
+
+    /// Allow binding to non-loopback addresses without --auth-token.
+    /// By default, binding to e.g. 0.0.0.0 without auth is a hard error.
+    /// This flag downgrades it to a warning.
+    #[arg(long, global = true)]
+    pub allow_network_without_auth: bool,
+
+    /// Auth enforcement mode for HTTP endpoints.
+    /// - mutating-only (default): bearer required only on mutating + MCP routes
+    /// - all-routes: bearer required on ALL routes except /health
+    /// - namespace-acl: reserved for Track C (namespace-level ACL)
+    #[arg(long, global = true, default_value = "mutating-only",
+           value_parser = ["mutating-only", "all-routes", "namespace-acl"])]
+    pub auth_mode: String,
+
+    /// Allow passing bearer token as ?token= query parameter on read GET endpoints.
+    /// Disabled by default. Only effective when --auth-mode is all-routes.
+    #[arg(long, global = true)]
+    pub allow_query_token: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -950,6 +969,81 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage auth tokens with per-token scopes and namespace ACL
+    ///
+    /// Create, list, revoke, and rotate bearer tokens for HTTP API access.
+    /// Each token is hashed with argon2id at rest. The plaintext is shown
+    /// ONCE on creation and can never be retrieved again.
+    ///
+    /// Examples:
+    ///   rmcp-memex auth create --description "iPhone" --scopes read,write --namespaces kb:claude,kb:mikserka
+    ///   rmcp-memex auth list
+    ///   rmcp-memex auth revoke --id monika-iphone
+    ///   rmcp-memex auth rotate --id monika-iphone
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+/// Auth token management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum AuthAction {
+    /// Create a new auth token
+    ///
+    /// Generates a new token with specified scopes and namespace access.
+    /// The plaintext token is printed ONCE and never stored.
+    Create {
+        /// Human-readable token identifier (e.g., "monika-iphone")
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Description of what this token is for
+        #[arg(long, required = true)]
+        description: String,
+
+        /// Comma-separated scopes: read, write, admin
+        #[arg(long, default_value = "read,write")]
+        scopes: String,
+
+        /// Comma-separated namespace ACL. Use "*" for all namespaces.
+        #[arg(long, default_value = "*")]
+        namespaces: String,
+
+        /// Token expiry (RFC 3339 timestamp, e.g., "2026-12-31T00:00:00Z")
+        #[arg(long)]
+        expires_at: Option<String>,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List all tokens (without revealing plaintext)
+    List {
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Revoke (delete) a token by its ID
+    Revoke {
+        /// Token ID to revoke
+        #[arg(long, required = true)]
+        id: String,
+    },
+
+    /// Rotate a token: revoke old, create new with same metadata
+    Rotate {
+        /// Token ID to rotate
+        #[arg(long, required = true)]
+        id: String,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -1147,5 +1241,35 @@ mod tests {
             }
             other => panic!("expected repair-writes command, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn auth_mode_flag_parses_all_routes() {
+        let cli = Cli::parse_from(["rmcp-memex", "--auth-mode", "all-routes", "serve"]);
+        assert_eq!(cli.auth_mode, "all-routes");
+    }
+
+    #[test]
+    fn auth_mode_defaults_to_mutating_only() {
+        let cli = Cli::parse_from(["rmcp-memex", "serve"]);
+        assert_eq!(cli.auth_mode, "mutating-only");
+    }
+
+    #[test]
+    fn allow_network_without_auth_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "--allow-network-without-auth", "serve"]);
+        assert!(cli.allow_network_without_auth);
+    }
+
+    #[test]
+    fn allow_query_token_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "--allow-query-token", "serve"]);
+        assert!(cli.allow_query_token);
+    }
+
+    #[test]
+    fn auth_mode_rejects_invalid_value() {
+        let result = Cli::try_parse_from(["rmcp-memex", "--auth-mode", "bogus", "serve"]);
+        assert!(result.is_err());
     }
 }

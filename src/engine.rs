@@ -398,7 +398,7 @@ impl LayerStats {
 
         // Sort by frequency and take top 10
         let mut keywords: Vec<_> = keyword_counts.into_iter().collect();
-        keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        keywords.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top_keywords = keywords.into_iter().take(10).map(|(k, _)| k).collect();
 
         Self {
@@ -853,7 +853,7 @@ impl MemexEngine {
         let mut docs = Vec::with_capacity(items.len());
         let mut bm25_docs = Vec::new();
 
-        for (item, embedding) in items.iter().zip(embeddings.into_iter()) {
+        for (item, embedding) in items.iter().zip(embeddings) {
             let doc = ChromaDocument::new_flat(
                 item.id.clone(),
                 self.namespace.clone(),

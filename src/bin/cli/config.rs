@@ -93,6 +93,10 @@ pub struct FileConfig {
     pub bind_address: Option<String>,
     /// Allowed CORS origins (comma-separated list)
     pub cors_origins: Option<String>,
+    /// Auth mode: "mutating-only", "all-routes", or "namespace-acl"
+    pub auth_mode: Option<String>,
+    /// Allow ?token= query parameter on read GETs
+    pub allow_query_token: Option<bool>,
 }
 
 /// New embedding configuration from TOML

@@ -1136,11 +1136,8 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.handle_up(),
             KeyCode::Down | KeyCode::Char('j') => self.handle_down(),
             KeyCode::Char(' ') => self.handle_space(),
-            KeyCode::Char('r') => {
-                // Retry health check
-                if self.step == WizardStep::HealthCheck && !self.health_running {
-                    self.trigger_health_check();
-                }
+            KeyCode::Char('r') if self.step == WizardStep::HealthCheck && !self.health_running => {
+                self.trigger_health_check();
             }
             _ => {}
         }
@@ -1247,15 +1244,11 @@ impl App {
                 self.editing_field = Some(self.focus);
                 self.input_buffer = self.get_field_value(self.focus);
             }
-            WizardStep::HostSelection => {
-                if self.focus < self.hosts.len() {
-                    self.toggle_host(self.focus);
-                }
+            WizardStep::HostSelection if self.focus < self.hosts.len() => {
+                self.toggle_host(self.focus);
             }
-            WizardStep::HealthCheck => {
-                if !self.health_running {
-                    self.trigger_health_check();
-                }
+            WizardStep::HealthCheck if !self.health_running => {
+                self.trigger_health_check();
             }
             WizardStep::DataSetup => {
                 self.handle_data_setup_enter();

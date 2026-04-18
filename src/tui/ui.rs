@@ -851,11 +851,22 @@ fn render_indexing_dashboard(
         .clamp(0.0, 1.0);
 
     let progress_label = telemetry
-        .map(|snapshot| format!("{}% ({}/{})", (ratio * 100.0) as u64, snapshot.processed, snapshot.total))
+        .map(|snapshot| {
+            format!(
+                "{}% ({}/{})",
+                (ratio * 100.0) as u64,
+                snapshot.processed,
+                snapshot.total
+            )
+        })
         .unwrap_or_else(|| "0% (waiting)".to_string());
 
     let progress_gauge = Gauge::default()
-        .block(Block::default().borders(Borders::BOTTOM).padding(Padding::new(1, 1, 0, 0)))
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .padding(Padding::new(1, 1, 0, 0)),
+        )
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
         .ratio(ratio)
         .label(progress_label);
@@ -896,37 +907,61 @@ fn render_indexing_dashboard(
             ]),
             Line::from(vec![
                 Span::raw("Rate:        "),
-                Span::styled(format!("{:.2} files/sec", snapshot.files_per_sec), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!("{:.2} files/sec", snapshot.files_per_sec),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(vec![
                 Span::raw("ETA:         "),
-                Span::styled(format_eta(snapshot.eta_secs), Style::default().fg(Color::White)),
+                Span::styled(
+                    format_eta(snapshot.eta_secs),
+                    Style::default().fg(Color::White),
+                ),
             ]),
             Line::from(vec![
                 Span::raw("Parallelism: "),
-                Span::styled(snapshot.parallelism.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    snapshot.parallelism.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::raw(" (inflight: "),
-                Span::styled(snapshot.in_flight.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    snapshot.in_flight.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw(")"),
             ]),
             Line::from(vec![
                 Span::raw("Processed:   "),
-                Span::styled(snapshot.indexed.to_string(), Style::default().fg(Color::Green)),
+                Span::styled(
+                    snapshot.indexed.to_string(),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw(" indexed, "),
-                Span::styled(snapshot.skipped.to_string(), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    snapshot.skipped.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::raw(" skipped, "),
                 Span::styled(snapshot.failed.to_string(), Style::default().fg(Color::Red)),
                 Span::raw(" failed"),
             ]),
             Line::from(vec![
                 Span::raw("Chunks:      "),
-                Span::styled(snapshot.total_chunks.to_string(), Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    snapshot.total_chunks.to_string(),
+                    Style::default().fg(Color::Magenta),
+                ),
                 Span::raw(" produced"),
             ]),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Current File: ", Style::default().bold()),
-                Span::styled(current_file_label(snapshot), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    current_file_label(snapshot),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]),
         ]
     } else {
@@ -937,14 +972,17 @@ fn render_indexing_dashboard(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(" Operator Dashboard ");
-    frame.render_widget(Paragraph::new(left_lines).block(operator_block), main_chunks[0]);
+    frame.render_widget(
+        Paragraph::new(left_lines).block(operator_block),
+        main_chunks[0],
+    );
 
     // Right: System Telemetry with Gauges
     let system_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(" System Telemetry ");
-    
+
     let sys_area = system_block.inner(main_chunks[1]);
     frame.render_widget(system_block, main_chunks[1]);
 
@@ -995,29 +1033,50 @@ fn render_indexing_dashboard(
                 GpuStatus::Unavailable { reason } => format!("GPU Unavailable: {}", reason),
                 _ => "GPU: --".to_string(),
             };
-            frame.render_widget(Paragraph::new(gpu_note).style(Style::default().fg(Color::DarkGray)), sys_rows[2]);
+            frame.render_widget(
+                Paragraph::new(gpu_note).style(Style::default().fg(Color::DarkGray)),
+                sys_rows[2],
+            );
         }
 
         // Process stats
         let process_lines = vec![
             Line::from(vec![
                 Span::styled("rmcp-memex:  ", Style::default().bold()),
-                Span::styled(format!("{:.1}% CPU", snapshot.rmcp_memex_cpu), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{:.1}% CPU", snapshot.rmcp_memex_cpu),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw(" | "),
-                Span::styled(MonitorSnapshot::format_bytes(snapshot.rmcp_memex_rss), Style::default().fg(Color::Blue)),
+                Span::styled(
+                    MonitorSnapshot::format_bytes(snapshot.rmcp_memex_rss),
+                    Style::default().fg(Color::Blue),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("Embedder:    ", Style::default().bold()),
-                Span::styled(format!("{:.1}% CPU", snapshot.embedder_cpu_aggregate), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{:.1}% CPU", snapshot.embedder_cpu_aggregate),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw(" | "),
-                Span::styled(MonitorSnapshot::format_bytes(snapshot.embedder_rss_aggregate), Style::default().fg(Color::Blue)),
+                Span::styled(
+                    MonitorSnapshot::format_bytes(snapshot.embedder_rss_aggregate),
+                    Style::default().fg(Color::Blue),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("GPU VRAM:    ", Style::default().bold()),
                 Span::raw(format!(
                     "{} / {}",
-                    snapshot.gpu_memory_used.map(MonitorSnapshot::format_bytes).unwrap_or_else(|| "--".to_string()),
-                    snapshot.gpu_memory_total.map(MonitorSnapshot::format_bytes).unwrap_or_else(|| "--".to_string())
+                    snapshot
+                        .gpu_memory_used
+                        .map(MonitorSnapshot::format_bytes)
+                        .unwrap_or_else(|| "--".to_string()),
+                    snapshot
+                        .gpu_memory_total
+                        .map(MonitorSnapshot::format_bytes)
+                        .unwrap_or_else(|| "--".to_string())
                 )),
             ]),
         ];
@@ -1038,7 +1097,10 @@ fn render_indexing_dashboard(
             .rev()
             .map(|warning| {
                 Line::from(vec![
-                    Span::styled(format!("[{}] ", warning.code), Style::default().fg(Color::Red).bold()),
+                    Span::styled(
+                        format!("[{}] ", warning.code),
+                        Style::default().fg(Color::Red).bold(),
+                    ),
                     Span::styled(&warning.message, Style::default().fg(Color::Yellow)),
                 ])
             })
@@ -1059,7 +1121,12 @@ fn render_indexing_dashboard(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(" Recent Warnings ");
-    frame.render_widget(Paragraph::new(warning_lines).block(warnings_block).wrap(Wrap { trim: true }), chunks[2]);
+    frame.render_widget(
+        Paragraph::new(warning_lines)
+            .block(warnings_block)
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
 }
 
 fn current_file_label(snapshot: &IndexTelemetrySnapshot) -> String {

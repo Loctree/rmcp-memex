@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod common;
 pub mod embeddings;
 pub mod engine;
@@ -27,6 +28,9 @@ use anyhow::Result;
 use tracing::Level;
 
 // Re-export core types for library consumers
+pub use auth::{
+    AuthDenial, AuthManager, AuthResult, Scope, TokenEntry, TokenStoreFile, TokenStoreV2,
+};
 pub use embeddings::{
     DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
     MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
@@ -82,6 +86,7 @@ pub use search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
     StemLanguage,
 };
+#[allow(deprecated)]
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
 pub use storage::{
     ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,

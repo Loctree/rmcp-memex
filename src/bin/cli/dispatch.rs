@@ -19,6 +19,21 @@ use crate::cli::inspection::*;
 use crate::cli::maintenance::*;
 use crate::cli::search::*;
 
+/// Validate that an auth token contains only ASCII bytes (RFC 7230).
+/// Returns Ok(()) if valid, Err with descriptive message if non-ASCII byte found.
+fn validate_ascii_token(token: &str) -> Result<()> {
+    for (pos, byte) in token.bytes().enumerate() {
+        if !byte.is_ascii() {
+            return Err(anyhow::anyhow!(
+                "ERROR: --auth-token must be ASCII (RFC 7230). Got non-ASCII byte 0x{:02x} at position {}.",
+                byte,
+                pos
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_http_server_config(
     cli: &Cli,
     file_cfg: &FileConfig,
@@ -52,10 +67,22 @@ fn resolve_http_server_config(
         })
         .unwrap_or_default();
 
+    let auth_mode_str = file_cfg.auth_mode.as_deref().unwrap_or("mutating-only");
+    // CLI flag overrides file config
+    let auth_mode = rmcp_memex::http::AuthMode::parse(if cli.auth_mode != "mutating-only" {
+        &cli.auth_mode
+    } else {
+        auth_mode_str
+    });
+    let allow_query_token = cli.allow_query_token || file_cfg.allow_query_token.unwrap_or(false);
+
     rmcp_memex::http::HttpServerConfig {
         auth_token,
         cors_origins,
         bind_address,
+        auth_mode,
+        allow_query_token,
+        auth_manager: None, // initialized lazily in start_server if NamespaceAcl mode
     }
 }
 
@@ -97,9 +124,44 @@ fn open_browser(url: &str) -> Result<()> {
     ))
 }
 
+/// Validate startup preconditions for the HTTP server:
+/// - ASCII guard on auth token
+/// - Non-loopback bind without auth is a hard error (unless escape hatch)
+fn validate_http_preconditions(
+    http_config: &rmcp_memex::http::HttpServerConfig,
+    allow_network_without_auth: bool,
+) -> Result<()> {
+    // ASCII guard
+    if let Some(ref token) = http_config.auth_token {
+        validate_ascii_token(token)?;
+    }
+
+    // Bind guard: non-loopback without auth
+    if !http_config.bind_address.is_loopback() && http_config.auth_token.is_none() {
+        if allow_network_without_auth {
+            eprintln!(
+                "WARNING: HTTP server exposed on network without auth token. \
+                 This is allowed via --allow-network-without-auth but is NOT recommended."
+            );
+        } else {
+            return Err(anyhow::anyhow!(
+                "ERROR: Refusing to bind to {} without --auth-token. \
+                 Network-exposed server without authentication is a security risk.\n\
+                 Options:\n  \
+                 1. Add --auth-token <token> or set MEMEX_AUTH_TOKEN\n  \
+                 2. Add --allow-network-without-auth to override (not recommended)",
+                http_config.bind_address
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 async fn run_http_only_command(cli: Cli, port: u16, auto_open_browser: bool) -> Result<()> {
     let (file_cfg, _) = load_or_discover_config(cli.config.as_deref())?;
     let http_server_config = resolve_http_server_config(&cli, &file_cfg);
+    validate_http_preconditions(&http_server_config, cli.allow_network_without_auth)?;
     let dashboard_url = dashboard_browser_url(http_server_config.bind_address, port);
 
     let mut config = cli.into_server_config()?;
@@ -689,6 +751,7 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             let cfg = ResolvedConfig::load(cli.config.as_deref(), cli.db_path.as_deref())?;
             run_purge_quality(threshold, confirm, json, cfg.db_path).await
         }
+        Some(Commands::Auth { action }) => run_auth_command(action, cli.token_store_path).await,
         Some(Commands::Serve) | None => {
             let http_port = cli.http_port;
             let http_only = cli.http_only;
@@ -699,6 +762,10 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             }
             let (file_cfg_ref, _) = load_or_discover_config(cli.config.as_deref())?;
             let http_server_config = resolve_http_server_config(&cli, &file_cfg_ref);
+            // Validate HTTP preconditions (ASCII guard, bind guard) before starting
+            if http_port.is_some() || http_only {
+                validate_http_preconditions(&http_server_config, cli.allow_network_without_auth)?;
+            }
             let mut config = cli.into_server_config()?;
             if http_only {
                 config.hybrid.bm25.read_only = true;
@@ -733,5 +800,248 @@ pub async fn run_command(cli: Cli) -> Result<()> {
             }
             server.run_stdio().await
         }
+    }
+}
+
+async fn run_auth_command(action: AuthAction, token_store_path: Option<String>) -> Result<()> {
+    use rmcp_memex::auth::{Scope, TokenStoreFile};
+    use std::str::FromStr;
+
+    let store_path =
+        token_store_path.unwrap_or_else(|| "~/.rmcp-servers/rmcp-memex/tokens.json".to_string());
+    let store = TokenStoreFile::new(store_path.clone());
+    store.load().await?;
+
+    match action {
+        AuthAction::Create {
+            id,
+            description,
+            scopes,
+            namespaces,
+            expires_at,
+            json,
+        } => {
+            let token_id = id.unwrap_or_else(|| {
+                use uuid::Uuid;
+                Uuid::new_v4().to_string()[..8].to_string()
+            });
+
+            let parsed_scopes: Vec<Scope> = scopes
+                .split(',')
+                .map(|s| Scope::from_str(s.trim()))
+                .collect::<Result<Vec<_>>>()?;
+
+            let parsed_namespaces: Vec<String> = namespaces
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let parsed_expiry = if let Some(exp_str) = expires_at {
+                Some(
+                    chrono::DateTime::parse_from_rfc3339(&exp_str)
+                        .map_err(|e| anyhow::anyhow!("Invalid expiry format: {}. Use RFC 3339 (e.g., 2026-12-31T00:00:00Z)", e))?
+                        .with_timezone(&chrono::Utc),
+                )
+            } else {
+                None
+            };
+
+            let plaintext = store
+                .create_token(
+                    token_id.clone(),
+                    parsed_scopes.clone(),
+                    parsed_namespaces.clone(),
+                    parsed_expiry,
+                    description.clone(),
+                )
+                .await?;
+
+            if json {
+                let output = serde_json::json!({
+                    "id": token_id,
+                    "token": plaintext,
+                    "scopes": parsed_scopes,
+                    "namespaces": parsed_namespaces,
+                    "description": description,
+                    "store_path": store_path,
+                    "warning": "This token is shown ONCE. Store it securely."
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                eprintln!("Token created successfully.");
+                eprintln!();
+                eprintln!("  ID:          {}", token_id);
+                eprintln!("  Scopes:      {}", scopes);
+                eprintln!("  Namespaces:  {}", namespaces);
+                eprintln!("  Description: {}", description);
+                eprintln!("  Store:       {}", store_path);
+                eprintln!();
+                eprintln!("  TOKEN (shown ONCE, store securely):");
+                println!("{}", plaintext);
+                eprintln!();
+                eprintln!("  Use as: Authorization: Bearer {}", plaintext);
+            }
+
+            Ok(())
+        }
+        AuthAction::List { json } => {
+            let tokens = store.list_tokens().await;
+
+            if json {
+                let output: Vec<serde_json::Value> = tokens
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "id": t.id,
+                            "scopes": t.scopes,
+                            "namespaces": t.namespaces,
+                            "expires_at": t.expires_at,
+                            "description": t.description,
+                            "created_at": t.created_at,
+                            "expired": t.is_expired(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else if tokens.is_empty() {
+                eprintln!("No tokens configured.");
+                eprintln!("Create one with: rmcp-memex auth create --description \"My token\"");
+            } else {
+                eprintln!("{} token(s) in store:", tokens.len());
+                eprintln!();
+                for t in &tokens {
+                    let scopes_str: Vec<String> = t.scopes.iter().map(|s| s.to_string()).collect();
+                    let expired_marker = if t.is_expired() { " [EXPIRED]" } else { "" };
+                    eprintln!("  {} {}", t.id, expired_marker);
+                    eprintln!("    Description: {}", t.description);
+                    eprintln!("    Scopes:      [{}]", scopes_str.join(", "));
+                    eprintln!("    Namespaces:  [{}]", t.namespaces.join(", "));
+                    if let Some(exp) = t.expires_at {
+                        eprintln!("    Expires:     {}", exp.to_rfc3339());
+                    } else {
+                        eprintln!("    Expires:     never");
+                    }
+                    eprintln!("    Created:     {}", t.created_at.to_rfc3339());
+                    eprintln!();
+                }
+            }
+
+            Ok(())
+        }
+        AuthAction::Revoke { id } => {
+            let removed = store.revoke_token(&id).await?;
+            if removed {
+                eprintln!("Token '{}' revoked.", id);
+            } else {
+                eprintln!("Token '{}' not found.", id);
+            }
+            Ok(())
+        }
+        AuthAction::Rotate { id, json } => {
+            let new_plaintext = store.rotate_token(&id).await?;
+
+            if json {
+                let output = serde_json::json!({
+                    "id": id,
+                    "token": new_plaintext,
+                    "warning": "This token is shown ONCE. Store it securely."
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                eprintln!("Token '{}' rotated.", id);
+                eprintln!();
+                eprintln!("  NEW TOKEN (shown ONCE, store securely):");
+                println!("{}", new_plaintext);
+                eprintln!();
+                eprintln!("  Use as: Authorization: Bearer {}", new_plaintext);
+            }
+
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn ascii_guard_accepts_ascii_token() {
+        assert!(validate_ascii_token("my-secure-token-123").is_ok());
+        assert!(validate_ascii_token("abcABC012!@#$%").is_ok());
+        assert!(validate_ascii_token("").is_ok()); // empty is technically ASCII
+    }
+
+    #[test]
+    fn ascii_guard_rejects_non_ascii_token() {
+        let err = validate_ascii_token("token-with-\u{015b}-polish").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ASCII"),
+            "Error message should mention ASCII: {msg}"
+        );
+        assert!(
+            msg.contains("0xc5"),
+            "Error message should show the offending byte: {msg}"
+        );
+    }
+
+    #[test]
+    fn bind_guard_blocks_network_without_auth() {
+        let config = rmcp_memex::http::HttpServerConfig {
+            bind_address: Ipv4Addr::UNSPECIFIED.into(),
+            auth_token: None,
+            ..Default::default()
+        };
+        let result = validate_http_preconditions(&config, false);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Refusing to bind"),
+            "Should contain refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn bind_guard_allows_network_with_escape_hatch() {
+        let config = rmcp_memex::http::HttpServerConfig {
+            bind_address: Ipv4Addr::UNSPECIFIED.into(),
+            auth_token: None,
+            ..Default::default()
+        };
+        assert!(validate_http_preconditions(&config, true).is_ok());
+    }
+
+    #[test]
+    fn bind_guard_allows_network_with_auth() {
+        let config = rmcp_memex::http::HttpServerConfig {
+            bind_address: Ipv4Addr::UNSPECIFIED.into(),
+            auth_token: Some("my-token".to_string()),
+            ..Default::default()
+        };
+        assert!(validate_http_preconditions(&config, false).is_ok());
+    }
+
+    #[test]
+    fn bind_guard_allows_localhost_without_auth() {
+        let config = rmcp_memex::http::HttpServerConfig {
+            bind_address: Ipv4Addr::LOCALHOST.into(),
+            auth_token: None,
+            ..Default::default()
+        };
+        assert!(validate_http_preconditions(&config, false).is_ok());
+    }
+
+    #[test]
+    fn ascii_guard_rejects_non_ascii_in_preconditions() {
+        let config = rmcp_memex::http::HttpServerConfig {
+            auth_token: Some("token-\u{0107}".to_string()), // \u{0107} = 'c' with acute
+            ..Default::default()
+        };
+        let result = validate_http_preconditions(&config, false);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ASCII"));
     }
 }
