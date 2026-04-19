@@ -156,7 +156,7 @@ pub struct Cli {
 
     /// Auth enforcement mode for HTTP endpoints.
     /// - mutating-only (default): bearer required only on mutating + MCP routes
-    /// - all-routes: bearer required on ALL routes except /health
+    /// - all-routes: bearer required on ALL routes
     /// - namespace-acl: reserved for Track C (namespace-level ACL)
     #[arg(long, global = true, default_value = "mutating-only",
            value_parser = ["mutating-only", "all-routes", "namespace-acl"])]

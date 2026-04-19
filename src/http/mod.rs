@@ -40,7 +40,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         Html, IntoResponse,
@@ -1202,6 +1202,26 @@ fn token_matches(provided: &str, expected: &str) -> bool {
     provided_bytes.ct_eq(expected_bytes).into()
 }
 
+fn unauthorized_response(request: &Request) -> axum::response::Response {
+    let authenticate = [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))];
+
+    if request.method() == Method::GET && request.uri().path() == "/" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            authenticate,
+            Html(DASHBOARD_LOGIN_HTML.to_string()),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        authenticate,
+        Json(json!({"error": "missing or invalid auth token"})),
+    )
+        .into_response()
+}
+
 /// Bearer token auth middleware for mutating endpoints.
 /// If the server has an auth_token configured, requires `Authorization: Bearer <token>`.
 /// Uses constant-time comparison to prevent timing side-channel attacks.
@@ -1224,10 +1244,7 @@ async fn auth_middleware(
         let bearer = match bearer {
             Some(t) => t,
             None => {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": "Authorization header missing or malformed"})),
-                ));
+                return Err(unauthorized_response(&request));
             }
         };
 
@@ -1247,16 +1264,14 @@ async fn auth_middleware(
         {
             Ok(_) => {}
             Err(crate::auth::AuthDenial::MissingToken | crate::auth::AuthDenial::InvalidToken) => {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": "missing or invalid auth token"})),
-                ));
+                return Err(unauthorized_response(&request));
             }
             Err(crate::auth::AuthDenial::Expired { id }) => {
                 return Err((
                     StatusCode::UNAUTHORIZED,
                     Json(json!({"error": format!("Token '{}' has expired", id)})),
-                ));
+                )
+                    .into_response());
             }
             Err(
                 denial @ (crate::auth::AuthDenial::InsufficientScope { .. }
@@ -1265,7 +1280,8 @@ async fn auth_middleware(
                 return Err((
                     StatusCode::FORBIDDEN,
                     Json(json!({"error": denial.to_string()})),
-                ));
+                )
+                    .into_response());
             }
         }
 
@@ -1279,10 +1295,7 @@ async fn auth_middleware(
         match extract_bearer_token(&request, allow_query) {
             Some(token) if token_matches(&token, expected) => {}
             _ => {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": "missing or invalid auth token"})),
-                ));
+                return Err(unauthorized_response(&request));
             }
         }
     }
@@ -1313,7 +1326,7 @@ fn extract_namespace_from_path(path: &str) -> Option<String> {
 pub enum AuthMode {
     /// Bearer required only on mutating + MCP routes (default, backwards compat)
     MutatingOnly,
-    /// Bearer required on ALL routes except /health
+    /// Bearer required on ALL routes
     AllRoutes,
     /// Reserved for Track C namespace-level ACL
     NamespaceAcl,
@@ -1332,7 +1345,7 @@ impl AuthMode {
 /// HTTP server configuration passed to `create_router` and `start_server`
 #[derive(Clone)]
 pub struct HttpServerConfig {
-    /// Bearer token for auth on mutating endpoints. None = no auth.
+    /// Bearer token for auth on HTTP endpoints. None = no auth.
     pub auth_token: Option<String>,
     /// Allowed CORS origins. Empty = same-origin only (unless localhost).
     pub cors_origins: Vec<String>,
@@ -1361,6 +1374,12 @@ impl Default for HttpServerConfig {
 
 /// Create the HTTP router
 pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
+    let mut state = state;
+    state.auth_token = config.auth_token.clone();
+    state.auth_mode = config.auth_mode.clone();
+    state.allow_query_token = config.allow_query_token;
+    state.auth_manager = config.auth_manager.clone();
+
     let is_localhost = config.bind_address.is_loopback();
 
     // CORS policy: permissive on localhost, restrictive otherwise
@@ -1402,14 +1421,11 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
 
     let all_routes_auth = config.auth_mode == AuthMode::AllRoutes;
 
-    // /health and / (dashboard) are ALWAYS public regardless of auth mode.
-    // The dashboard checks auth internally and shows a login form when needed.
-    let always_public = Router::new()
-        .route("/health", get(health_handler))
-        .route("/", get(dashboard_handler));
-
-    // Read-only routes: public in mutating-only mode, authed in all-routes mode
+    // Read-only routes: public in mutating-only mode, authed in all-routes mode.
+    // The dashboard route returns an auth bootstrap page when bearer is missing.
     let read_routes = Router::new()
+        .route("/", get(dashboard_handler))
+        .route("/health", get(health_handler))
         .route("/api/discovery", get(discovery_handler))
         .route("/api/namespaces", get(namespaces_handler))
         .route("/api/overview", get(overview_handler))
@@ -1460,8 +1476,7 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
             auth_middleware,
         ));
 
-    always_public
-        .merge(read_routes)
+    read_routes
         .merge(authed_routes)
         .merge(mcp_routes)
         .layer(cors)
@@ -2651,7 +2666,7 @@ pub async fn start_server(
     if server_config.auth_token.is_some() {
         let mode_label = match server_config.auth_mode {
             AuthMode::MutatingOnly => "mutating endpoints only",
-            AuthMode::AllRoutes => "ALL routes (except /health)",
+            AuthMode::AllRoutes => "ALL routes",
             AuthMode::NamespaceAcl => "namespace ACL (Track C)",
         };
         info!("HTTP auth: Bearer token required for {}", mode_label);
@@ -2800,8 +2815,10 @@ mod tests {
         security::{NamespaceAccessManager, NamespaceSecurityConfig},
         storage::StorageManager,
     };
+    use axum::body::{Body, to_bytes};
     use std::sync::Arc;
     use tokio::sync::Mutex;
+    use tower::util::ServiceExt;
 
     async fn build_test_http_state(db_path: &str) -> HttpState {
         let embedding_client = Arc::new(Mutex::new(EmbeddingClient::stub_for_tests()));
@@ -3054,5 +3071,108 @@ mod tests {
             let db_path = tmp.path().join(".lancedb");
             build_test_http_state(db_path.to_str().unwrap()).await
         })
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_auth_requires_health_and_mcp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::UNAUTHORIZED);
+
+        let discovery = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/discovery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::UNAUTHORIZED);
+
+        let mcp = app
+            .clone()
+            .oneshot(Request::builder().uri("/mcp/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_root_returns_login_page_with_401() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_text.contains("memex_token"));
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_accepts_query_token_for_get_routes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                allow_query_token: true,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/discovery?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
