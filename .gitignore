@@ -29,3 +29,9 @@ AGENTS.md
 /*.py
 /tmp
 /.vibecrafted
+
+# Environment Variables
+.env
+.env.*
+!.env.example
+*.out

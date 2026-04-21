@@ -3,7 +3,7 @@ name = "rmcp-memex"
 version = "0.5.1"
 edition = "2024"
 build = "src/build.rs"
-description = "RAG/memory MCP server with LanceDB vector storage"
+description = "High-performance semantic indexing with MCP server and blazing-fast LanceDB vector storage."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/VetCoders/rmcp-memex"
 homepage = "https://github.com/VetCoders/rmcp-memex"
@@ -70,6 +70,12 @@ regex = "1.11"
 # Cryptographic hashing for deduplication
 sha2 = "0.10"
 
+# Constant-time comparison for auth tokens (prevents timing attacks)
+subtle = "2.5"
+
+# Argon2id password hashing for token-at-rest security
+argon2 = "0.5"
+
 # Utils
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -93,6 +99,7 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3.14"
+tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
 # Keep local directory namespaces without pulling unused cloud backends into the graph.

@@ -123,14 +123,16 @@ pub fn start_indexing(
                     Ok(IndexResult::Indexed {
                         chunks_indexed,
                         content_hash,
+                        embedder_ms,
+                        tokens_estimated,
                     }) => FileOutcome::Indexed {
                         file_index,
                         path,
                         chunks_indexed,
                         content_hash,
                         duration_ms: started_at.elapsed().as_millis() as u64,
-                        embedder_ms: None,
-                        tokens_estimated: None,
+                        embedder_ms,
+                        tokens_estimated,
                     },
                     Ok(IndexResult::Skipped {
                         reason,
@@ -200,6 +202,8 @@ async fn run_scheduler_with_processor(
     });
     emit_stats_tick(&state, &sink);
 
+    let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_millis(500));
+
     loop {
         drain_control_queue(&mut state, &sink, &mut control_rx);
 
@@ -209,6 +213,9 @@ async fn run_scheduler_with_processor(
             }
 
             tokio::select! {
+                _ = stats_interval.tick() => {
+                    emit_stats_tick(&state, &sink);
+                }
                 Some(control) = control_rx.recv() => {
                     handle_control(&mut state, &sink, control);
                 }
@@ -225,6 +232,9 @@ async fn run_scheduler_with_processor(
             tokio::pin!(resume_wait);
 
             tokio::select! {
+                _ = stats_interval.tick() => {
+                    emit_stats_tick(&state, &sink);
+                }
                 Some(control) = control_rx.recv() => {
                     handle_control(&mut state, &sink, control);
                 }
@@ -243,6 +253,9 @@ async fn run_scheduler_with_processor(
         }
 
         tokio::select! {
+            _ = stats_interval.tick() => {
+                emit_stats_tick(&state, &sink);
+            }
             Some(control) = control_rx.recv() => {
                 handle_control(&mut state, &sink, control);
             }

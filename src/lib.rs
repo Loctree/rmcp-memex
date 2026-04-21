@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod common;
 pub mod embeddings;
 pub mod engine;
@@ -27,11 +28,14 @@ use anyhow::Result;
 use tracing::Level;
 
 // Re-export core types for library consumers
+pub use auth::{
+    AuthDenial, AuthManager, AuthResult, Scope, TokenEntry, TokenStoreFile, TokenStoreV2,
+};
 pub use embeddings::{
     DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
     MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
-    cross_dimension_search_adapt, estimate_tokens, infer_embedding_dimension, safe_chunk_size,
-    truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
+    cross_dimension_search_adapt, estimate_tokens, safe_chunk_size, truncate_to_token_limit,
+    validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
 pub use mcp_core::{
@@ -50,6 +54,9 @@ pub use query::{
 pub use rag::{
     Chunk as PipelineChunk,
     ContextPrefixConfig,
+    CrossStoreRecoveryBatchReport,
+    CrossStoreRecoveryReport,
+    CrossStoreRecoveryState,
     EmbeddedChunk,
     EnrichedChunk,
     FileContent,
@@ -58,6 +65,7 @@ pub use rag::{
     OnionSliceConfig,
     PipelineConfig,
     PipelineEvent,
+    PipelineGovernorConfig,
     PipelineResult,
     PipelineSnapshot,
     PipelineStats,
@@ -69,6 +77,8 @@ pub use rag::{
     compute_content_hash,
     create_enriched_chunks,
     create_onion_slices,
+    inspect_cross_store_recovery,
+    repair_cross_store_recovery,
     // Async pipeline exports
     run_pipeline,
 };
@@ -76,9 +86,11 @@ pub use search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
     StemLanguage,
 };
+#[allow(deprecated)]
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
 pub use storage::{
-    ChromaDocument, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
+    ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,
+    CrossStoreRecoveryStatus, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
 };
 
 // High-level engine API

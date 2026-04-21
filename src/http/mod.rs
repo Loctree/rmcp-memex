@@ -40,7 +40,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         Html, IntoResponse,
@@ -50,6 +50,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
@@ -899,6 +900,12 @@ pub struct HttpState {
     pub namespace_activity: Arc<RwLock<HashMap<String, String>>>,
     /// Optional Bearer token for authenticating mutating requests
     pub auth_token: Option<String>,
+    /// Auth enforcement mode
+    pub auth_mode: AuthMode,
+    /// Allow ?token= query parameter on read GETs
+    pub allow_query_token: bool,
+    /// Multi-token auth manager (Track C). Used when auth_mode == NamespaceAcl.
+    pub auth_manager: Option<Arc<crate::auth::AuthManager>>,
 }
 
 /// Search request body
@@ -1164,50 +1171,192 @@ pub struct HealthResponse {
     pub embedding_provider: String,
 }
 
+/// Extract bearer token from Authorization header or ?token= query param.
+fn extract_bearer_token(request: &Request, allow_query_token: bool) -> Option<String> {
+    // 1. Check Authorization header first
+    if let Some(header) = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some(token) = header.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
+    }
+
+    // 2. Check ?token= query param if allowed
+    if allow_query_token && let Some(query) = request.uri().query() {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("token=") {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Constant-time token comparison to prevent timing attacks.
+fn token_matches(provided: &str, expected: &str) -> bool {
+    let provided_bytes = provided.as_bytes();
+    let expected_bytes = expected.as_bytes();
+    provided_bytes.ct_eq(expected_bytes).into()
+}
+
+fn unauthorized_response(request: &Request) -> axum::response::Response {
+    let authenticate = [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))];
+
+    if request.method() == Method::GET && request.uri().path() == "/" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            authenticate,
+            Html(DASHBOARD_LOGIN_HTML.to_string()),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        authenticate,
+        Json(json!({"error": "missing or invalid auth token"})),
+    )
+        .into_response()
+}
+
 /// Bearer token auth middleware for mutating endpoints.
 /// If the server has an auth_token configured, requires `Authorization: Bearer <token>`.
+/// Uses constant-time comparison to prevent timing side-channel attacks.
 /// Returns 401 if the token is missing or doesn't match.
+///
+/// In NamespaceAcl mode (Track C), delegates to AuthManager for multi-token
+/// lookup with scope enforcement. The scope is inferred from the HTTP method:
+/// GET/HEAD = Read, POST/PUT/DELETE = Write.
 async fn auth_middleware(
     State(state): State<HttpState>,
     request: Request,
     next: Next,
 ) -> impl IntoResponse {
-    if let Some(ref expected) = state.auth_token {
-        let auth_header = request
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-
-        match auth_header {
-            Some(header) if header.starts_with("Bearer ") => {
-                let token = &header[7..];
-                if token != expected.as_str() {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({"error": "missing or invalid auth token"})),
-                    ));
-                }
+    // Track C: NamespaceAcl mode uses the AuthManager for multi-token auth
+    if state.auth_mode == AuthMode::NamespaceAcl
+        && let Some(ref manager) = state.auth_manager
+    {
+        let allow_query = state.allow_query_token;
+        let bearer = extract_bearer_token(&request, allow_query);
+        let bearer = match bearer {
+            Some(t) => t,
+            None => {
+                return Err(unauthorized_response(&request));
             }
-            _ => {
+        };
+
+        // Determine required scope from method
+        let required_scope = match *request.method() {
+            Method::GET | Method::HEAD => crate::auth::Scope::Read,
+            _ => crate::auth::Scope::Write,
+        };
+
+        // Extract namespace from path if present (e.g., /api/browse/{ns}, /ns/{namespace})
+        let path = request.uri().path().to_string();
+        let namespace = extract_namespace_from_path(&path);
+
+        match manager
+            .authorize(&bearer, &required_scope, namespace.as_deref())
+            .await
+        {
+            Ok(_) => {}
+            Err(crate::auth::AuthDenial::MissingToken | crate::auth::AuthDenial::InvalidToken) => {
+                return Err(unauthorized_response(&request));
+            }
+            Err(crate::auth::AuthDenial::Expired { id }) => {
                 return Err((
                     StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": "missing or invalid auth token"})),
-                ));
+                    Json(json!({"error": format!("Token '{}' has expired", id)})),
+                )
+                    .into_response());
+            }
+            Err(
+                denial @ (crate::auth::AuthDenial::InsufficientScope { .. }
+                | crate::auth::AuthDenial::NamespaceDenied { .. }),
+            ) => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": denial.to_string()})),
+                )
+                    .into_response());
+            }
+        }
+
+        return Ok(next.run(request).await);
+    }
+    // Fallback: NamespaceAcl mode without AuthManager configured = same as legacy
+
+    // Legacy single-token path
+    if let Some(ref expected) = state.auth_token {
+        let allow_query = state.allow_query_token;
+        match extract_bearer_token(&request, allow_query) {
+            Some(token) if token_matches(&token, expected) => {}
+            _ => {
+                return Err(unauthorized_response(&request));
             }
         }
     }
     Ok(next.run(request).await)
 }
 
+/// Extract namespace from URL path segments for ACL checks.
+/// Recognizes patterns like:
+///   /api/browse/{ns}  /ns/{namespace}  /expand/{ns}/{id}  /get/{ns}/{id}
+///   /delete/{ns}/{id}  /parent/{ns}/{id}
+fn extract_namespace_from_path(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segments.as_slice() {
+        // /api/browse/{ns}
+        ["api", "browse", ns] => Some(ns.to_string()),
+        // /ns/{namespace}
+        ["ns", ns] => Some(ns.to_string()),
+        // /expand/{ns}/{id}, /parent/{ns}/{id}, /get/{ns}/{id}, /delete/{ns}/{id}
+        [verb, ns, _id] if matches!(*verb, "expand" | "parent" | "get" | "delete") => {
+            Some(ns.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Auth enforcement mode for HTTP endpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Bearer required only on mutating + MCP routes (default, backwards compat)
+    MutatingOnly,
+    /// Bearer required on ALL routes
+    AllRoutes,
+    /// Reserved for Track C namespace-level ACL
+    NamespaceAcl,
+}
+
+impl AuthMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "all-routes" => Self::AllRoutes,
+            "namespace-acl" => Self::NamespaceAcl,
+            _ => Self::MutatingOnly,
+        }
+    }
+}
+
 /// HTTP server configuration passed to `create_router` and `start_server`
 #[derive(Clone)]
 pub struct HttpServerConfig {
-    /// Bearer token for auth on mutating endpoints. None = no auth.
+    /// Bearer token for auth on HTTP endpoints. None = no auth.
     pub auth_token: Option<String>,
     /// Allowed CORS origins. Empty = same-origin only (unless localhost).
     pub cors_origins: Vec<String>,
     /// Bind address. Defaults to 127.0.0.1.
     pub bind_address: IpAddr,
+    /// Auth enforcement mode
+    pub auth_mode: AuthMode,
+    /// Allow ?token= query param on read GETs (only in all-routes mode)
+    pub allow_query_token: bool,
+    /// Multi-token auth manager (Track C). Used when auth_mode == NamespaceAcl.
+    pub auth_manager: Option<Arc<crate::auth::AuthManager>>,
 }
 
 impl Default for HttpServerConfig {
@@ -1216,12 +1365,21 @@ impl Default for HttpServerConfig {
             auth_token: None,
             cors_origins: Vec::new(),
             bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            auth_mode: AuthMode::MutatingOnly,
+            allow_query_token: false,
+            auth_manager: None,
         }
     }
 }
 
 /// Create the HTTP router
 pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
+    let mut state = state;
+    state.auth_token = config.auth_token.clone();
+    state.auth_mode = config.auth_mode.clone();
+    state.allow_query_token = config.allow_query_token;
+    state.auth_manager = config.auth_manager.clone();
+
     let is_localhost = config.bind_address.is_loopback();
 
     // CORS policy: permissive on localhost, restrictive otherwise
@@ -1239,6 +1397,12 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::AUTHORIZATION,
             ])
+    } else if config.cors_origins.iter().any(|o| o == "*") {
+        // Explicit wildcard: use tower_http::cors::Any instead of literal "*" string
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
     } else {
         // Explicit origins configured
         let origins: Vec<HeaderValue> = config
@@ -1255,9 +1419,13 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
             ])
     };
 
-    // Read-only routes (no auth required)
-    let public_routes = Router::new()
+    let all_routes_auth = config.auth_mode == AuthMode::AllRoutes;
+
+    // Read-only routes: public in mutating-only mode, authed in all-routes mode.
+    // The dashboard route returns an auth bootstrap page when bearer is missing.
+    let read_routes = Router::new()
         .route("/", get(dashboard_handler))
+        .route("/health", get(health_handler))
         .route("/api/discovery", get(discovery_handler))
         .route("/api/namespaces", get(namespaces_handler))
         .route("/api/overview", get(overview_handler))
@@ -1265,7 +1433,6 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .route("/api/browse", get(browse_all_handler))
         .route("/api/browse/", get(browse_all_handler))
         .route("/api/browse/{ns}", get(browse_handler))
-        .route("/health", get(health_handler))
         .route("/search", post(search_handler))
         .route("/sse/search", get(sse_search_handler))
         .route("/cross-search", get(cross_search_handler))
@@ -1274,6 +1441,16 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .route("/expand/{ns}/{id}", get(expand_handler))
         .route("/parent/{ns}/{id}", get(parent_handler))
         .route("/get/{ns}/{id}", get(get_handler));
+
+    // Conditionally wrap read routes with auth middleware in all-routes mode
+    let read_routes = if all_routes_auth {
+        read_routes.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+    } else {
+        read_routes
+    };
 
     // Mutating routes (auth required when token is configured)
     let authed_routes = Router::new()
@@ -1299,7 +1476,7 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
             auth_middleware,
         ));
 
-    public_routes
+    read_routes
         .merge(authed_routes)
         .merge(mcp_routes)
         .layer(cors)
@@ -1327,9 +1504,10 @@ struct DiscoverySnapshot {
 }
 
 async fn build_discovery_snapshot(state: &HttpState) -> DiscoverySnapshot {
+    let refresh_error = refresh_namespace_cache(state).await.err();
     let cache = state.cached_namespaces.read().await;
     let activity = state.namespace_activity.read().await;
-    let cache_ready = cache.is_some();
+    let cache_ready = refresh_error.is_none();
 
     let namespaces: Vec<DiscoveryNamespaceInfo> = cache
         .as_ref()
@@ -1350,7 +1528,9 @@ async fn build_discovery_snapshot(state: &HttpState) -> DiscoverySnapshot {
 
     DiscoverySnapshot {
         cache_ready,
-        hint: discovery_hint(cache_ready).to_string(),
+        hint: refresh_error
+            .map(|error| format!("{}: {}", discovery_hint(false), error))
+            .unwrap_or_else(|| discovery_hint(true).to_string()),
         namespaces,
     }
 }
@@ -1370,8 +1550,10 @@ async fn build_discovery_response(state: &HttpState) -> DiscoveryResponse {
     DiscoveryResponse {
         status: if snapshot.cache_ready {
             "ok"
+        } else if snapshot.namespaces.is_empty() {
+            "error"
         } else {
-            "loading"
+            "stale"
         }
         .to_string(),
         hint: snapshot.hint,
@@ -1384,19 +1566,14 @@ async fn build_discovery_response(state: &HttpState) -> DiscoveryResponse {
     }
 }
 
-async fn refresh_namespace_cache(state: &HttpState) {
-    match state.rag.storage_manager().list_namespaces().await {
-        Ok(ns_list) => {
-            let namespaces: Vec<NamespaceInfo> = ns_list
-                .into_iter()
-                .map(|(name, count)| NamespaceInfo { name, count })
-                .collect();
-            *state.cached_namespaces.write().await = Some(namespaces);
-        }
-        Err(error) => {
-            warn!("Namespace cache refresh failed: {}", error);
-        }
-    }
+async fn refresh_namespace_cache(state: &HttpState) -> anyhow::Result<()> {
+    let ns_list = state.rag.storage_manager().list_namespaces().await?;
+    let namespaces: Vec<NamespaceInfo> = ns_list
+        .into_iter()
+        .map(|(name, count)| NamespaceInfo { name, count })
+        .collect();
+    *state.cached_namespaces.write().await = Some(namespaces);
+    Ok(())
 }
 
 async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
@@ -1405,24 +1582,13 @@ async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
         .write()
         .await
         .insert(namespace.to_string(), chrono::Utc::now().to_rfc3339());
-    refresh_namespace_cache(state).await;
-}
-
-fn namespaces_response_from_snapshot(snapshot: &DiscoverySnapshot) -> NamespacesResponse {
-    NamespacesResponse {
-        total: snapshot.namespaces.len(),
-        namespaces: snapshot
-            .namespaces
-            .iter()
-            .map(|ns| NamespaceInfo {
-                name: ns.id.clone(),
-                count: ns.count,
-            })
-            .collect(),
+    if let Err(error) = refresh_namespace_cache(state).await {
+        warn!(
+            "Namespace cache refresh failed after activity update: {}",
+            error
+        );
     }
 }
-
-#[cfg(test)]
 fn namespaces_response_from_discovery(discovery: &DiscoveryResponse) -> NamespacesResponse {
     NamespacesResponse {
         total: discovery.namespaces.len(),
@@ -1446,15 +1612,6 @@ fn overview_response_from_discovery(discovery: &DiscoveryResponse) -> OverviewRe
     }
 }
 
-fn status_response_from_snapshot(snapshot: &DiscoverySnapshot) -> serde_json::Value {
-    json!({
-        "cache_ready": snapshot.cache_ready,
-        "namespace_count": snapshot.namespaces.len(),
-        "hint": snapshot.hint,
-    })
-}
-
-#[cfg(test)]
 fn status_response_from_discovery(discovery: &DiscoveryResponse) -> serde_json::Value {
     json!({
         "cache_ready": discovery.status == "ok",
@@ -1464,15 +1621,79 @@ fn status_response_from_discovery(discovery: &DiscoveryResponse) -> serde_json::
 }
 
 /// Dashboard HTML endpoint (GET /)
-async fn dashboard_handler() -> Html<String> {
+/// Minimal HTML login form for dashboard auth in all-routes mode.
+/// Token is stored in localStorage and used as Bearer header for all API calls.
+const DASHBOARD_LOGIN_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rmcp-memex - Login Required</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 400px; width: 100%; }
+h2 { margin: 0 0 16px; color: #58a6ff; }
+p { color: #8b949e; margin: 0 0 24px; font-size: 14px; }
+input { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 14px; box-sizing: border-box; margin-bottom: 16px; }
+button { width: 100%; padding: 10px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 14px; cursor: pointer; }
+button:hover { background: #2ea043; }
+.error { color: #f85149; font-size: 13px; display: none; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div class="card">
+<h2>rmcp-memex Dashboard</h2>
+<p>This server requires authentication. Enter your bearer token to continue.</p>
+<div class="error" id="err">Invalid token. Please try again.</div>
+<form id="f" onsubmit="return login()">
+<input type="password" id="tok" placeholder="Bearer token" autocomplete="off" autofocus>
+<button type="submit">Authenticate</button>
+</form>
+</div>
+<script>
+(function() {
+  var t = localStorage.getItem('memex_token');
+  if (t) { window.location.href = '/?_authed=1'; }
+})();
+function login() {
+  var tok = document.getElementById('tok').value.trim();
+  if (!tok) return false;
+  fetch('/api/discovery', { headers: { 'Authorization': 'Bearer ' + tok } })
+    .then(function(r) {
+      if (r.ok) { localStorage.setItem('memex_token', tok); window.location.reload(); }
+      else { document.getElementById('err').style.display = 'block'; }
+    });
+  return false;
+}
+</script>
+</body>
+</html>"##;
+
+async fn dashboard_handler(State(state): State<HttpState>, request: Request) -> impl IntoResponse {
     debug!("Dashboard: serving HTML");
+
+    // In all-routes mode, check if the user has a valid bearer token
+    if state.auth_mode == AuthMode::AllRoutes
+        && let Some(ref expected) = state.auth_token
+    {
+        let allow_query = state.allow_query_token;
+        let has_valid_token = match extract_bearer_token(&request, allow_query) {
+            Some(token) => token_matches(&token, expected),
+            None => false,
+        };
+
+        if !has_valid_token {
+            return Html(DASHBOARD_LOGIN_HTML.to_string());
+        }
+    }
+
     Html(get_dashboard_html())
 }
 
 /// List all namespaces with document counts (GET /api/namespaces)
 async fn namespaces_handler(State(state): State<HttpState>) -> Json<NamespacesResponse> {
-    Json(namespaces_response_from_snapshot(
-        &build_discovery_snapshot(&state).await,
+    Json(namespaces_response_from_discovery(
+        &build_discovery_response(&state).await,
     ))
 }
 
@@ -1485,8 +1706,8 @@ async fn overview_handler(State(state): State<HttpState>) -> Json<OverviewRespon
 
 /// System status including cache state (GET /api/status)
 async fn status_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
-    Json(status_response_from_snapshot(
-        &build_discovery_snapshot(&state).await,
+    Json(status_response_from_discovery(
+        &build_discovery_response(&state).await,
     ))
 }
 
@@ -1565,13 +1786,12 @@ async fn browse_all_handler(
 async fn refresh_handler(
     State(state): State<HttpState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state.rag.refresh().await.map_err(|e| {
+    refresh_namespace_cache(&state).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Refresh failed: {}", e),
         )
     })?;
-    refresh_namespace_cache(&state).await;
 
     Ok(Json(serde_json::json!({
         "status": "refreshed",
@@ -2252,8 +2472,10 @@ async fn delete_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.rag.remove_memory(&ns, &id).await {
         Ok(deleted) => {
-            if deleted > 0 {
-                refresh_namespace_cache(&state).await;
+            if deleted > 0
+                && let Err(error) = refresh_namespace_cache(&state).await
+            {
+                warn!("Namespace cache refresh failed after delete: {}", error);
             }
             Ok(Json(serde_json::json!({
                 "status": if deleted > 0 { "deleted" } else { "not_found" },
@@ -2276,7 +2498,9 @@ async fn purge_namespace_handler(
     match state.rag.clear_namespace(&namespace).await {
         Ok(deleted) => {
             state.namespace_activity.write().await.remove(&namespace);
-            refresh_namespace_cache(&state).await;
+            if let Err(error) = refresh_namespace_cache(&state).await {
+                warn!("Namespace cache refresh failed after purge: {}", error);
+            }
             Ok(Json(serde_json::json!({
                 "status": "purged",
                 "namespace": namespace,
@@ -2440,18 +2664,40 @@ pub async fn start_server(
 
     // Log auth status
     if server_config.auth_token.is_some() {
-        info!("HTTP auth: Bearer token required for mutating endpoints");
+        let mode_label = match server_config.auth_mode {
+            AuthMode::MutatingOnly => "mutating endpoints only",
+            AuthMode::AllRoutes => "ALL routes",
+            AuthMode::NamespaceAcl => "namespace ACL (Track C)",
+        };
+        info!("HTTP auth: Bearer token required for {}", mode_label);
+        if server_config.allow_query_token {
+            info!("HTTP auth: ?token= query parameter enabled for read GETs");
+        }
     } else {
         warn!(
             "WARNING: HTTP server running without auth token. Set MEMEX_AUTH_TOKEN or use --auth-token."
         );
     }
 
-    // Warn if exposed on network without auth
-    if !server_config.bind_address.is_loopback() && server_config.auth_token.is_none() {
-        warn!(
-            "WARNING: HTTP server exposed on network without auth token. Set MEMEX_AUTH_TOKEN or use --auth-token."
-        );
+    // Log namespace security status when --security-enabled is active
+    #[allow(deprecated)]
+    // NamespaceAccessManager deprecated by Track C; still needed for diagnostics
+    if let Some(access_mgr) = mcp_core.access_manager() {
+        let protected = access_mgr.list_protected_namespaces().await;
+        if protected.is_empty() {
+            warn!(
+                "Namespace security enabled but NO namespaces have tokens. All namespaces are unprotected."
+            );
+        } else {
+            info!(
+                "Namespace security: {} namespace(s) with tokens:",
+                protected.len()
+            );
+            for (ns_name, _created, desc) in &protected {
+                let label = desc.as_deref().unwrap_or("(no description)");
+                info!("  - '{}' {}", ns_name, label);
+            }
+        }
     }
 
     let state = HttpState {
@@ -2462,6 +2708,9 @@ pub async fn start_server(
         cached_namespaces: cached_namespaces.clone(),
         namespace_activity: Arc::new(RwLock::new(HashMap::new())),
         auth_token: server_config.auth_token.clone(),
+        auth_mode: server_config.auth_mode.clone(),
+        allow_query_token: server_config.allow_query_token,
+        auth_manager: server_config.auth_manager.clone(),
     };
 
     // Spawn background task to refresh namespace cache every 5 minutes
@@ -2558,8 +2807,64 @@ pub async fn start_server(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::{
+        embeddings::EmbeddingClient,
+        security::{NamespaceAccessManager, NamespaceSecurityConfig},
+        storage::StorageManager,
+    };
+    use axum::body::{Body, to_bytes};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tower::util::ServiceExt;
+
+    async fn build_test_http_state(db_path: &str) -> HttpState {
+        let embedding_client = Arc::new(Mutex::new(EmbeddingClient::stub_for_tests()));
+        let storage = Arc::new(StorageManager::new(db_path).await.expect("storage"));
+        let rag = Arc::new(
+            RAGPipeline::new(embedding_client.clone(), storage)
+                .await
+                .expect("rag"),
+        );
+        let access_manager = Arc::new(NamespaceAccessManager::new(
+            NamespaceSecurityConfig::default(),
+        ));
+
+        HttpState {
+            rag: rag.clone(),
+            mcp_core: Arc::new(McpCore::new(
+                rag,
+                None,
+                embedding_client,
+                1024 * 1024,
+                vec![],
+                access_manager,
+            )),
+            mcp_sessions: Arc::new(McpSessionManager::new()),
+            mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
+            cached_namespaces: Arc::new(RwLock::new(None)),
+            namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            auth_token: None,
+            auth_mode: AuthMode::MutatingOnly,
+            allow_query_token: false,
+            auth_manager: None,
+        }
+    }
+
+    async fn write_namespace_doc(storage: &StorageManager, namespace: &str, id: &str) {
+        storage
+            .add_to_store(vec![ChromaDocument::new_flat(
+                id.to_string(),
+                namespace.to_string(),
+                vec![0.5, 0.25],
+                json!({"source": "external-test"}),
+                format!("document for {namespace}"),
+            )])
+            .await
+            .expect("external write");
+    }
 
     #[test]
     fn test_search_request_defaults() {
@@ -2671,6 +2976,30 @@ mod tests {
         assert_eq!(status["hint"], "OK");
     }
 
+    #[tokio::test]
+    async fn test_discovery_refreshes_namespace_inventory_after_external_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+        let external_storage = StorageManager::new(&db_path_str)
+            .await
+            .expect("external storage");
+
+        write_namespace_doc(&external_storage, "alpha", "alpha-1").await;
+        let first = build_discovery_response(&state).await;
+        assert_eq!(first.status, "ok");
+        assert_eq!(first.namespace_count, 1);
+        assert_eq!(first.namespaces[0].id, "alpha");
+
+        write_namespace_doc(&external_storage, "beta", "beta-1").await;
+        let second = build_discovery_response(&state).await;
+        let namespace_ids: Vec<_> = second.namespaces.iter().map(|ns| ns.id.as_str()).collect();
+
+        assert_eq!(second.status, "ok");
+        assert_eq!(second.namespace_count, 2);
+        assert_eq!(namespace_ids, vec!["alpha", "beta"]);
+    }
     #[test]
     fn test_chroma_document_maps_to_browse_json() {
         let doc = ChromaDocument {
@@ -2694,5 +3023,156 @@ mod tests {
         assert_eq!(json_doc.layer.as_deref(), Some(SliceLayer::Outer.name()));
         assert!(json_doc.can_expand);
         assert!(json_doc.can_drill_up);
+    }
+
+    // ====================================================================
+    // Auth validation tests (Track A + Track B)
+    // ====================================================================
+
+    #[test]
+    fn test_constant_time_token_comparison() {
+        assert!(token_matches("secret123", "secret123"));
+        assert!(!token_matches("secret123", "secret124"));
+        assert!(!token_matches("short", "longer_token"));
+        assert!(!token_matches("", "notempty"));
+        assert!(token_matches("", ""));
+    }
+
+    #[test]
+    fn test_auth_mode_parse() {
+        assert_eq!(AuthMode::parse("mutating-only"), AuthMode::MutatingOnly);
+        assert_eq!(AuthMode::parse("all-routes"), AuthMode::AllRoutes);
+        assert_eq!(AuthMode::parse("namespace-acl"), AuthMode::NamespaceAcl);
+        assert_eq!(AuthMode::parse("unknown"), AuthMode::MutatingOnly);
+        assert_eq!(AuthMode::parse(""), AuthMode::MutatingOnly);
+    }
+
+    #[test]
+    fn test_cors_wildcard_produces_any() {
+        // When cors_origins contains "*", the CORS layer should use Any
+        let config = HttpServerConfig {
+            cors_origins: vec!["*".to_string()],
+            bind_address: std::net::Ipv4Addr::new(192, 168, 1, 1).into(),
+            ..Default::default()
+        };
+        // Verify the config triggers the wildcard branch (no panic = correct path)
+        let state = build_test_http_state_sync();
+        let _router = create_router(state, &config);
+    }
+
+    fn build_test_http_state_sync() -> HttpState {
+        // Minimal state for router creation tests (no DB needed)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let db_path = tmp.path().join(".lancedb");
+            build_test_http_state(db_path.to_str().unwrap()).await
+        })
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_auth_requires_health_and_mcp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::UNAUTHORIZED);
+
+        let discovery = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/discovery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::UNAUTHORIZED);
+
+        let mcp = app
+            .clone()
+            .oneshot(Request::builder().uri("/mcp/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_root_returns_login_page_with_401() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_text.contains("memex_token"));
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_accepts_query_token_for_get_routes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                allow_query_token: true,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/discovery?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

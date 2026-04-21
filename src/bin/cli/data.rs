@@ -164,10 +164,10 @@ fn should_replace_reprocess_candidate(
     current: &ReprocessDocument,
     candidate: &ReprocessDocument,
 ) -> bool {
-    let current_rank = (reprocess_layer_rank(&current.metadata), current.text.len());
+    let current_rank = (current.text.len(), reprocess_layer_rank(&current.metadata));
     let candidate_rank = (
-        reprocess_layer_rank(&candidate.metadata),
         candidate.text.len(),
+        reprocess_layer_rank(&candidate.metadata),
     );
     candidate_rank > current_rank
 }
@@ -340,6 +340,19 @@ async fn run_reprocess_documents(
 
     let storage = Arc::new(StorageManager::new_lance_only(&db_path).await?);
     let embedding_client = Arc::new(Mutex::new(EmbeddingClient::new(embedding_config).await?));
+
+    {
+        let mut guard = embedding_client.lock().await;
+        guard.embed("healthcheck").await.map_err(|e| {
+            anyhow!(
+                "Embedding server preflight failed: {}. \
+                 Fix the embedding server before reprocessing to avoid partial data loss.",
+                e
+            )
+        })?;
+        eprintln!("  Preflight:    embedding server OK");
+    }
+
     let rag = RAGPipeline::new(embedding_client, storage).await?;
     let preprocessor = preprocess.then(|| Preprocessor::new(PreprocessingConfig::default()));
     let min_length = PreprocessingConfig::default().min_content_length;
@@ -347,7 +360,10 @@ async fn run_reprocess_documents(
     let mut indexed = 0usize;
     let mut replaced = 0usize;
     let mut skipped_existing_count = 0usize;
-    let mut skipped_empty_count = 0usize;
+    let mut skipped_empty_input = 0usize;
+    let mut skipped_preprocess_short = 0usize;
+    let mut failed_ids: Vec<String> = Vec::new();
+    let total = docs.len();
 
     for (idx, doc) in docs.iter().enumerate() {
         let existing = rag.lookup_memory(&namespace, &doc.canonical_id).await?;
@@ -360,6 +376,15 @@ async fn run_reprocess_documents(
                 == Some(doc.source_text_hash.as_str())
         {
             skipped_existing_count += 1;
+            if (idx + 1) % 250 == 0 {
+                eprintln!(
+                    "  Progress: {}/{} (indexed:{} skipped:{})",
+                    idx + 1,
+                    total,
+                    indexed,
+                    skipped_existing_count
+                );
+            }
             continue;
         }
 
@@ -369,8 +394,13 @@ async fn run_reprocess_documents(
             doc.text.clone()
         };
 
-        if text.trim().is_empty() || (preprocess && text.trim().len() < min_length) {
-            skipped_empty_count += 1;
+        if text.trim().is_empty() {
+            skipped_empty_input += 1;
+            continue;
+        }
+
+        if preprocess && text.trim().len() < min_length {
+            skipped_preprocess_short += 1;
             continue;
         }
 
@@ -388,12 +418,28 @@ async fn run_reprocess_documents(
             replaced += 1;
         }
 
-        rag.memory_upsert(&namespace, doc.canonical_id.clone(), text, metadata)
-            .await?;
-        indexed += 1;
+        match rag
+            .memory_upsert(&namespace, doc.canonical_id.clone(), text, metadata)
+            .await
+        {
+            Ok(()) => {
+                indexed += 1;
+            }
+            Err(e) => {
+                eprintln!("  WARN: failed to index '{}': {}", doc.canonical_id, e);
+                failed_ids.push(doc.canonical_id.clone());
+            }
+        }
 
         if (idx + 1) % 250 == 0 {
-            eprintln!("  Progress: {}/{} canonical documents", idx + 1, docs.len());
+            eprintln!(
+                "  Progress: {}/{} (indexed:{} skipped:{} failed:{})",
+                idx + 1,
+                total,
+                indexed,
+                skipped_existing_count,
+                failed_ids.len()
+            );
         }
     }
 
@@ -406,8 +452,26 @@ async fn run_reprocess_documents(
     if skipped_existing_count > 0 {
         eprintln!("  Skipped existing: {}", skipped_existing_count);
     }
-    if skipped_empty_count > 0 {
-        eprintln!("  Skipped empty:   {}", skipped_empty_count);
+    if skipped_empty_input > 0 {
+        eprintln!("  Skipped empty:   {}", skipped_empty_input);
+    }
+    if skipped_preprocess_short > 0 {
+        eprintln!("  Skipped too short: {}", skipped_preprocess_short);
+    }
+    if !failed_ids.is_empty() {
+        eprintln!(
+            "  FAILED:          {} (IDs: {})",
+            failed_ids.len(),
+            if failed_ids.len() <= 10 {
+                failed_ids.join(", ")
+            } else {
+                format!(
+                    "{}... and {} more",
+                    failed_ids[..10].join(", "),
+                    failed_ids.len() - 10
+                )
+            }
+        );
     }
     if parse_errors > 0 {
         eprintln!("  Parse errors:    {}", parse_errors);
@@ -425,9 +489,26 @@ pub async fn run_export(
 ) -> Result<()> {
     let storage = StorageManager::new_lance_only(&db_path).await?;
 
-    // Get all documents in the namespace
-    // Using a zero vector to search - this gets documents by namespace filter
-    let docs = storage.all_documents(Some(&namespace), 100000).await?;
+    const PAGE_SIZE: usize = 5000;
+    let mut docs: Vec<rmcp_memex::ChromaDocument> = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = storage
+            .all_documents_page(Some(&namespace), offset, PAGE_SIZE)
+            .await?;
+        let page_len = page.len();
+        if page_len > 0 {
+            eprintln!(
+                "  Loading: fetched {} documents (offset {})",
+                page_len, offset
+            );
+        }
+        docs.extend(page);
+        if page_len < PAGE_SIZE {
+            break;
+        }
+        offset += page_len;
+    }
 
     if docs.is_empty() {
         eprintln!("No documents found in namespace '{}'", namespace);
@@ -558,13 +639,16 @@ pub async fn run_import(
 
         let mut docs = Vec::new();
         for (record, embedding) in records_with_embeddings {
+            let hash = record
+                .content_hash
+                .unwrap_or_else(|| compute_content_hash(&record.text));
             let doc = rmcp_memex::ChromaDocument::new_flat_with_hash(
                 record.id,
                 namespace.clone(),
                 embedding,
                 record.metadata,
                 record.text,
-                record.content_hash.unwrap_or_default(),
+                hash,
             );
             docs.push(doc);
         }
@@ -589,13 +673,16 @@ pub async fn run_import(
 
         let mut docs = Vec::new();
         for ((record, _line_num), embedding) in records_to_embed.into_iter().zip(embeddings) {
+            let hash = record
+                .content_hash
+                .unwrap_or_else(|| compute_content_hash(&record.text));
             let doc = rmcp_memex::ChromaDocument::new_flat_with_hash(
                 record.id,
                 namespace.clone(),
                 embedding,
                 record.metadata,
                 record.text,
-                record.content_hash.unwrap_or_default(),
+                hash,
             );
             docs.push(doc);
         }
@@ -673,25 +760,63 @@ pub async fn run_reindex(config: ReindexConfig, embedding_config: &EmbeddingConf
         db_path,
     } = config;
 
+    if source_namespace == target_namespace {
+        return Err(anyhow!(
+            "Source and target namespace are the same ('{}'). \
+             In-place reindex risks data loss if the embedding server fails mid-operation. \
+             Use a different target namespace, or pass --force-in-place if you have a backup.",
+            source_namespace
+        ));
+    }
+
     let storage = StorageManager::new_lance_only(&db_path).await?;
-    let docs = storage
-        .all_documents(Some(&source_namespace), 1_000_000)
-        .await?;
-    if docs.is_empty() {
+
+    if !dry_run {
+        let target_count = storage.count_namespace(&target_namespace).await?;
+        if target_count > 0 && !skip_existing {
+            return Err(anyhow!(
+                "Target namespace '{}' already contains {} documents. \
+                 Pass --skip-existing to resume, or use a fresh target namespace.",
+                target_namespace,
+                target_count
+            ));
+        }
+    }
+
+    const PAGE_SIZE: usize = 5000;
+    let mut records: Vec<ExportRecord> = Vec::new();
+    let mut offset = 0;
+
+    loop {
+        let page = storage
+            .all_documents_page(Some(&source_namespace), offset, PAGE_SIZE)
+            .await?;
+        let page_len = page.len();
+        eprintln!(
+            "  Loading source: fetched {} documents (offset {})",
+            page_len, offset
+        );
+
+        for doc in page {
+            records.push(ExportRecord {
+                id: doc.id,
+                text: doc.document,
+                metadata: doc.metadata,
+                content_hash: doc.content_hash,
+                embeddings: None,
+            });
+        }
+
+        if page_len < PAGE_SIZE {
+            break;
+        }
+        offset += page_len;
+    }
+
+    if records.is_empty() {
         eprintln!("No documents found in namespace '{}'", source_namespace);
         return Ok(());
     }
-
-    let records = docs
-        .into_iter()
-        .map(|doc| ExportRecord {
-            id: doc.id,
-            text: doc.document,
-            metadata: doc.metadata,
-            content_hash: doc.content_hash,
-            embeddings: None,
-        })
-        .collect::<Vec<_>>();
 
     let source_records = records.len();
     let collapsed = collapse_export_records(records);

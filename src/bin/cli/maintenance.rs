@@ -10,8 +10,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
 use rmcp_memex::{
-    EmbeddingClient, EmbeddingConfig, IndexProgressTracker, PipelineConfig, PipelineEvent,
-    PipelineSnapshot, PreprocessingConfig, RAGPipeline, SliceMode, StorageManager, path_utils,
+    BM25Config, BM25Index, CrossStoreRecoveryReport, EmbeddingClient, EmbeddingConfig,
+    IndexProgressTracker, PipelineConfig, PipelineEvent, PipelineSnapshot, PreprocessingConfig,
+    RAGPipeline, SliceMode, StorageManager, inspect_cross_store_recovery, path_utils,
+    rag::PipelineGovernorConfig, repair_cross_store_recovery,
 };
 
 #[allow(dead_code)]
@@ -83,6 +85,8 @@ use crate::cli::definition::*;
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct IndexCheckpointStats {
     pub total_files: usize,
+    pub discovered_files: usize,
+    pub resumed_files: usize,
     pub files_read: usize,
     pub files_skipped: usize,
     pub files_committed: usize,
@@ -97,6 +101,8 @@ impl From<&PipelineSnapshot> for IndexCheckpointStats {
     fn from(snapshot: &PipelineSnapshot) -> Self {
         Self {
             total_files: snapshot.total_files,
+            discovered_files: snapshot.discovered_files,
+            resumed_files: snapshot.resumed_files,
             files_read: snapshot.files_read,
             files_skipped: snapshot.files_skipped,
             files_committed: snapshot.files_committed,
@@ -216,6 +222,10 @@ pub struct BatchIndexConfig {
     pub resume: bool,
     /// Enable async pipeline mode for concurrent stages
     pub pipeline: bool,
+    /// Maximum embedding requests in flight for pipeline mode.
+    pub pipeline_embed_concurrency: u8,
+    /// Enable adaptive governor for pipeline embed throughput.
+    pub pipeline_governor: bool,
     /// Number of files to process in parallel (1-16, ignored in pipeline mode)
     pub parallel: u8,
 }
@@ -231,6 +241,82 @@ pub enum FileIndexResult {
     SkippedResume,
     /// Indexing failed
     Failed,
+}
+
+fn pipeline_embed_rate(snapshot: &PipelineSnapshot) -> f64 {
+    let elapsed_secs = snapshot.elapsed.as_secs_f64();
+    if elapsed_secs > 0.0 {
+        snapshot.chunks_embedded as f64 / elapsed_secs
+    } else {
+        0.0
+    }
+}
+
+fn format_pipeline_status_line(snapshot: &PipelineSnapshot, scheduled_files: usize) -> String {
+    let terminal_files = snapshot.files_committed + snapshot.files_skipped + snapshot.files_failed;
+    let discovered_files = snapshot
+        .discovered_files
+        .max(scheduled_files.saturating_add(snapshot.resumed_files))
+        .max(scheduled_files);
+    let completed_discovered = terminal_files
+        .saturating_add(snapshot.resumed_files)
+        .min(discovered_files);
+    let eta = snapshot
+        .eta
+        .map(HumanDuration)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let avg_embed_ms = snapshot
+        .avg_embed_batch_ms
+        .map(|value| format!("{value:.0}ms"))
+        .unwrap_or_else(|| "--".to_string());
+
+    format!(
+        "{}/{} discovered | scheduled {} resumed {} | read {} | committed {} skipped {} failed {} | chunks created {} embedded {} ({:.1}/s) stored {} ({:.1}/s) | eta {} | q {}/{}/{} | embed {}/{} req @ {} | batch {}/{} items {} / {} chars | gov {} ({}) | {}",
+        completed_discovered,
+        discovered_files,
+        scheduled_files,
+        snapshot.resumed_files,
+        snapshot.files_read,
+        snapshot.files_committed,
+        snapshot.files_skipped,
+        snapshot.files_failed,
+        snapshot.chunks_created,
+        snapshot.chunks_embedded,
+        pipeline_embed_rate(snapshot),
+        snapshot.chunks_stored,
+        snapshot.chunks_per_sec,
+        eta,
+        snapshot.reader_queue_depth,
+        snapshot.chunker_queue_depth,
+        snapshot.storage_queue_depth,
+        snapshot.embed_active_requests,
+        snapshot.embed_concurrency_limit,
+        avg_embed_ms,
+        snapshot.current_embed_batch_items,
+        snapshot.embed_batch_items_limit,
+        snapshot.current_embed_batch_chars,
+        snapshot.embed_batch_chars_limit,
+        snapshot.governor_mode,
+        snapshot.governor_reason,
+        snapshot.bottleneck
+    )
+}
+
+fn format_pipeline_error_line(path: Option<&Path>, stage: &str, message: &str) -> String {
+    match path {
+        Some(path) => format!(
+            "[pipeline:error] {} [{}] {}",
+            stage,
+            path.display(),
+            message
+        ),
+        None => format!("[pipeline:error] {} {}", stage, message),
+    }
+}
+
+fn should_disable_pipeline_storage_dedup(existing_checkpoint_loaded: bool) -> bool {
+    existing_checkpoint_loaded
 }
 
 struct PipelineProgressRenderer {
@@ -261,33 +347,32 @@ impl PipelineProgressRenderer {
         }
     }
 
+    fn println(&self, line: &str) {
+        if let Some(progress_bar) = &self.progress_bar {
+            progress_bar.println(line);
+        } else {
+            eprintln!("{}", line);
+        }
+    }
+
     fn render(&mut self, snapshot: &PipelineSnapshot, force: bool) {
         let terminal_files =
             snapshot.files_committed + snapshot.files_skipped + snapshot.files_failed;
-        let eta = snapshot
-            .eta
-            .map(HumanDuration)
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "--".to_string());
-        let message = format!(
-            "stored {} chunks | {:.1} chunks/s | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
-            snapshot.chunks_stored,
-            snapshot.chunks_per_sec,
-            eta,
-            snapshot.reader_queue_depth,
-            snapshot.chunker_queue_depth,
-            snapshot.storage_queue_depth,
-            snapshot.current_embed_batch_items,
-            snapshot.current_embed_batch_chars,
-            snapshot.bottleneck
-        );
+        let discovered_files = snapshot
+            .discovered_files
+            .max(self.total_files.saturating_add(snapshot.resumed_files))
+            .max(self.total_files);
+        let completed_discovered = terminal_files
+            .saturating_add(snapshot.resumed_files)
+            .min(discovered_files);
+        let message = format_pipeline_status_line(snapshot, self.total_files);
 
         if let Some(progress_bar) = &self.progress_bar {
-            progress_bar.set_length(self.total_files as u64);
-            progress_bar.set_position(terminal_files.min(self.total_files) as u64);
-            progress_bar.set_message(message);
-            if force && terminal_files >= self.total_files {
-                progress_bar.finish_with_message("complete");
+            progress_bar.set_length(discovered_files as u64);
+            progress_bar.set_position(completed_discovered as u64);
+            progress_bar.set_message(message.clone());
+            if force && completed_discovered >= discovered_files {
+                progress_bar.finish_with_message(format!("complete | {}", message));
             }
             return;
         }
@@ -297,39 +382,40 @@ impl PipelineProgressRenderer {
         }
 
         self.last_line_at = Instant::now();
-        eprintln!(
-            "[pipeline] {}/{} files | committed {} skipped {} failed {} | chunks {} stored {} | {:.1} chunks/s | eta {} | q {}/{}/{} | batch {}/{} chars | {}",
-            terminal_files.min(self.total_files),
-            self.total_files,
-            snapshot.files_committed,
-            snapshot.files_skipped,
-            snapshot.files_failed,
-            snapshot.chunks_created,
-            snapshot.chunks_stored,
-            snapshot.chunks_per_sec,
-            eta,
-            snapshot.reader_queue_depth,
-            snapshot.chunker_queue_depth,
-            snapshot.storage_queue_depth,
-            snapshot.current_embed_batch_items,
-            snapshot.current_embed_batch_chars,
-            snapshot.bottleneck
-        );
+        eprintln!("[pipeline] {}", message);
     }
 }
 
-async fn consume_pipeline_events(
-    mut rx: mpsc::UnboundedReceiver<PipelineEvent>,
+struct PipelineEventConsumerConfig {
     checkpoint: Option<Arc<Mutex<IndexCheckpoint>>>,
     db_path: String,
     show_progress: bool,
     interactive_progress: bool,
-    total_files: usize,
+    scheduled_files: usize,
+    discovered_files: usize,
+    resumed_files: usize,
+}
+
+async fn consume_pipeline_events(
+    mut rx: mpsc::UnboundedReceiver<PipelineEvent>,
+    config: PipelineEventConsumerConfig,
 ) -> PipelineSnapshot {
+    let PipelineEventConsumerConfig {
+        checkpoint,
+        db_path,
+        show_progress,
+        interactive_progress,
+        scheduled_files,
+        discovered_files,
+        resumed_files,
+    } = config;
+
     let mut renderer =
-        show_progress.then(|| PipelineProgressRenderer::new(total_files, interactive_progress));
+        show_progress.then(|| PipelineProgressRenderer::new(scheduled_files, interactive_progress));
     let mut latest_snapshot = PipelineSnapshot {
-        total_files,
+        total_files: scheduled_files,
+        discovered_files,
+        resumed_files,
         ..Default::default()
     };
 
@@ -354,7 +440,7 @@ async fn consume_pipeline_events(
                 }
             }
             PipelineEvent::Snapshot(snapshot) => {
-                latest_snapshot = snapshot;
+                latest_snapshot = *snapshot;
                 if let Some(checkpoint) = &checkpoint {
                     let mut checkpoint = checkpoint.lock().await;
                     checkpoint.update_from_snapshot(&latest_snapshot);
@@ -364,10 +450,29 @@ async fn consume_pipeline_events(
                     renderer.render(&latest_snapshot, false);
                 }
             }
+            PipelineEvent::Error {
+                path,
+                stage,
+                message,
+            } => {
+                if let Some(renderer) = &renderer {
+                    renderer.println(&format_pipeline_error_line(
+                        path.as_deref(),
+                        stage,
+                        &message,
+                    ));
+                } else {
+                    eprintln!(
+                        "{}",
+                        format_pipeline_error_line(path.as_deref(), stage, &message)
+                    );
+                }
+            }
             PipelineEvent::FileRead { .. }
+            | PipelineEvent::EmbedStarted { .. }
             | PipelineEvent::ChunksCreated { .. }
             | PipelineEvent::ChunksEmbedded { .. }
-            | PipelineEvent::Error { .. } => {}
+            | PipelineEvent::GovernorAdjusted { .. } => {}
         }
     }
 
@@ -395,6 +500,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         show_progress,
         resume,
         pipeline,
+        pipeline_embed_concurrency,
+        pipeline_governor,
         parallel,
     } = config;
     // Expand and canonicalize path - canonicalize validates path exists and resolves symlinks
@@ -455,20 +562,26 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             eprintln!("Warning: --preprocess is not supported in pipeline mode (ignoring)");
         }
 
-        let checkpoint = if resume {
+        let (checkpoint, existing_checkpoint_loaded) = if resume {
             if let Some(cp) = IndexCheckpoint::load(&db_path, ns_name) {
                 let resumed_count = cp.indexed_files.len();
                 eprintln!(
                     "Resuming from checkpoint: {} files already committed",
                     resumed_count
                 );
-                Arc::new(Mutex::new(cp))
+                (Arc::new(Mutex::new(cp)), true)
             } else {
-                Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
+                (
+                    Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path))),
+                    false,
+                )
             }
         } else {
             IndexCheckpoint::delete(&db_path, ns_name);
-            Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path)))
+            (
+                Arc::new(Mutex::new(IndexCheckpoint::new(ns_name, &db_path))),
+                false,
+            )
         };
 
         let (pipeline_files, resumed_count, disable_storage_dedup) = if resume {
@@ -479,7 +592,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                 .filter(|path| !checkpoint_guard.is_indexed(path))
                 .cloned()
                 .collect();
-            let disable_storage_dedup = resumed_count > 0;
+            let disable_storage_dedup =
+                should_disable_pipeline_storage_dedup(existing_checkpoint_loaded);
             (filtered_files, resumed_count, disable_storage_dedup)
         } else {
             (files.clone(), 0, false)
@@ -500,28 +614,48 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         }
 
         eprintln!(
-            "Pipeline mode: {} files ({} discovered, {} resumed), slice mode: {:?}",
+            "Pipeline mode: {} files ({} discovered, {} resumed), slice mode: {:?}, embed concurrency ceiling: {}, governor: {}",
             pipeline_files.len(),
             total,
             resumed_count,
-            slice_mode
+            slice_mode,
+            pipeline_embed_concurrency,
+            if pipeline_governor {
+                "adaptive"
+            } else {
+                "fixed"
+            }
         );
         eprintln!("Running concurrent stages: reader -> chunker -> embedder -> storage");
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let event_task = tokio::spawn(consume_pipeline_events(
             event_rx,
-            resume.then_some(Arc::clone(&checkpoint)),
-            db_path.clone(),
-            show_progress,
-            use_progress_bar,
-            pipeline_files.len(),
+            PipelineEventConsumerConfig {
+                checkpoint: resume.then_some(Arc::clone(&checkpoint)),
+                db_path: db_path.clone(),
+                show_progress,
+                interactive_progress: use_progress_bar,
+                scheduled_files: pipeline_files.len(),
+                discovered_files: total,
+                resumed_files: resumed_count,
+            },
         ));
 
         let pipeline_config = PipelineConfig {
             slice_mode,
             dedup_enabled: dedup && !disable_storage_dedup,
+            embed_concurrency: pipeline_embed_concurrency as usize,
+            governor: pipeline_governor.then(|| {
+                PipelineGovernorConfig::adaptive(
+                    embedding_config.max_batch_chars,
+                    embedding_config.max_batch_items,
+                    pipeline_embed_concurrency as usize,
+                )
+            }),
             event_sender: Some(event_tx),
+            discovered_files: total,
+            resumed_files: resumed_count,
             ..Default::default()
         };
 
@@ -554,7 +688,26 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
         eprintln!("  Chunks stored:     {}", result.stats.chunks_stored);
         if result.stats.errors > 0 {
             eprintln!("  Errors:            {}", result.stats.errors);
+            for error in result.errors.iter().take(5) {
+                eprintln!("    - {}", error);
+            }
+            if result.errors.len() > 5 {
+                eprintln!("    - ... and {} more", result.errors.len() - 5);
+            }
         }
+        if let Some(avg_embed_ms) = snapshot.avg_embed_batch_ms {
+            eprintln!("  Avg embed batch:   {:.0} ms", avg_embed_ms);
+        }
+        eprintln!(
+            "  Embed ceiling:     {} req | {} items | {} chars",
+            snapshot.embed_concurrency_limit,
+            snapshot.embed_batch_items_limit,
+            snapshot.embed_batch_chars_limit
+        );
+        eprintln!(
+            "  Governor:          {} ({})",
+            snapshot.governor_mode, snapshot.governor_reason
+        );
         eprintln!("  Bottleneck:        {}", snapshot.bottleneck);
         eprintln!("  Namespace:         {}", ns_name);
         eprintln!("  DB path:           {}", expanded_db);
@@ -718,6 +871,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                     .map(|()| rmcp_memex::IndexResult::Indexed {
                         chunks_indexed: (file_bytes as usize / 500).max(1),
                         content_hash: String::new(),
+                        embedder_ms: None,
+                        tokens_estimated: None,
                     })
                 } else {
                     rag.index_document_with_mode(&file_path, ns.as_deref(), effective_mode)
@@ -725,6 +880,8 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
                         .map(|()| rmcp_memex::IndexResult::Indexed {
                             chunks_indexed: (file_bytes as usize / 500).max(1),
                             content_hash: String::new(),
+                            embedder_ms: None,
+                            tokens_estimated: None,
                         })
                 }
             };
@@ -907,6 +1064,154 @@ pub async fn run_batch_index(config: BatchIndexConfig) -> Result<()> {
             "Checkpoint preserved ({} files failed - rerun with --resume to retry)",
             failed
         );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_pipeline_status_line_surfaces_stage_flow() {
+        let snapshot = PipelineSnapshot {
+            total_files: 6,
+            discovered_files: 8,
+            resumed_files: 2,
+            files_read: 4,
+            files_committed: 2,
+            files_skipped: 1,
+            files_failed: 1,
+            chunks_created: 24,
+            chunks_embedded: 20,
+            chunks_stored: 18,
+            errors: 0,
+            files_per_sec: 0.8,
+            chunks_per_sec: 3.6,
+            reader_queue_depth: 2,
+            chunker_queue_depth: 1,
+            storage_queue_depth: 3,
+            embed_active_requests: 1,
+            embed_concurrency_limit: 3,
+            current_embed_batch_items: 8,
+            current_embed_batch_chars: 4096,
+            embed_batch_items_limit: 16,
+            embed_batch_chars_limit: 8192,
+            avg_embed_batch_ms: Some(640.0),
+            bottleneck: "storage".to_string(),
+            governor_mode: "adaptive".to_string(),
+            governor_reason: "backlog sustained".to_string(),
+            eta: Some(Duration::from_secs(12)),
+            elapsed: Duration::from_secs(5),
+        };
+
+        let line = format_pipeline_status_line(&snapshot, 6);
+
+        assert!(line.contains("6/8 discovered"));
+        assert!(line.contains("scheduled 6 resumed 2"));
+        assert!(line.contains("read 4"));
+        assert!(line.contains("embedded 20 (4.0/s)"));
+        assert!(line.contains("stored 18 (3.6/s)"));
+        assert!(line.contains("q 2/1/3"));
+        assert!(line.contains("embed 1/3 req @ 640ms"));
+        assert!(line.contains("batch 8/16 items 4096 / 8192 chars"));
+        assert!(line.contains("gov adaptive (backlog sustained)"));
+        assert!(line.contains("storage"));
+    }
+
+    #[test]
+    fn format_pipeline_error_line_keeps_stage_and_path_visible() {
+        let line = format_pipeline_error_line(
+            Some(Path::new("/tmp/corpus/a.md")),
+            "embedder",
+            "connection reset",
+        );
+
+        assert_eq!(
+            line,
+            "[pipeline:error] embedder [/tmp/corpus/a.md] connection reset"
+        );
+    }
+
+    #[test]
+    fn resume_checkpoint_disables_pipeline_storage_dedup_even_without_committed_files() {
+        assert!(should_disable_pipeline_storage_dedup(true));
+        assert!(!should_disable_pipeline_storage_dedup(false));
+    }
+}
+
+fn print_cross_store_recovery_report(report: &CrossStoreRecoveryReport, execute: bool) {
+    let mode = if execute { "EXECUTE" } else { "DRY RUN" };
+    eprintln!("\n=== CROSS-STORE RECOVERY ({}) ===\n", mode);
+    eprintln!("Recovery dir: {}", report.recovery_dir);
+    eprintln!("Pending batches: {}", report.pending_batches);
+    eprintln!("  Divergent:   {}", report.divergent_batches);
+    eprintln!("  Rolled back: {}", report.rolled_back_batches);
+    eprintln!("  Stale:       {}", report.stale_batches);
+    eprintln!("  Clean:       {}", report.clean_batches);
+    eprintln!("Documents examined: {}", report.documents_examined);
+    eprintln!("Missing BM25 docs:  {}", report.documents_missing_bm25);
+    eprintln!("Missing Lance docs: {}", report.documents_missing_lance);
+    if execute {
+        eprintln!("Repaired docs:      {}", report.repaired_documents);
+        eprintln!("Skipped docs:       {}", report.skipped_documents);
+        eprintln!("Cleared batches:    {}", report.cleared_batches);
+    }
+
+    if report.batches.is_empty() {
+        eprintln!("\nNo recovery ledgers found.");
+        return;
+    }
+
+    eprintln!();
+    for batch in &report.batches {
+        let state = match batch.state {
+            rmcp_memex::CrossStoreRecoveryState::Clean => "clean",
+            rmcp_memex::CrossStoreRecoveryState::Divergent => "divergent",
+            rmcp_memex::CrossStoreRecoveryState::RolledBack => "rolled_back",
+            rmcp_memex::CrossStoreRecoveryState::Stale => "stale",
+        };
+        eprintln!(
+            "- {} [{}] state={} docs={} lance={} bm25={}",
+            batch.batch_id,
+            batch.namespace,
+            state,
+            batch.document_count,
+            batch.lance_documents,
+            batch.bm25_documents
+        );
+        if let Some(ref error) = batch.last_error {
+            eprintln!("  last_error: {}", error);
+        }
+        if !batch.missing_bm25_ids.is_empty() {
+            eprintln!("  missing_bm25: {}", batch.missing_bm25_ids.join(", "));
+        }
+        if !batch.missing_lance_ids.is_empty() {
+            eprintln!("  missing_lance: {}", batch.missing_lance_ids.join(", "));
+        }
+    }
+}
+
+pub async fn run_repair_writes(
+    db_path: String,
+    namespace: Option<String>,
+    execute: bool,
+    json_output: bool,
+) -> Result<()> {
+    let storage = StorageManager::new_lance_only(&db_path).await?;
+    let bm25 = BM25Index::new(&BM25Config::default().with_read_only(!execute))?;
+
+    let report = if execute {
+        repair_cross_store_recovery(&storage, &bm25, namespace.as_deref()).await?
+    } else {
+        inspect_cross_store_recovery(&storage, &bm25, namespace.as_deref()).await?
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_cross_store_recovery_report(&report, execute);
     }
 
     Ok(())

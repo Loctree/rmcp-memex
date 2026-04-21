@@ -2,7 +2,6 @@
 //!
 //! Detects Ollama, MLX server, and other embedding providers automatically.
 
-use crate::embeddings::{DEFAULT_REQUIRED_DIMENSION, infer_embedding_dimension};
 use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
@@ -63,17 +62,6 @@ impl DetectedProvider {
             self.suggested_model.as_deref()
         }
     }
-
-    /// Infer embedding dimension from the detected model name.
-    pub fn inferred_dimension(&self) -> Option<usize> {
-        self.model().and_then(infer_embedding_dimension)
-    }
-
-    /// Get embedding dimension for the detected model
-    pub fn suggested_dimension(&self) -> usize {
-        self.inferred_dimension()
-            .unwrap_or(DEFAULT_REQUIRED_DIMENSION)
-    }
 }
 
 fn looks_like_embedding_model(model: &str) -> bool {
@@ -89,14 +77,8 @@ fn looks_like_embedding_model(model: &str) -> bool {
 fn pick_embedding_model(models: &[String]) -> Option<String> {
     models
         .iter()
-        .find(|m| infer_embedding_dimension(m).is_some())
+        .find(|m| looks_like_embedding_model(m))
         .cloned()
-        .or_else(|| {
-            models
-                .iter()
-                .find(|m| looks_like_embedding_model(m))
-                .cloned()
-        })
 }
 
 /// Type of embedding provider.
@@ -409,24 +391,10 @@ pub async fn check_custom_endpoint(url: &str) -> Result<DetectedProvider> {
     })
 }
 
-/// Get dimension explanation for UI
-pub fn dimension_explanation(dim: usize, model_name: Option<&str>) -> String {
-    let model = model_name.unwrap_or("").to_ascii_lowercase();
-    let is_qwen = model.contains("qwen");
-
-    match dim {
-        4096 if is_qwen => "Qwen3 Embedding 8B natively (4096 dims)".to_string(),
-        2560 if is_qwen => "Qwen3 Embedding 4B or MRL-truncated 8B (2560 dims)".to_string(),
-        1024 if is_qwen => "Qwen3 Embedding 0.6B or MRL-truncated (1024 dims)".to_string(),
-        2048 if is_qwen => "Qwen3-VL Embedding (2048 dims)".to_string(),
-        2560 => "Default baseline dimension (2560 dims)".to_string(),
-        4096 => "Large embedding models (4096 dims)".to_string(),
-        2048 => "Compact and accurate embedding models (2048 dims)".to_string(),
-        1024 => "BGE-M3/mxbai-embed or MRL (1024 dims) - good balance".to_string(),
-        768 => "nomic-embed (768 dims) - fast and lightweight".to_string(),
-        384 => "all-minilm (384 dims) - fastest, lowest quality".to_string(),
-        _ => "Custom dimension - ensure all providers match".to_string(),
-    }
+/// Get dimension explanation for UI.
+/// Reports the verified dimension without guessing model variants.
+pub fn dimension_explanation(dim: usize) -> String {
+    format!("{dim} dims — ensure all providers match this dimension")
 }
 
 #[cfg(test)]
@@ -440,42 +408,17 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_for_models() {
-        let provider = DetectedProvider {
-            kind: ProviderKind::Ollama,
-            base_url: "http://localhost:11434".to_string(),
-            port: 11434,
-            models: vec![],
-            suggested_model: Some("qwen3-embedding:4b".to_string()),
-            status: ProviderStatus::Online("qwen3-embedding:4b".to_string()),
-        };
-        assert_eq!(provider.inferred_dimension(), Some(2560));
-        assert_eq!(provider.suggested_dimension(), 2560);
-    }
-
-    #[test]
-    fn test_dimension_for_qwen3_vl_models() {
-        let provider = DetectedProvider {
-            kind: ProviderKind::Ollama,
-            base_url: "http://localhost:11434".to_string(),
-            port: 11434,
-            models: vec![],
-            suggested_model: Some("MedAIBase/Qwen3-VL-Embedding:2b-q8_0".to_string()),
-            status: ProviderStatus::Online("MedAIBase/Qwen3-VL-Embedding:2b-q8_0".to_string()),
-        };
-        assert_eq!(provider.inferred_dimension(), Some(2048));
-        assert_eq!(provider.suggested_dimension(), 2048);
-    }
-
-    #[test]
-    fn test_pick_embedding_model_prefers_detectable_models_in_order() {
-        let models = vec![
-            "MedAIBase/Qwen3-VL-Embedding:2b-q8_0".to_string(),
-            "qwen3-embedding:8b".to_string(),
-        ];
+    fn pick_embedding_model_finds_embedding_keyword() {
+        let models = vec!["llama3:8b".to_string(), "qwen3-embedding:8b".to_string()];
         assert_eq!(
             pick_embedding_model(&models).as_deref(),
-            Some("MedAIBase/Qwen3-VL-Embedding:2b-q8_0")
+            Some("qwen3-embedding:8b")
         );
+    }
+
+    #[test]
+    fn dimension_explanation_is_dynamic() {
+        let explanation = dimension_explanation(1536);
+        assert!(explanation.contains("1536"));
     }
 }

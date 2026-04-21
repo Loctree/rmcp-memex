@@ -631,10 +631,7 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
                     ProviderStatus::Offline => Color::DarkGray,
                 };
 
-                let dimension_note = provider
-                    .inferred_dimension()
-                    .map(|dim| format!("{dim} inferred"))
-                    .unwrap_or_else(|| "dimension probe required".to_string());
+                let dimension_note = "probe required".to_string();
 
                 lines.push(Line::from(vec![
                     Span::styled(prefix, style),
@@ -832,19 +829,16 @@ fn render_indexing_dashboard(
     telemetry: Option<&IndexTelemetrySnapshot>,
     monitor: Option<&MonitorSnapshot>,
 ) {
-    let outer = Layout::default()
+    let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(10), Constraint::Length(4)])
+        .constraints([
+            Constraint::Length(3), // Progress Gauge
+            Constraint::Min(10),   // Main Stats
+            Constraint::Length(5), // Recent Warnings
+        ])
         .split(area);
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(outer[0]);
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(6)])
-        .split(main[0]);
 
+    // 1. Top Progress Gauge
     let ratio = telemetry
         .map(|snapshot| {
             if snapshot.total == 0 {
@@ -857,123 +851,241 @@ fn render_indexing_dashboard(
         .clamp(0.0, 1.0);
 
     let progress_label = telemetry
-        .map(|snapshot| format!("{}/{}", snapshot.processed, snapshot.total))
-        .unwrap_or_else(|| "waiting".to_string());
+        .map(|snapshot| {
+            format!(
+                "{}% ({}/{})",
+                (ratio * 100.0) as u64,
+                snapshot.processed,
+                snapshot.total
+            )
+        })
+        .unwrap_or_else(|| "0% (waiting)".to_string());
+
     let progress_gauge = Gauge::default()
         .block(
             Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Index Progress "),
+                .borders(Borders::BOTTOM)
+                .padding(Padding::new(1, 1, 0, 0)),
         )
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
         .ratio(ratio)
         .label(progress_label);
-    frame.render_widget(progress_gauge, left[0]);
+    frame.render_widget(progress_gauge, chunks[0]);
 
+    // 2. Middle section: Left (Operator Stats) | Right (System Telemetry)
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    // Left: Operator Stats
     let left_lines = if let Some(snapshot) = telemetry {
-        let status = if snapshot.complete {
-            "complete"
+        let status_style = if snapshot.complete {
+            Style::default().fg(Color::Green).bold()
         } else if snapshot.stopping {
-            "stopping"
+            Style::default().fg(Color::Red).bold()
         } else if snapshot.paused {
-            "paused"
+            Style::default().fg(Color::Yellow).bold()
         } else {
-            "running"
+            Style::default().fg(Color::Cyan).bold()
         };
+
+        let status = if snapshot.complete {
+            "COMPLETE"
+        } else if snapshot.stopping {
+            "STOPPING"
+        } else if snapshot.paused {
+            "PAUSED"
+        } else {
+            "RUNNING"
+        };
+
         vec![
-            Line::from(format!("Rate: {:.2} files/sec", snapshot.files_per_sec)),
-            Line::from(format!("ETA: {}", format_eta(snapshot.eta_secs))),
-            Line::from(format!("State: {}", status)),
-            Line::from(format!(
-                "Parallelism: {} | Inflight: {}",
-                snapshot.parallelism, snapshot.in_flight
-            )),
-            Line::from(format!(
-                "Indexed: {} | Skipped: {} | Failed: {}",
-                snapshot.indexed, snapshot.skipped, snapshot.failed
-            )),
-            Line::from(format!("Current file: {}", current_file_label(snapshot))),
+            Line::from(vec![
+                Span::raw("Status:      "),
+                Span::styled(status, status_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Rate:        "),
+                Span::styled(
+                    format!("{:.2} files/sec", snapshot.files_per_sec),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("ETA:         "),
+                Span::styled(
+                    format_eta(snapshot.eta_secs),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("Parallelism: "),
+                Span::styled(
+                    snapshot.parallelism.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(" (inflight: "),
+                Span::styled(
+                    snapshot.in_flight.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(")"),
+            ]),
+            Line::from(vec![
+                Span::raw("Processed:   "),
+                Span::styled(
+                    snapshot.indexed.to_string(),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" indexed, "),
+                Span::styled(
+                    snapshot.skipped.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(" skipped, "),
+                Span::styled(snapshot.failed.to_string(), Style::default().fg(Color::Red)),
+                Span::raw(" failed"),
+            ]),
+            Line::from(vec![
+                Span::raw("Chunks:      "),
+                Span::styled(
+                    snapshot.total_chunks.to_string(),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::raw(" produced"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Current File: ", Style::default().bold()),
+                Span::styled(
+                    current_file_label(snapshot),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
         ]
     } else {
-        vec![
-            Line::from("Waiting for indexing telemetry..."),
-            Line::from(""),
-            Line::from("The scheduler will publish live stats here."),
-        ]
+        vec![Line::from("Waiting for indexing telemetry...")]
     };
-    let left_stats = Paragraph::new(left_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" Operator Stats "),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(left_stats, left[1]);
 
-    let right_lines = if let Some(snapshot) = monitor {
-        let gpu_status = match &snapshot.gpu_status {
-            GpuStatus::Available { class_name } => format!("available ({class_name})"),
-            GpuStatus::Unavailable { reason } => format!("unavailable ({reason})"),
+    let operator_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Operator Dashboard ");
+    frame.render_widget(
+        Paragraph::new(left_lines).block(operator_block),
+        main_chunks[0],
+    );
+
+    // Right: System Telemetry with Gauges
+    let system_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" System Telemetry ");
+
+    let sys_area = system_block.inner(main_chunks[1]);
+    frame.render_widget(system_block, main_chunks[1]);
+
+    if let Some(snapshot) = monitor {
+        let sys_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // CPU Gauge
+                Constraint::Length(2), // RAM Gauge
+                Constraint::Length(2), // GPU Gauge (if available)
+                Constraint::Min(4),    // Process stats
+            ])
+            .margin(1)
+            .split(sys_area);
+
+        // CPU Gauge
+        let cpu_gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+            .ratio((snapshot.system_cpu_percent / 100.0).clamp(0.0, 1.0) as f64)
+            .label(format!("CPU: {:.1}%", snapshot.system_cpu_percent));
+        frame.render_widget(cpu_gauge, sys_rows[0]);
+
+        // RAM Gauge
+        let ram_ratio = if snapshot.system_ram_total > 0 {
+            snapshot.system_ram_used as f64 / snapshot.system_ram_total as f64
+        } else {
+            0.0
         };
-        vec![
-            Line::from(format!("System CPU: {:.1}%", snapshot.system_cpu_percent)),
-            Line::from(format!(
-                "System RAM: {} / {}",
+        let ram_gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Blue).bg(Color::DarkGray))
+            .ratio(ram_ratio.clamp(0.0, 1.0))
+            .label(format!(
+                "RAM: {} / {}",
                 MonitorSnapshot::format_bytes(snapshot.system_ram_used),
                 MonitorSnapshot::format_bytes(snapshot.system_ram_total)
-            )),
-            Line::from(format!("rmcp-memex CPU: {:.1}%", snapshot.rmcp_memex_cpu)),
-            Line::from(format!(
-                "rmcp-memex RSS: {}",
-                MonitorSnapshot::format_bytes(snapshot.rmcp_memex_rss)
-            )),
-            Line::from(format!(
-                "Embedder CPU: {:.1}%",
-                snapshot.embedder_cpu_aggregate
-            )),
-            Line::from(format!(
-                "Embedder RSS: {}",
-                MonitorSnapshot::format_bytes(snapshot.embedder_rss_aggregate)
-            )),
-            Line::from(format!(
-                "GPU util: {}",
-                snapshot
-                    .gpu_util_percent
-                    .map(|value| format!("{value:.1}%"))
-                    .unwrap_or_else(|| "--".to_string())
-            )),
-            Line::from(format!(
-                "GPU memory: {} / {}",
-                snapshot
-                    .gpu_memory_used
-                    .map(MonitorSnapshot::format_bytes)
-                    .unwrap_or_else(|| "--".to_string()),
-                snapshot
-                    .gpu_memory_total
-                    .map(MonitorSnapshot::format_bytes)
-                    .unwrap_or_else(|| "--".to_string())
-            )),
-            Line::from(format!("GPU status: {gpu_status}")),
-        ]
-    } else {
-        vec![
-            Line::from("Waiting for system telemetry..."),
-            Line::from(""),
-            Line::from("CPU, RAM, process, and GPU stats will stream here."),
-        ]
-    };
-    let right_stats = Paragraph::new(right_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .title(" System Telemetry "),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(right_stats, main[1]);
+            ));
+        frame.render_widget(ram_gauge, sys_rows[1]);
 
+        // GPU Gauge (if available)
+        if let Some(gpu_util) = snapshot.gpu_util_percent {
+            let gpu_gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Magenta).bg(Color::DarkGray))
+                .ratio((gpu_util / 100.0).clamp(0.0, 1.0) as f64)
+                .label(format!("GPU: {:.1}%", gpu_util));
+            frame.render_widget(gpu_gauge, sys_rows[2]);
+        } else {
+            let gpu_note = match &snapshot.gpu_status {
+                GpuStatus::Unavailable { reason } => format!("GPU Unavailable: {}", reason),
+                _ => "GPU: --".to_string(),
+            };
+            frame.render_widget(
+                Paragraph::new(gpu_note).style(Style::default().fg(Color::DarkGray)),
+                sys_rows[2],
+            );
+        }
+
+        // Process stats
+        let process_lines = vec![
+            Line::from(vec![
+                Span::styled("rmcp-memex:  ", Style::default().bold()),
+                Span::styled(
+                    format!("{:.1}% CPU", snapshot.rmcp_memex_cpu),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    MonitorSnapshot::format_bytes(snapshot.rmcp_memex_rss),
+                    Style::default().fg(Color::Blue),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Embedder:    ", Style::default().bold()),
+                Span::styled(
+                    format!("{:.1}% CPU", snapshot.embedder_cpu_aggregate),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    MonitorSnapshot::format_bytes(snapshot.embedder_rss_aggregate),
+                    Style::default().fg(Color::Blue),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("GPU VRAM:    ", Style::default().bold()),
+                Span::raw(format!(
+                    "{} / {}",
+                    snapshot
+                        .gpu_memory_used
+                        .map(MonitorSnapshot::format_bytes)
+                        .unwrap_or_else(|| "--".to_string()),
+                    snapshot
+                        .gpu_memory_total
+                        .map(MonitorSnapshot::format_bytes)
+                        .unwrap_or_else(|| "--".to_string())
+                )),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(process_lines), sys_rows[3]);
+    } else {
+        frame.render_widget(Paragraph::new("Waiting for system monitor..."), sys_area);
+    }
+
+    // 3. Bottom: Warnings/Log
     let warning_lines = if let Some(snapshot) = telemetry {
         let lines: Vec<Line> = snapshot
             .recent_warnings
@@ -984,28 +1096,37 @@ fn render_indexing_dashboard(
             .into_iter()
             .rev()
             .map(|warning| {
-                Line::from(Span::styled(
-                    format!("[{}] {}", warning.code, warning.message),
-                    Style::default().fg(Color::Yellow),
-                ))
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", warning.code),
+                        Style::default().fg(Color::Red).bold(),
+                    ),
+                    Span::styled(&warning.message, Style::default().fg(Color::Yellow)),
+                ])
             })
             .collect();
         if lines.is_empty() {
             vec![Line::from(Span::styled(
-                "No warnings.",
+                "No warnings encountered.",
                 Style::default().fg(Color::DarkGray),
             ))]
         } else {
             lines
         }
     } else {
-        vec![Line::from(Span::styled(
-            "Waiting for warnings...",
-            Style::default().fg(Color::DarkGray),
-        ))]
+        vec![Line::from("Waiting for telemetry...")]
     };
-    let warnings = Paragraph::new(warning_lines).wrap(Wrap { trim: false });
-    frame.render_widget(warnings, outer[1]);
+
+    let warnings_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Recent Warnings ");
+    frame.render_widget(
+        Paragraph::new(warning_lines)
+            .block(warnings_block)
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
 }
 
 fn current_file_label(snapshot: &IndexTelemetrySnapshot) -> String {

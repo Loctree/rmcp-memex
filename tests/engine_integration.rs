@@ -495,6 +495,15 @@ async fn test_delete_by_filter_scans_past_first_page() {
     assert_eq!(remaining_target, 0, "target docs should be fully removed");
     assert_eq!(remaining_keep, 1000, "non-matching docs should remain");
 
+    let deleted_again = engine
+        .delete_by_filter(MetaFilter {
+            doc_type: Some("target".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("idempotent delete_by_filter should succeed");
+    assert_eq!(deleted_again, 0, "second delete should find nothing");
+
     server_handle.abort();
 }
 

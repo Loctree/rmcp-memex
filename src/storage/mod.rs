@@ -10,11 +10,13 @@ use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::{OptimizeAction, OptimizeStats};
 use lancedb::{Table, connect};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::rag::SliceLayer;
 
@@ -170,6 +172,49 @@ pub struct StorageManager {
     lance_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossStoreRecoveryStatus {
+    #[default]
+    Pending,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossStoreRecoveryDocumentRef {
+    pub namespace: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossStoreRecoveryBatch {
+    pub batch_id: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub status: CrossStoreRecoveryStatus,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    pub documents: Vec<CrossStoreRecoveryDocumentRef>,
+}
+
+impl CrossStoreRecoveryBatch {
+    pub fn from_documents(documents: &[ChromaDocument]) -> Self {
+        Self {
+            batch_id: Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: CrossStoreRecoveryStatus::Pending,
+            last_error: None,
+            documents: documents
+                .iter()
+                .map(|document| CrossStoreRecoveryDocumentRef {
+                    namespace: document.namespace.clone(),
+                    id: document.id.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 type BatchIter =
     RecordBatchIterator<std::vec::IntoIter<std::result::Result<RecordBatch, ArrowError>>>;
 
@@ -209,6 +254,81 @@ impl StorageManager {
 
     pub fn lance_path(&self) -> &str {
         &self.lance_path
+    }
+
+    pub fn cross_store_recovery_dir(&self) -> PathBuf {
+        let db_path = Path::new(&self.lance_path);
+        let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = db_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("lancedb");
+        parent.join(format!(".{stem}-cross-store-recovery"))
+    }
+
+    fn cross_store_recovery_batch_path(&self, batch_id: &str) -> PathBuf {
+        self.cross_store_recovery_dir()
+            .join(format!("{batch_id}.json"))
+    }
+
+    fn write_cross_store_recovery_batch(&self, batch: &CrossStoreRecoveryBatch) -> Result<PathBuf> {
+        let dir = self.cross_store_recovery_dir();
+        std::fs::create_dir_all(&dir)?;
+
+        let path = self.cross_store_recovery_batch_path(&batch.batch_id);
+        let tmp_path = path.with_extension("json.tmp");
+        let payload = serde_json::to_vec_pretty(batch)?;
+
+        std::fs::write(&tmp_path, payload)?;
+        std::fs::rename(&tmp_path, &path)?;
+
+        Ok(path)
+    }
+
+    pub fn persist_cross_store_recovery_batch(
+        &self,
+        batch: &CrossStoreRecoveryBatch,
+    ) -> Result<PathBuf> {
+        self.write_cross_store_recovery_batch(batch)
+    }
+
+    pub fn update_cross_store_recovery_batch(
+        &self,
+        batch: &CrossStoreRecoveryBatch,
+    ) -> Result<PathBuf> {
+        self.write_cross_store_recovery_batch(batch)
+    }
+
+    pub fn clear_cross_store_recovery_batch(&self, batch_id: &str) -> Result<()> {
+        let path = self.cross_store_recovery_batch_path(batch_id);
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn list_cross_store_recovery_batches(&self) -> Result<Vec<CrossStoreRecoveryBatch>> {
+        let dir = self.cross_store_recovery_dir();
+        if !dir.exists() {
+            return Ok(vec![]);
+        }
+
+        let mut batches = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = std::fs::read(&path)?;
+            let batch: CrossStoreRecoveryBatch = serde_json::from_slice(&payload)?;
+            batches.push(batch);
+        }
+
+        batches.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+        Ok(batches)
     }
 
     /// Refresh the table connection to see new data written by other processes.
@@ -343,9 +463,9 @@ impl StorageManager {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(vec![]),
         };
 
         let mut query = table.query().limit(limit).offset(offset);
@@ -375,9 +495,9 @@ impl StorageManager {
     }
 
     pub async fn get_document(&self, namespace: &str, id: &str) -> Result<Option<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(None),
         };
         let filter = format!(
             "{} AND {}",
@@ -400,27 +520,53 @@ impl StorageManager {
     }
 
     pub async fn delete_document(&self, namespace: &str, id: &str) -> Result<usize> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(0),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(0),
         };
         let predicate = format!(
             "{} AND {}",
             self.namespace_filter(namespace),
             self.id_filter(id)
         );
-        let deleted = table.delete(predicate.as_str()).await?;
-        Ok(deleted.version as usize)
+        let pre_count = table
+            .query()
+            .only_if(predicate.as_str())
+            .execute()
+            .await?
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
+            .await?;
+        if pre_count == 0 {
+            return Ok(0);
+        }
+        table.delete(predicate.as_str()).await?;
+        Ok(pre_count)
     }
 
     pub async fn delete_namespace_documents(&self, namespace: &str) -> Result<usize> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(0),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(0),
         };
         let predicate = self.namespace_filter(namespace);
-        let deleted = table.delete(predicate.as_str()).await?;
-        Ok(deleted.version as usize)
+        let pre_count = table
+            .query()
+            .only_if(predicate.as_str())
+            .execute()
+            .await?
+            .try_fold(
+                0usize,
+                |acc, batch| async move { Ok(acc + batch.num_rows()) },
+            )
+            .await?;
+        if pre_count == 0 {
+            return Ok(0);
+        }
+        table.delete(predicate.as_str()).await?;
+        Ok(pre_count)
     }
 
     pub fn get_collection_name(&self) -> &str {
@@ -463,8 +609,50 @@ impl StorageManager {
         Ok(table)
     }
 
+    /// Try to open the table without creating it.
+    /// Returns `Ok(None)` when the table genuinely does not exist.
+    /// Propagates real errors (I/O, corruption, permission) as `Err`.
+    async fn open_table_if_exists(&self) -> Result<Option<Table>> {
+        let mut guard = self.table.lock().await;
+        if let Some(table) = guard.as_ref() {
+            return Ok(Some(table.clone()));
+        }
+
+        match self
+            .lance
+            .open_table(self.collection_name.as_str())
+            .execute()
+            .await
+        {
+            Ok(tbl) => {
+                *guard = Some(tbl.clone());
+                Ok(Some(tbl))
+            }
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("not found")
+                    || msg.contains("does not exist")
+                    || msg.contains("no such file")
+                {
+                    Ok(None)
+                } else {
+                    tracing::warn!(
+                        "LanceDB error opening table '{}': {}",
+                        self.collection_name,
+                        e
+                    );
+                    Err(anyhow!(
+                        "LanceDB error on table '{}': {}",
+                        self.collection_name,
+                        e
+                    ))
+                }
+            }
+        }
+    }
+
     async fn open_existing_table(&self) -> Result<Table> {
-        self.ensure_table(0).await.map_err(|_| {
+        self.open_table_if_exists().await?.ok_or_else(|| {
             anyhow!(
                 "Vector table '{}' not found at {}. Index data first so rmcp-memex can use the stored embedding dimension instead of guessing.",
                 self.collection_name,
@@ -705,9 +893,9 @@ impl StorageManager {
         namespace: &str,
         filter: &str,
     ) -> Result<Vec<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(vec![]),
         };
         let combined = format!("{} AND ({})", self.namespace_filter(namespace), filter);
         let mut stream = table.query().only_if(combined.as_str()).execute().await?;
@@ -770,11 +958,9 @@ impl StorageManager {
         namespace: &str,
         parent_id: &str,
     ) -> Result<Vec<ChromaDocument>> {
-        // Ensure table exists
-        let _ = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]),
-        };
+        if self.open_table_if_exists().await?.is_none() {
+            return Ok(vec![]);
+        }
 
         // First get the parent document to find children IDs
         if let Some(parent) = self.get_document(namespace, parent_id).await? {
@@ -845,9 +1031,9 @@ impl StorageManager {
     /// - Table doesn't exist yet
     /// - Table has old schema without content_hash column (graceful degradation)
     pub async fn has_content_hash(&self, namespace: &str, hash: &str) -> Result<bool> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(false), // Table doesn't exist yet, no duplicates possible
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(false),
         };
 
         // Graceful handling of old schema without content_hash column
@@ -893,9 +1079,9 @@ impl StorageManager {
             return Ok(vec![]);
         }
 
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(hashes.iter().collect()), // Table doesn't exist, all are new
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(hashes.iter().collect()),
         };
 
         // Graceful handling of old schema without content_hash column
@@ -1011,9 +1197,9 @@ impl StorageManager {
 
     /// Count rows in a specific namespace
     pub async fn count_namespace(&self, namespace: &str) -> Result<usize> {
-        let table = match self.ensure_table(0).await {
-            Ok(table) => table,
-            Err(_) => return Ok(0),
+        let table = match self.open_table_if_exists().await? {
+            Some(table) => table,
+            None => return Ok(0),
         };
         let filter = self.namespace_filter(namespace);
         let count = table.count_rows(Some(filter)).await?;
@@ -1025,9 +1211,9 @@ impl StorageManager {
     /// Note: This uses a full table scan with namespace filter.
     /// For very large namespaces, consider batching.
     pub async fn get_all_in_namespace(&self, namespace: &str) -> Result<Vec<ChromaDocument>> {
-        let table = match self.ensure_table(0).await {
-            Ok(t) => t,
-            Err(_) => return Ok(vec![]), // Table doesn't exist
+        let table = match self.open_table_if_exists().await? {
+            Some(t) => t,
+            None => return Ok(vec![]),
         };
 
         let filter = self.namespace_filter(namespace);
@@ -1179,10 +1365,20 @@ impl StorageManager {
     pub async fn garbage_collect(&self, config: &GcConfig) -> Result<GcStats> {
         let mut stats = GcStats::default();
 
-        // Get all documents for analysis
-        let all_docs = self
-            .all_documents(config.namespace.as_deref(), 1_000_000)
-            .await?;
+        const PAGE_SIZE: usize = 5000;
+        let mut all_docs: Vec<ChromaDocument> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .all_documents_page(config.namespace.as_deref(), offset, PAGE_SIZE)
+                .await?;
+            let page_len = page.len();
+            all_docs.extend(page);
+            if page_len < PAGE_SIZE {
+                break;
+            }
+            offset += page_len;
+        }
 
         if all_docs.is_empty() {
             return Ok(stats);
@@ -1359,12 +1555,23 @@ impl StorageManager {
 
     /// List all unique namespaces in the database
     pub async fn list_namespaces(&self) -> Result<Vec<(String, usize)>> {
-        let all_docs = self.all_documents(None, 1_000_000).await?;
+        self.refresh().await?;
 
         let mut namespace_counts: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
-        for doc in &all_docs {
-            *namespace_counts.entry(doc.namespace.clone()).or_insert(0) += 1;
+
+        const PAGE_SIZE: usize = 5000;
+        let mut offset = 0;
+        loop {
+            let page = self.all_documents_page(None, offset, PAGE_SIZE).await?;
+            let page_len = page.len();
+            for doc in &page {
+                *namespace_counts.entry(doc.namespace.clone()).or_insert(0) += 1;
+            }
+            if page_len < PAGE_SIZE {
+                break;
+            }
+            offset += page_len;
         }
 
         let mut namespaces: Vec<(String, usize)> = namespace_counts.into_iter().collect();

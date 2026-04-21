@@ -5,7 +5,7 @@
 //! through both `McpTransport::Stdio` and `McpTransport::HttpSse` and
 //! asserts structurally equivalent responses.
 //!
-//! These tests require a running embedding server (Ollama with qwen3-embedding:4b).
+//! These tests require a running embedding server (Ollama with qwen3-embedding:8b, 4096 dims).
 //! Run with: cargo test --test transport_parity -- --ignored
 //!
 //! Vibecrafted with AI Agents (c)2026 VetCoders

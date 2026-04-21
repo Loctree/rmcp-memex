@@ -8,7 +8,6 @@ use rmcp_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
 pub const DEFAULT_SSE_PORT: u16 = 8997;
-
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
@@ -148,6 +147,25 @@ pub struct Cli {
     /// when bound to non-localhost, or permissive when bound to localhost.
     #[arg(long, global = true)]
     pub cors_origins: Option<String>,
+
+    /// Allow binding to non-loopback addresses without --auth-token.
+    /// By default, binding to e.g. 0.0.0.0 without auth is a hard error.
+    /// This flag downgrades it to a warning.
+    #[arg(long, global = true)]
+    pub allow_network_without_auth: bool,
+
+    /// Auth enforcement mode for HTTP endpoints.
+    /// - mutating-only (default): bearer required only on mutating + MCP routes
+    /// - all-routes: bearer required on ALL routes
+    /// - namespace-acl: reserved for Track C (namespace-level ACL)
+    #[arg(long, global = true, default_value = "mutating-only",
+           value_parser = ["mutating-only", "all-routes", "namespace-acl"])]
+    pub auth_mode: String,
+
+    /// Allow passing bearer token as ?token= query parameter on read GET endpoints.
+    /// Disabled by default. Only effective when --auth-mode is all-routes.
+    #[arg(long, global = true)]
+    pub allow_query_token: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -291,6 +309,17 @@ pub enum Commands {
         /// Supports live progress output and commit-based resume checkpoints.
         #[arg(long)]
         pipeline: bool,
+
+        /// Maximum number of embedding requests to keep in flight in pipeline mode.
+        /// With --pipeline-governor disabled this is a fixed concurrency limit.
+        /// With --pipeline-governor enabled this becomes the governor's ceiling.
+        #[arg(long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=8))]
+        pipeline_embed_concurrency: u8,
+
+        /// Enable adaptive pipeline flow control for embedding batch sizes and concurrency.
+        /// Uses embed latency and queue pressure to increase slowly and back off quickly.
+        #[arg(long)]
+        pipeline_governor: bool,
 
         /// Number of files to process in parallel (default: 4, max: 16).
         /// Higher values can speed up indexing on multi-core systems,
@@ -589,6 +618,31 @@ pub enum Commands {
         namespace: Option<String>,
 
         /// Output results as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect or repair pending Lance/BM25 recovery ledgers
+    ///
+    /// This is the explicit recovery contract for partial cross-store writes.
+    /// It does not claim crash-safe atomicity. Instead it inspects persisted
+    /// batch ledgers, reports divergence, and can replay BM25 writes to match
+    /// current Lance truth.
+    ///
+    /// Examples:
+    ///   rmcp-memex repair-writes
+    ///   rmcp-memex repair-writes --execute
+    ///   rmcp-memex repair-writes -n memories --json
+    RepairWrites {
+        /// Limit inspection/repair to a single namespace
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Actually execute reconciliation. Default is dry-run/report-only.
+        #[arg(long)]
+        execute: bool,
+
+        /// Output results as JSON instead of human-readable text
         #[arg(long)]
         json: bool,
     },
@@ -915,6 +969,81 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage auth tokens with per-token scopes and namespace ACL
+    ///
+    /// Create, list, revoke, and rotate bearer tokens for HTTP API access.
+    /// Each token is hashed with argon2id at rest. The plaintext is shown
+    /// ONCE on creation and can never be retrieved again.
+    ///
+    /// Examples:
+    ///   rmcp-memex auth create --description "iPhone" --scopes read,write --namespaces kb:claude,kb:mikserka
+    ///   rmcp-memex auth list
+    ///   rmcp-memex auth revoke --id monika-iphone
+    ///   rmcp-memex auth rotate --id monika-iphone
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+/// Auth token management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum AuthAction {
+    /// Create a new auth token
+    ///
+    /// Generates a new token with specified scopes and namespace access.
+    /// The plaintext token is printed ONCE and never stored.
+    Create {
+        /// Human-readable token identifier (e.g., "monika-iphone")
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Description of what this token is for
+        #[arg(long, required = true)]
+        description: String,
+
+        /// Comma-separated scopes: read, write, admin
+        #[arg(long, default_value = "read,write")]
+        scopes: String,
+
+        /// Comma-separated namespace ACL. Use "*" for all namespaces.
+        #[arg(long, default_value = "*")]
+        namespaces: String,
+
+        /// Token expiry (RFC 3339 timestamp, e.g., "2026-12-31T00:00:00Z")
+        #[arg(long)]
+        expires_at: Option<String>,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List all tokens (without revealing plaintext)
+    List {
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Revoke (delete) a token by its ID
+    Revoke {
+        /// Token ID to revoke
+        #[arg(long, required = true)]
+        id: String,
+    },
+
+    /// Rotate a token: revoke old, create new with same metadata
+    Rotate {
+        /// Token ID to rotate
+        #[arg(long, required = true)]
+        id: String,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -1073,7 +1202,6 @@ mod tests {
         assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
         assert_eq!(config.allowed_paths, defaults.allowed_paths);
     }
-
     #[test]
     fn dashboard_command_parses_without_explicit_port() {
         let cli = Cli::parse_from(["rmcp-memex", "dashboard"]);
@@ -1095,5 +1223,53 @@ mod tests {
             Some(Commands::Sse { port }) => assert_eq!(port, None),
             other => panic!("expected sse command, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn repair_writes_command_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "repair-writes", "--execute", "-n", "memories"]);
+
+        match cli.command {
+            Some(Commands::RepairWrites {
+                namespace,
+                execute,
+                json,
+            }) => {
+                assert_eq!(namespace.as_deref(), Some("memories"));
+                assert!(execute);
+                assert!(!json);
+            }
+            other => panic!("expected repair-writes command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auth_mode_flag_parses_all_routes() {
+        let cli = Cli::parse_from(["rmcp-memex", "--auth-mode", "all-routes", "serve"]);
+        assert_eq!(cli.auth_mode, "all-routes");
+    }
+
+    #[test]
+    fn auth_mode_defaults_to_mutating_only() {
+        let cli = Cli::parse_from(["rmcp-memex", "serve"]);
+        assert_eq!(cli.auth_mode, "mutating-only");
+    }
+
+    #[test]
+    fn allow_network_without_auth_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "--allow-network-without-auth", "serve"]);
+        assert!(cli.allow_network_without_auth);
+    }
+
+    #[test]
+    fn allow_query_token_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "--allow-query-token", "serve"]);
+        assert!(cli.allow_query_token);
+    }
+
+    #[test]
+    fn auth_mode_rejects_invalid_value() {
+        let result = Cli::try_parse_from(["rmcp-memex", "--auth-mode", "bogus", "serve"]);
+        assert!(result.is_err());
     }
 }

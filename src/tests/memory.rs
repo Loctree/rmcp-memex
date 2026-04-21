@@ -1,6 +1,8 @@
 use crate::{
-    BM25Config, BM25Index, EmbeddingConfig, MLXBridge, ProviderConfig, SearchOptions, SliceLayer,
-    SliceMode, compute_content_hash, rag::RAGPipeline, storage::StorageManager,
+    BM25Config, BM25Index, ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryStatus,
+    EmbeddingConfig, MLXBridge, ProviderConfig, SearchOptions, SliceLayer, SliceMode,
+    compute_content_hash, inspect_cross_store_recovery, rag::RAGPipeline,
+    repair_cross_store_recovery, storage::StorageManager,
 };
 use anyhow::{Result, anyhow};
 use serde_json::json;
@@ -159,6 +161,91 @@ async fn rag_pipeline_rolls_back_lance_write_when_bm25_write_fails() -> Result<(
             .is_empty(),
         "LanceDB rows should be rolled back when BM25 indexing fails"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn repair_cross_store_replays_bm25_for_pending_lance_batch() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
+    storage.ensure_collection().await?;
+
+    let bm25 =
+        BM25Index::new(&BM25Config::default().with_path(bm25_path.to_string_lossy().into_owned()))?;
+
+    let text = "Recoverable divergence batch should be replayed into BM25 after Lance survives.";
+    let document = ChromaDocument::new_flat_with_hash(
+        "doc1".to_string(),
+        "repair-ns".to_string(),
+        vec![0.1, 0.2],
+        json!({"kind": "repairable"}),
+        text.to_string(),
+        compute_content_hash(text),
+    );
+    let batch = CrossStoreRecoveryBatch::from_documents(std::slice::from_ref(&document));
+
+    storage.persist_cross_store_recovery_batch(&batch)?;
+    storage.add_to_store(vec![document]).await?;
+
+    let inspect = inspect_cross_store_recovery(&storage, &bm25, Some("repair-ns")).await?;
+    assert_eq!(inspect.pending_batches, 1);
+    assert_eq!(inspect.divergent_batches, 1);
+    assert_eq!(inspect.documents_missing_bm25, 1);
+
+    let repaired = repair_cross_store_recovery(&storage, &bm25, Some("repair-ns")).await?;
+    assert_eq!(repaired.batches_repaired, 1);
+    assert_eq!(repaired.repaired_documents, 1);
+    assert_eq!(repaired.cleared_batches, 1);
+    assert!(storage.list_cross_store_recovery_batches()?.is_empty());
+
+    let results = bm25.search("recoverable", Some("repair-ns"), 10)?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "doc1");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn repair_cross_store_clears_rolled_back_batches_as_skipped() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
+    storage.ensure_collection().await?;
+
+    let bm25 =
+        BM25Index::new(&BM25Config::default().with_path(bm25_path.to_string_lossy().into_owned()))?;
+
+    let text = "This batch was rolled back before BM25 could keep it.";
+    let document = ChromaDocument::new_flat_with_hash(
+        "doc1".to_string(),
+        "rollback-ledger-ns".to_string(),
+        vec![0.3, 0.4],
+        json!({"kind": "rolled-back"}),
+        text.to_string(),
+        compute_content_hash(text),
+    );
+    let mut batch = CrossStoreRecoveryBatch::from_documents(std::slice::from_ref(&document));
+    batch.status = CrossStoreRecoveryStatus::RolledBack;
+    batch.last_error =
+        Some("BM25 write failed after Lance persist; lance_rollback_failures=0".to_string());
+    storage.persist_cross_store_recovery_batch(&batch)?;
+
+    let inspect = inspect_cross_store_recovery(&storage, &bm25, Some("rollback-ledger-ns")).await?;
+    assert_eq!(inspect.pending_batches, 1);
+    assert_eq!(inspect.rolled_back_batches, 1);
+    assert_eq!(inspect.documents_missing_lance, 1);
+
+    let repaired = repair_cross_store_recovery(&storage, &bm25, Some("rollback-ledger-ns")).await?;
+    assert_eq!(repaired.rolled_back_batches, 1);
+    assert_eq!(repaired.skipped_documents, 1);
+    assert_eq!(repaired.cleared_batches, 1);
+    assert!(storage.list_cross_store_recovery_batches()?.is_empty());
 
     Ok(())
 }

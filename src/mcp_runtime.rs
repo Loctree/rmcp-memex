@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 use crate::{
     ServerConfig,
     embeddings::EmbeddingClient,
@@ -53,6 +54,7 @@ pub async fn build_mcp_core(config: ServerConfig) -> Result<Arc<McpCore>> {
             .await?,
     );
 
+    #[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
     let access_manager = NamespaceAccessManager::new(config.security.clone());
     access_manager.init().await?;
     let access_manager = Arc::new(access_manager);
