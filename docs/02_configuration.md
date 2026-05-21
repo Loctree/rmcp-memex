@@ -26,8 +26,6 @@ rmcp-memex [OPTIONS] [COMMAND]
 | Flaga | Opis | Domyślnie |
 |-------|------|-----------|
 | `--config <PATH>` | Ścieżka do pliku konfiguracyjnego TOML | brak |
-| `--mode <MODE>` | Tryb serwera: `memory` lub `full` | `full` |
-| `--features <LIST>` | Lista funkcji (comma-separated) | `filesystem,memory,search` |
 | `--cache-mb <SIZE>` | Rozmiar cache w MB | `4096` |
 | `--db-path <PATH>` | Ścieżka do LanceDB | `~/.rmcp-servers/rmcp-memex/lancedb` |
 | `--max-request-bytes <SIZE>` | Max rozmiar requestu | `5242880` (5MB) |
@@ -42,11 +40,8 @@ rmcp-memex [OPTIONS] [COMMAND]
 # Podstawowe uruchomienie
 rmcp-memex serve
 
-# Tryb memory-only (bez dostępu do filesystem)
-rmcp-memex serve --mode memory
-
 # Z własną konfiguracją
-rmcp-memex serve --config ~/.rmcp-servers/config/rmcp-memex.toml
+rmcp-memex serve --config ~/.rmcp-servers/rmcp-memex/config.toml
 
 # Z security i custom paths
 rmcp-memex serve \
@@ -63,17 +58,11 @@ rmcp-memex index ./documents --namespace docs --recursive --glob "*.md"
 
 ### Lokalizacja
 
-Domyślna lokalizacja: `~/.rmcp-servers/config/rmcp-memex.toml`
+Domyślna lokalizacja: `~/.rmcp-servers/rmcp-memex/config.toml`
 
 ### Pełny Przykład
 
 ```toml
-# Tryb serwera: "memory" lub "full"
-mode = "full"
-
-# Lista włączonych funkcji
-features = "filesystem,memory,search"
-
 # Rozmiar cache w MB
 cache_mb = 4096
 
@@ -111,34 +100,13 @@ security_enabled = true
 
 ## Tryby Serwera
 
-### Full Mode (domyślny)
+`rmcp-memex` udostępnia jeden kanoniczny MCP surface. Nie ma już osobnego
+przełącznika `memory/full`, bo nie zmieniał on realnie kontraktu serwera.
 
-Wszystkie funkcje włączone:
-- RAG indexing z plików
-- Memory operations
-- Semantic search
-
-```bash
-rmcp-memex serve --mode full
-# lub
-rmcp-memex serve  # domyślnie full
-```
-
-### Memory Mode
-
-Tylko operacje pamięciowe, bez dostępu do filesystem:
-- Memory upsert/get/search/delete
-- Semantic search
-- Brak rag_index (tylko rag_index_text)
-
-```bash
-rmcp-memex serve --mode memory
-```
-
-Użyj tego trybu gdy:
-- Serwer nie powinien mieć dostępu do plików
-- Tylko vector memory jest potrzebne
-- Zwiększone bezpieczeństwo
+Jeśli chcesz zawęzić runtime:
+- użyj `allowed_paths`, aby ograniczyć dostęp do filesystem
+- ustaw `--security-enabled`, aby chronić namespace'y tokenami
+- ustaw `--auth-token`, jeśli wystawiasz mutujące endpointy HTTP
 
 ## Zmienne Środowiskowe
 
@@ -159,7 +127,7 @@ Użyj tego trybu gdy:
   "mcpServers": {
     "rmcp-memex": {
       "command": "rmcp-memex",
-      "args": ["serve", "--config", "~/.rmcp-servers/config/rmcp-memex.toml"]
+      "args": ["serve", "--config", "~/.rmcp-servers/rmcp-memex/config.toml"]
     }
   }
 }
@@ -248,7 +216,7 @@ Przykład:
 # Config file: log_level = "info"
 # CLI: --log-level debug
 # Wynik: debug (CLI wygrywa)
-rmcp-memex serve --config config.toml --log-level debug
+rmcp-memex serve --config ~/.rmcp-servers/rmcp-memex/config.toml --log-level debug
 ```
 
 ## Walidacja Konfiguracji
@@ -278,7 +246,7 @@ allowed_paths = [
 
 Sprawdź czy plik konfiguracyjny istnieje:
 ```bash
-ls -la ~/.rmcp-servers/config/rmcp-memex.toml
+ls -la ~/.rmcp-servers/rmcp-memex/config.toml
 ```
 
 ### "Token store not found"

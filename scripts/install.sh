@@ -1,19 +1,20 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
-echo "=== rmcp-memex setup ==="
+echo "=== rmcp-memex source setup ==="
+echo "For prebuilt GitHub Release bundles, use ../install.sh instead."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 echo "Building release binary..."
-cargo build --release
+cargo build --locked --release --bin rmcp-memex
 
 if [[ "${1:-}" == "--bundle-macos" ]]; then
   echo "Creating macOS app bundle..."
   "$SCRIPT_DIR/build-macos.sh"
-  BIN_PATH="$HOME/.mcp-servers/MCPServer.app/Contents/MacOS/rmcp-memex"
+  BIN_PATH="$HOME/.mcp-servers/rmcp-memex.app/Contents/MacOS/rmcp-memex"
 else
   BIN_PATH="$REPO_ROOT/target/release/rmcp-memex"
 fi
@@ -28,7 +29,7 @@ cat <<JSON
   "mcpServers": {
     "rmcp-memex": {
       "command": "$BIN_PATH",
-      "args": ["--log-level", "info"]
+      "args": ["serve"]
     }
   }
 }

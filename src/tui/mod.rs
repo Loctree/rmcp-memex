@@ -19,6 +19,7 @@ mod detection;
 mod health;
 mod host_detection;
 mod indexer;
+mod monitor;
 mod ui;
 
 pub use crate::common::{HostFormat, HostKind};
@@ -27,8 +28,10 @@ pub use detection::{
     DetectedProvider, ProviderKind, ProviderStatus, check_custom_endpoint, detect_providers,
 };
 pub use health::{CheckStatus, HealthCheckItem, HealthCheckResult, HealthChecker};
-pub use host_detection::{HostDetection, detect_hosts};
+pub use host_detection::{HostDetection, detect_hosts, write_mux_service_config};
 pub use indexer::{
-    DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress,
-    collect_indexable_files, import_lancedb, start_indexing, validate_path,
+    DataSetupOption, DataSetupState, DataSetupSubStep, FanOut, ImportMode, IndexControl,
+    IndexEvent, IndexEventSink, IndexTelemetrySnapshot, SharedIndexTelemetry, TracingSink,
+    TuiTelemetrySink, collect_indexable_files, import_lancedb, start_indexing, validate_path,
 };
+pub use monitor::{GpuStatus, MonitorSnapshot, spawn_monitor};

@@ -78,7 +78,8 @@ done
 # Check if rmcp-memex is available
 if ! command -v rmcp-memex &> /dev/null; then
     echo -e "${RED}Error: rmcp-memex not found in PATH${NC}"
-    echo "Install with: cargo install --path ."
+    echo "Install the prebuilt release with: curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh"
+    echo "For development-only source builds: cargo install --path ."
     exit 1
 fi
 

@@ -58,7 +58,7 @@ flowchart TB
     subgraph LAUNCHD["LaunchD Services"]
         LD_RAMDISK["ai.libraxis.memex-ramdisk<br/>Create 50GB RAM disk"]
         LD_MLX["ai.libraxis.mlx-embedding<br/>Port 8765 embedder"]
-        LD_MEMEX["ai.libraxis.rmcp-memex<br/>Port 8987 server"]
+        LD_MEMEX["ai.libraxis.rmcp-memex<br/>Port 8997 server"]
         LD_SNAPSHOT["ai.libraxis.memex-snapshot<br/>Periodic sync to disk"]
     end
 

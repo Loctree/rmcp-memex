@@ -1,22 +1,23 @@
-#!/bin/bash
-# rmcp-memex installer
-# curl -sSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
-# or with custom version:
-# RMCP_MEMEX_VERSION=v0.1.13 curl -sSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+#!/usr/bin/env bash
+# rmcp-memex installer for prebuilt GitHub Release bundles
+# curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+# or with a specific release tag:
+# RMCP_MEMEX_VERSION=v0.5.1 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
 
 set -euo pipefail
 
-# Configuration
 VERSION="${RMCP_MEMEX_VERSION:-latest}"
 INSTALL_DIR="${RMCP_MEMEX_INSTALL_DIR:-$HOME/.cargo/bin}"
 GITHUB_REPO="VetCoders/rmcp-memex"
+BINARY_NAME="rmcp-memex"
+CHECKSUM_FILE="rmcp-memex-sha256sums.txt"
+COMPAT_ALIASES=("rmcp_memex")
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 info() {
     printf "${BLUE}==>${NC} %s\n" "$1"
@@ -27,130 +28,118 @@ success() {
 }
 
 warn() {
-    printf "${YELLOW}Warning:${NC} %s\n" "$1"
+    printf "${YELLOW}warning:${NC} %s\n" "$1"
 }
 
 error() {
-    printf "${RED}Error:${NC} %s\n" "$1" >&2
+    printf "${RED}error:${NC} %s\n" "$1" >&2
     exit 1
 }
 
-# Detect OS and architecture
 detect_platform() {
     local os arch
 
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
     arch=$(uname -m)
 
-    # Normalize architecture
     case "$arch" in
-        x86_64|amd64)
-            arch="x86_64"
-            ;;
-        aarch64|arm64)
-            arch="aarch64"
-            ;;
-        *)
-            error "Unsupported architecture: $arch"
-            ;;
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *) error "Unsupported architecture: $arch" ;;
     esac
 
-    # Map to Rust target triple
     case "$os-$arch" in
-        darwin-aarch64)
-            echo "aarch64-apple-darwin"
-            ;;
-        darwin-x86_64)
-            echo "x86_64-apple-darwin"
-            ;;
-        linux-x86_64)
-            echo "x86_64-unknown-linux-gnu"
-            ;;
-        linux-aarch64)
-            echo "aarch64-unknown-linux-gnu"
-            ;;
-        *)
-            error "Unsupported platform: $os-$arch"
-            ;;
+        darwin-aarch64) echo "aarch64-apple-darwin" ;;
+        darwin-x86_64) echo "x86_64-apple-darwin" ;;
+        linux-x86_64) echo "x86_64-unknown-linux-gnu" ;;
+        linux-aarch64) echo "aarch64-unknown-linux-gnu" ;;
+        *) error "Unsupported platform: $os-$arch" ;;
     esac
 }
 
-# Get the latest version from GitHub API
+download_file() {
+    local url="$1"
+    local destination="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -LsSf "$url" -o "$destination"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q "$url" -O "$destination"
+    else
+        error "Neither curl nor wget is available."
+    fi
+}
+
 get_latest_version() {
     local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local payload
 
-    if command -v curl &> /dev/null; then
-        curl -sSf "$api_url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo ""
-    elif command -v wget &> /dev/null; then
-        wget -qO- "$api_url" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || echo ""
+    if ! payload=$(download_to_stdout "$api_url" 2>/dev/null); then
+        echo ""
+        return
+    fi
+
+    printf "%s" "$payload" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/' || true
+}
+
+download_to_stdout() {
+    local url="$1"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -LsSf "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$url"
     else
-        error "Neither curl nor wget found. Please install one of them."
+        return 1
     fi
 }
 
-# Download and extract binary
-download_and_install() {
-    local target="$1"
-    local version="$2"
-    local install_dir="$3"
-    local url
-    local temp_dir
+release_asset_url() {
+    local version="$1"
+    local asset="$2"
 
-    # Construct download URL
     if [ "$version" = "latest" ]; then
-        url="https://github.com/${GITHUB_REPO}/releases/latest/download/rmcp-memex-${target}.tar.gz"
+        printf "https://github.com/%s/releases/latest/download/%s" "$GITHUB_REPO" "$asset"
     else
-        url="https://github.com/${GITHUB_REPO}/releases/download/${version}/rmcp-memex-${target}.tar.gz"
+        printf "https://github.com/%s/releases/download/%s/%s" "$GITHUB_REPO" "$version" "$asset"
     fi
-
-    info "Downloading from: $url"
-
-    # Create temp directory
-    temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" EXIT
-
-    # Download
-    if command -v curl &> /dev/null; then
-        if ! curl -sSfL "$url" -o "$temp_dir/rmcp-memex.tar.gz" 2>/dev/null; then
-            error "Failed to download from $url"
-        fi
-    elif command -v wget &> /dev/null; then
-        if ! wget -q "$url" -O "$temp_dir/rmcp-memex.tar.gz" 2>/dev/null; then
-            error "Failed to download from $url"
-        fi
-    else
-        error "Neither curl nor wget found."
-    fi
-
-    # Extract
-    info "Extracting..."
-    mkdir -p "$temp_dir/extract"
-    tar xzf "$temp_dir/rmcp-memex.tar.gz" -C "$temp_dir/extract"
-
-    # Install
-    mkdir -p "$install_dir"
-
-    # Find the binary (might be in subdirectory)
-    local binary
-    binary=$(find "$temp_dir/extract" -name "rmcp-memex" -type f | head -1)
-
-    if [ -z "$binary" ]; then
-        error "Binary not found in archive"
-    fi
-
-    cp "$binary" "$install_dir/rmcp-memex"
-    chmod +x "$install_dir/rmcp-memex"
-    ln -sf "$install_dir/rmcp-memex" "$install_dir/rmcp_memex"
-
-    success "Installed rmcp-memex to $install_dir/rmcp-memex"
 }
 
-# Check if command is available
-check_command() {
-    command -v "$1" &> /dev/null
+sha256_file() {
+    local file="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        return 1
+    fi
 }
 
-# Check if directory is in PATH
+verify_checksum() {
+    local archive="$1"
+    local manifest="$2"
+    local artifact_name="$3"
+    local expected actual
+
+    expected=$(awk -v name="$artifact_name" '$2 == name { print $1 }' "$manifest")
+    if [ -z "$expected" ]; then
+        error "Checksum manifest does not contain an entry for $artifact_name"
+    fi
+
+    if ! actual=$(sha256_file "$archive"); then
+        warn "No SHA256 tool found; skipping checksum verification"
+        return 0
+    fi
+
+    if [ "$expected" != "$actual" ]; then
+        error "Checksum mismatch for $artifact_name"
+    fi
+
+    success "Checksum verified"
+}
+
 is_in_path() {
     case ":$PATH:" in
         *":$1:"*) return 0 ;;
@@ -158,90 +147,96 @@ is_in_path() {
     esac
 }
 
-# Main installation logic
-main() {
-    echo ""
-    echo "  ____  __  __  ____ ____       __  __ _____ __  __ _______  __"
-    echo " |  _ \\|  \\/  |/ ___|  _ \\     |  \\/  | ____|  \\/  | ____\\ \\/ /"
-    echo " | |_) | |\\/| | |   | |_) |____| |\\/| |  _| | |\\/| |  _|  \\  / "
-    echo " |  _ <| |  | | |___|  __/|____| |  | | |___| |  | | |___ /  \\ "
-    echo " |_| \\_\\_|  |_|\\____|_|        |_|  |_|_____|_|  |_|_____/_/\\_\\"
-    echo ""
-    echo "  RAG Memory with Vector Search for MCP"
-    echo ""
+install_compat_aliases() {
+    local binary_path="$1"
+    local alias_name
 
-    # Detect platform
-    info "Detecting platform..."
-    local target
+    for alias_name in "${COMPAT_ALIASES[@]}"; do
+        ln -sfn "$binary_path" "$INSTALL_DIR/$alias_name"
+    done
+}
+
+main() {
+    local target version archive_name checksum_url archive_url temp_dir extracted_binary checksum_path installed_version
+
+    printf "\nrmcp-memex installer\n"
+    printf "Shared RAG memory for MCP agents.\n\n"
+
+    info "Detecting platform"
     target=$(detect_platform)
     success "Platform: $target"
 
-    # Resolve version
-    local version="$VERSION"
+    version="$VERSION"
     if [ "$version" = "latest" ]; then
-        info "Fetching latest version..."
+        info "Resolving latest GitHub Release"
         version=$(get_latest_version)
         if [ -z "$version" ]; then
-            warn "Could not determine latest version, using 'latest' tag"
+            warn "Could not resolve the latest release tag; falling back to latest/download"
             version="latest"
         else
-            success "Latest version: $version"
+            success "Latest release: $version"
         fi
     fi
 
-    # Download and install
-    info "Installing rmcp-memex $version..."
-    download_and_install "$target" "$version" "$INSTALL_DIR"
+    archive_name="${BINARY_NAME}-${target}.tar.gz"
+    archive_url=$(release_asset_url "$version" "$archive_name")
+    checksum_url=$(release_asset_url "$version" "$CHECKSUM_FILE")
 
-    # Verify installation
-    if [ -x "$INSTALL_DIR/rmcp-memex" ]; then
-        success "Installation successful!"
-        echo ""
+    temp_dir=$(mktemp -d)
+    trap 'rm -rf "$temp_dir"' EXIT
 
-        # Get version info
-        local installed_version
-        installed_version=$("$INSTALL_DIR/rmcp-memex" --version 2>/dev/null || echo "unknown")
-        info "Installed version: $installed_version"
+    info "Downloading ${archive_name}"
+    download_file "$archive_url" "$temp_dir/$archive_name" || error "Failed to download $archive_url"
+
+    checksum_path="$temp_dir/$CHECKSUM_FILE"
+    if download_file "$checksum_url" "$checksum_path" 2>/dev/null; then
+        info "Verifying release checksum"
+        verify_checksum "$temp_dir/$archive_name" "$checksum_path" "$archive_name"
     else
-        error "Installation verification failed"
+        warn "Checksum manifest unavailable; continuing without verification"
     fi
 
-    # Check PATH
-    echo ""
+    info "Extracting release archive"
+    mkdir -p "$temp_dir/extract"
+    tar xzf "$temp_dir/$archive_name" -C "$temp_dir/extract"
+
+    extracted_binary=$(find "$temp_dir/extract" -name "$BINARY_NAME" -type f | head -1)
+    if [ -z "$extracted_binary" ]; then
+        error "Binary $BINARY_NAME not found inside $archive_name"
+    fi
+
+    mkdir -p "$INSTALL_DIR"
+    cp "$extracted_binary" "$INSTALL_DIR/$BINARY_NAME"
+    chmod +x "$INSTALL_DIR/$BINARY_NAME"
+    install_compat_aliases "$INSTALL_DIR/$BINARY_NAME"
+    success "Installed ${BINARY_NAME} to $INSTALL_DIR/$BINARY_NAME"
+    info "Legacy compatibility alias: $INSTALL_DIR/rmcp_memex"
+
+    installed_version=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null || echo "unknown")
+    info "Installed version: $installed_version"
+
     if ! is_in_path "$INSTALL_DIR"; then
-        warn "The install directory is not in your PATH."
-        echo ""
-        echo "  Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-        echo ""
-        echo "    export PATH=\"$INSTALL_DIR:\$PATH\""
-        echo ""
+        warn "Install directory is not in PATH"
+        printf 'Add this to your shell profile:\n\n'
+        printf '  export PATH="%s:$PATH"\n\n' "$INSTALL_DIR"
     fi
 
-    # Next steps
-    echo ""
-    info "Next steps:"
-    echo ""
-    echo "  1. Run the configuration wizard:"
-    echo "     rmcp-memex wizard"
-    echo ""
-    echo "  2. Or start the MCP server directly:"
-    echo "     rmcp-memex serve"
-    echo ""
-    echo "  3. Add to your MCP host config (e.g., Claude Desktop):"
-    echo ""
-    echo "     {\"mcpServers\": {\"rmcp-memex\": {"
-    echo "       \"command\": \"$INSTALL_DIR/rmcp-memex\","
-    echo "       \"args\": [\"serve\"]"
-    echo "     }}}"
-    echo ""
+    printf "Next steps\n"
+    printf "1. Start the MCP server:\n"
+    printf "   %s serve\n\n" "$BINARY_NAME"
+    printf "2. Or start the shared HTTP/SSE daemon:\n"
+    printf "   %s serve --http-port 6660 --http-only\n\n" "$BINARY_NAME"
+    printf "3. Example MCP host config:\n\n"
+    cat <<JSON
+{"mcpServers":{"rmcp-memex":{"command":"$INSTALL_DIR/$BINARY_NAME","args":["serve"]}}}
+JSON
+    printf "\n"
 
-    # Launch wizard if interactive
     if [ -t 0 ] && [ -t 1 ]; then
-        echo ""
-        read -p "Would you like to run the configuration wizard now? [y/N] " -n 1 -r
-        echo ""
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            exec "$INSTALL_DIR/rmcp-memex" wizard
+        printf "Run the configuration wizard now? [y/N] "
+        read -r answer
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+            exec "$INSTALL_DIR/$BINARY_NAME" wizard
         fi
     fi
 }

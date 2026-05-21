@@ -1,20 +1,27 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "Building MCP Rust Server for macOS..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+BINARY_NAME="rmcp-memex"
+APP_DIR="${RMCP_MEMEX_APP_DIR:-$HOME/.mcp-servers/rmcp-memex.app}"
+VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$REPO_ROOT/Cargo.toml")"
+SIGN_IDENTITY="${RMCP_MEMEX_SIGN_IDENTITY:-}"
 
-# Build release binary
-cargo build --release
+if [[ -z "$SIGN_IDENTITY" && -f "$HOME/.keys/signing-identity.txt" ]]; then
+  SIGN_IDENTITY="$(head -n 1 "$HOME/.keys/signing-identity.txt")"
+fi
 
-# Create app bundle
-APP_DIR="$HOME/.mcp-servers/MCPServer.app"
-mkdir -p "$APP_DIR/Contents/MacOS"
-mkdir -p "$APP_DIR/Contents/Resources"
+cd "$REPO_ROOT"
 
-# Copy binary (crate binary name: mcp_memex)
-cp target/release/mcp_memex "$APP_DIR/Contents/MacOS/"
+echo "Building ${BINARY_NAME} for macOS..."
+cargo build --locked --release --bin "$BINARY_NAME"
 
-# Create Info.plist
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+cp "target/release/$BINARY_NAME" "$APP_DIR/Contents/MacOS/$BINARY_NAME"
+chmod +x "$APP_DIR/Contents/MacOS/$BINARY_NAME"
+
 cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -22,29 +29,39 @@ cat > "$APP_DIR/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.maciejgad.mcp-rust</string>
+    <string>space.div0.rmcp-memex</string>
     <key>CFBundleExecutable</key>
-    <string>mcp_memex</string>
+    <string>${BINARY_NAME}</string>
     <key>CFBundleName</key>
-    <string>MCP Rust Server</string>
+    <string>rmcp-memex</string>
+    <key>CFBundleDisplayName</key>
+    <string>rmcp-memex</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>${VERSION}</string>
     <key>LSUIElement</key>
     <true/>
     <key>LSBackgroundOnly</key>
     <true/>
     <key>NSHighResolutionCapable</key>
-    <false/>
+    <true/>
     <key>NSSupportsAutomaticTermination</key>
     <false/>
 </dict>
 </plist>
 EOF
 
-# Sign the app
-codesign --force --deep --sign - "$APP_DIR"
+if command -v codesign >/dev/null 2>&1; then
+  if [[ -n "$SIGN_IDENTITY" ]]; then
+    codesign --force --deep --timestamp --options runtime --sign "$SIGN_IDENTITY" "$APP_DIR"
+  else
+    echo "warning: no signing identity configured; falling back to ad-hoc signing" >&2
+    codesign --force --deep --sign - "$APP_DIR"
+  fi
+fi
 
 echo "Done! App bundle created at: $APP_DIR"
 echo ""
 echo "To use with an MCP host, add to config:"
-echo '  "command": "'"$APP_DIR/Contents/MacOS/mcp_memex"'"'
+echo '  "command": "'"$APP_DIR/Contents/MacOS/$BINARY_NAME"'"'

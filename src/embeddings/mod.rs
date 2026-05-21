@@ -31,32 +31,6 @@ use std::time::Duration;
 pub const DEFAULT_REQUIRED_DIMENSION: usize = 2560;
 pub const DEFAULT_OLLAMA_EMBEDDING_MODEL: &str = "qwen3-embedding:4b";
 
-pub fn infer_embedding_dimension(model: &str) -> Option<usize> {
-    let model = model.to_ascii_lowercase();
-
-    if model.contains("qwen3-vl-embedding") {
-        Some(2048)
-    } else if model.contains("qwen3-embedding") {
-        if model.contains("0.6b") {
-            Some(1024)
-        } else if model.contains("4b") {
-            Some(2560)
-        } else if model.contains("8b") {
-            Some(4096)
-        } else {
-            None
-        }
-    } else if model.contains("bge-m3") || model.contains("mxbai-embed") {
-        Some(1024)
-    } else if model.contains("nomic-embed") {
-        Some(768)
-    } else if model.contains("all-minilm") {
-        Some(384)
-    } else {
-        None
-    }
-}
-
 // =============================================================================
 // REQUEST/RESPONSE TYPES (OpenAI-compatible)
 // =============================================================================
@@ -364,8 +338,7 @@ impl MlxConfig {
     /// Convert legacy config to new EmbeddingConfig
     pub fn to_embedding_config(&self) -> EmbeddingConfig {
         let reranker_port = self.local_port + self.reranker_port_offset;
-        let required_dimension =
-            infer_embedding_dimension(&self.embedder_model).unwrap_or(DEFAULT_REQUIRED_DIMENSION);
+        let required_dimension = DEFAULT_REQUIRED_DIMENSION;
 
         EmbeddingConfig {
             required_dimension,
@@ -408,6 +381,7 @@ impl MlxConfig {
 // =============================================================================
 
 /// Universal embedding client with provider cascade
+#[derive(Clone)]
 pub struct EmbeddingClient {
     client: Client,
     embedder_url: String,
@@ -555,6 +529,19 @@ impl EmbeddingClient {
     /// Get required dimension
     pub fn required_dimension(&self) -> usize {
         self.required_dimension
+    }
+
+    /// Get the current runtime batch limits used for embedding requests.
+    pub fn batch_limits(&self) -> (usize, usize) {
+        (self.max_batch_chars, self.max_batch_items)
+    }
+
+    /// Clone the client while overriding the runtime batch limits.
+    pub fn clone_with_batch_limits(&self, max_chars: usize, max_items: usize) -> Self {
+        let mut cloned = self.clone();
+        cloned.max_batch_chars = max_chars.max(1);
+        cloned.max_batch_items = max_items.max(1);
+        cloned
     }
 
     /// Create a stub client for tests that don't need real embeddings.
@@ -1381,23 +1368,6 @@ mod tests {
         assert_eq!(config.max_batch_items, 64); // 4x more items per batch
         assert!(!config.providers.is_empty());
         assert_eq!(config.providers[0].model, DEFAULT_OLLAMA_EMBEDDING_MODEL);
-    }
-
-    #[test]
-    fn test_infer_embedding_dimension() {
-        assert_eq!(
-            infer_embedding_dimension("qwen3-embedding:0.6b"),
-            Some(1024)
-        );
-        assert_eq!(infer_embedding_dimension("qwen3-embedding:4b"), Some(2560));
-        assert_eq!(infer_embedding_dimension("qwen3-embedding:8b"), Some(4096));
-        assert_eq!(
-            infer_embedding_dimension("MedAIBase/Qwen3-VL-Embedding:2b-q8_0"),
-            Some(2048)
-        );
-        assert_eq!(infer_embedding_dimension("nomic-embed-text"), Some(768));
-        assert_eq!(infer_embedding_dimension("qwen3-embedding"), None);
-        assert_eq!(infer_embedding_dimension("unknown-model"), None);
     }
 
     #[tokio::test]

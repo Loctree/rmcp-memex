@@ -5,8 +5,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
     ServerConfig,
-    mcp_protocol::{McpCore, McpTransport, jsonrpc_success},
-    mcp_runtime::{build_mcp_core, dispatch_mcp_payload, dispatch_mcp_request},
+    mcp_core::{
+        McpCore, McpDispatch, McpTransport, dispatch_mcp_jsonrpc_request, dispatch_mcp_payload,
+    },
+    mcp_runtime::build_mcp_core,
 };
 
 pub struct MCPServer {
@@ -51,10 +53,22 @@ impl MCPServer {
         self.run_stdio().await
     }
 
-    pub async fn dispatch_request(&self, request: Value) -> Value {
-        dispatch_mcp_request(self.mcp_core.as_ref(), request, McpTransport::Stdio)
-            .await
-            .unwrap_or_else(|| jsonrpc_success(&Value::Null, Value::Null))
+    /// Dispatch a parsed JSON-RPC request through the shared stdio MCP core.
+    ///
+    /// Notifications return `None` so library callers see the same semantics as
+    /// the real stdio transport instead of a synthetic success response.
+    pub async fn dispatch_request(&self, request: Value) -> Option<Value> {
+        self.dispatch_jsonrpc_request(request).await.into_option()
+    }
+
+    /// Dispatch a parsed JSON-RPC request and preserve notification semantics.
+    pub async fn dispatch_jsonrpc_request(&self, request: Value) -> McpDispatch {
+        dispatch_mcp_jsonrpc_request(self.mcp_core.as_ref(), request, McpTransport::Stdio).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_mcp_core(mcp_core: Arc<McpCore>) -> Self {
+        Self { mcp_core }
     }
 }
 

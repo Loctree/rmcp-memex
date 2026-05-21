@@ -9,12 +9,13 @@
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tantivy::{
     Index, IndexReader, TantivyDocument,
     collector::TopDocs,
-    query::QueryParser,
+    query::{AllQuery, QueryParser},
     schema::{
         Field, IndexRecordOption, STORED, STRING, Schema, TextFieldIndexing, TextOptions, Value,
     },
@@ -442,11 +443,6 @@ impl BM25Index {
         Ok(1)
     }
 
-    #[deprecated(note = "use delete_namespace_term")]
-    pub async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
-        self.delete_namespace_term(namespace).await
-    }
-
     /// Escape special query characters
     fn escape_query(query: &str) -> String {
         // Tantivy query syntax special characters
@@ -469,6 +465,40 @@ impl BM25Index {
     pub fn doc_count(&self) -> u64 {
         let searcher = self.reader.searcher();
         searcher.num_docs()
+    }
+
+    /// Return the stored `(namespace, id)` keys currently present in the index.
+    ///
+    /// This is intentionally an operator/debug surface used by recovery checks,
+    /// not a hot-path query primitive.
+    pub fn document_keys(&self, namespace: Option<&str>) -> Result<HashSet<(String, String)>> {
+        let searcher = self.reader.searcher();
+        let total = usize::try_from(searcher.num_docs()).unwrap_or(usize::MAX);
+        if total == 0 {
+            return Ok(HashSet::new());
+        }
+
+        let all_query = AllQuery;
+        let top_docs = searcher.search(&all_query, &TopDocs::with_limit(total))?;
+        let mut keys = HashSet::with_capacity(total);
+
+        for (_score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            let id = doc
+                .get_first(self.id_field)
+                .and_then(|value| Value::as_str(&value).map(|value| value.to_string()))
+                .ok_or_else(|| anyhow!("Document missing ID field"))?;
+            let doc_namespace = doc
+                .get_first(self.namespace_field)
+                .and_then(|value| Value::as_str(&value).map(|value| value.to_string()))
+                .ok_or_else(|| anyhow!("Document missing namespace field"))?;
+
+            if namespace.is_none_or(|expected| expected == doc_namespace) {
+                keys.insert((doc_namespace, id));
+            }
+        }
+
+        Ok(keys)
     }
 }
 

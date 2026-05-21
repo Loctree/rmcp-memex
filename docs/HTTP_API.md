@@ -4,158 +4,136 @@ Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
 
 ## Overview
 
-The HTTP server provides REST API access to memex for agents and tools that cannot use MCP directly.
-It also serves an embedded HTML dashboard for visual browsing of memories.
+`rmcp-memex` exposes the same HTTP surface in two ergonomic entrypoints:
+`rmcp-memex dashboard` for local browsing on port `8987`, and `rmcp-memex sse`
+for the agent-facing daemon on port `8997`. In both cases, the dashboard at `/`
+and new HTTP clients should start with `GET /api/discovery`.
 
-**Default port:** `6666`
+`/api/discovery` is the canonical read surface because it bundles:
 
-## Architecture
+- daemon readiness (`status`, `hint`)
+- runtime identity (`version`, `db_path`, `embedding_provider`)
+- current dataset summary (`total_documents`, `namespace_count`)
+- namespace inventory (`namespaces[]` with `id`, `count`, `last_indexed_at`)
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                 rmcp-memex HTTP Server                  │
-│                    (port 6666)                          │
-├─────────────────────────────────────────────────────────┤
-│  LanceDB (vector storage)  │  RAM cache (namespaces)   │
-│       [disk-based]         │    [background refresh]    │
-└─────────────────────────────────────────────────────────┘
-```
+The older read endpoints `/api/status`, `/api/overview`, and `/api/namespaces`
+still exist, but they are compatibility slices now, not the first stop for new
+clients.
 
-### Memory Management
-
-- **LanceDB** stores vectors on disk (~25GB for large DBs)
-- **Namespace cache** is loaded into RAM at startup (background task)
-- **Search index** kept in RAM for fast queries
-- HTTP API is **~100x faster** than CLI for repeated queries
-
-## Starting the Server
+## Start The Server
 
 ```bash
-# Via launchd (recommended - auto-restart)
-launchctl load ~/Library/LaunchAgents/ai.libraxis.rmcp-memex.plist
+# Standard dual transport mode (stdio + HTTP)
+rmcp-memex serve --http-port 8997
 
-# Direct (for debugging)
-rmcp-memex serve --http-port 6666
+# HTTP-only daemon mode
+rmcp-memex sse
 
-# Using Makefile
-make start    # Start via launchd
-make stop     # Stop service
-make restart  # Restart service
-make status   # Check if running
-make health   # Quick health check
+# Protect mutating routes
+rmcp-memex serve --http-port 8997 --auth-token "$MEMEX_AUTH_TOKEN"
+
+# Open the local dashboard in a browser
+rmcp-memex dashboard
 ```
 
-## Dashboard
+Default dashboard URL:
 
-Open in browser: `http://localhost:6666/`
-
-The dashboard provides:
-- Visual namespace browser (left sidebar)
-- Document list with text preview
-- Search across all namespaces
-- Expand/drill-up for onion slices
-
-### If Dashboard Shows "Loading namespaces..."
-
-This means the namespace cache is still being built (normal for large DBs) or the database needs optimization:
-
-```bash
-# Check status
-curl http://localhost:6666/api/status
-
-# If hint says "run optimize":
-rmcp-memex optimize
-# or
-make optimize
+```text
+http://localhost:8987/
 ```
 
-## API Endpoints
+## Canonical Discovery
 
-### Health & Status
+### `GET /api/discovery`
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Basic health check |
-| `/api/status` | GET | Cache status and hints |
-| `/api/overview` | GET | Database stats |
+Use this first. It is the single source of truth for dashboards, health probes,
+and lightweight HTTP clients.
 
-**GET /health**
-```json
-{"status":"ok","db_path":"/path/to/lancedb","embedding_provider":"ollama-dragon"}
-```
+Example response:
 
-**GET /api/status**
 ```json
 {
-  "cache_ready": true,
-  "namespace_count": 5,
-  "hint": "OK"
-}
-```
-If `cache_ready` is false, run `rmcp-memex optimize`.
-
-**GET /api/overview**
-```json
-{
-  "namespace_count": 0,
+  "status": "ok",
+  "hint": "OK",
+  "version": "0.5.1",
+  "db_path": "/Users/you/.rmcp-servers/rmcp-memex/lancedb",
+  "embedding_provider": "ollama-local",
   "total_documents": 27455,
-  "db_path": "/Users/you/.ai-memories/lancedb",
-  "embedding_provider": "ollama-dragon"
-}
-```
-
-### Browse & Namespaces
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/namespaces` | GET | List all namespaces with counts |
-| `/api/browse/{ns}` | GET | Browse documents in namespace |
-| `/api/browse` | GET | Browse all documents |
-
-**GET /api/namespaces**
-```json
-{
+  "namespace_count": 2,
   "namespaces": [
-    {"name": "kodowanie", "count": 15000},
-    {"name": "memories", "count": 5000}
-  ],
-  "total": 2
-}
-```
-
-**GET /api/browse/kodowanie?limit=50**
-```json
-{
-  "documents": [
     {
-      "id": "doc-123",
-      "namespace": "kodowanie",
-      "text": "Document content...",
-      "layer": "L0_Atom",
-      "can_expand": true,
-      "can_drill_up": false
+      "id": "kodowanie",
+      "count": 15000,
+      "last_indexed_at": "2026-03-15T10:11:12Z"
+    },
+    {
+      "id": "memories",
+      "count": 12455,
+      "last_indexed_at": null
     }
   ]
 }
 ```
 
-### Search
+### Discovery Status Semantics
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/search` | POST | Search with namespace filter |
-| `/cross-search` | GET | Search across all namespaces |
-| `/sse/search` | GET | Streaming search (SSE) |
-| `/sse/cross-search` | GET | Streaming cross-search |
+- `status = "ok"` means the namespace cache is ready and `namespaces[]` is fully populated.
+- `status = "loading"` means the daemon is up, but the background namespace cache is still warming.
+- `hint` is the user-facing guidance string. When cache warmup drags, it tells clients to run `rmcp-memex optimize`.
 
-**POST /search**
-```bash
-curl -X POST http://localhost:6666/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "rust async", "namespace": "kodowanie", "limit": 10}'
+## Read Surfaces
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/` | GET | Embedded dashboard |
+| `/health` | GET | Minimal liveness check |
+| `/api/discovery` | GET | Canonical readiness + namespace summary |
+| `/api/status` | GET | Compatibility slice of cache readiness |
+| `/api/overview` | GET | Compatibility slice of DB totals |
+| `/api/namespaces` | GET | Compatibility slice of namespace counts |
+| `/api/browse` | GET | Browse all documents |
+| `/api/browse/{ns}` | GET | Browse one namespace |
+| `/get/{ns}/{id}` | GET | Fetch one document |
+| `/expand/{ns}/{id}` | GET | Expand an onion slice to children |
+| `/parent/{ns}/{id}` | GET | Fetch the parent slice |
+| `/search` | POST | Search with optional namespace, mode, project, layer, and deep filters (`k` alias supported) |
+| `/cross-search` | GET | Search across namespaces with `mode=vector|bm25|hybrid` |
+| `/sse/search` | GET | Streaming single-namespace search |
+| `/sse/cross-search` | GET | Streaming cross-namespace search |
+| `/sse/namespaces` | GET | Streaming namespace summary |
+
+### `GET /health`
+
+Minimal health shape:
+
+```json
+{
+  "status": "ok",
+  "db_path": "/path/to/lancedb",
+  "embedding_provider": "ollama-local"
+}
 ```
 
-Response:
+### Compatibility Slices
+
+These remain useful for legacy clients, but new code should prefer `GET /api/discovery`.
+
+- `GET /api/status`
+- `GET /api/overview`
+- `GET /api/namespaces`
+
+## Search Examples
+
+### `POST /search`
+
+```bash
+curl -X POST http://localhost:8997/search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"rust async","namespace":"kodowanie","k":10,"mode":"hybrid","project":"Vista","deep":true}'
+```
+
+Representative response:
+
 ```json
 {
   "results": [
@@ -172,25 +150,39 @@ Response:
 }
 ```
 
-**GET /cross-search**
+### `GET /cross-search`
+
 ```bash
-curl "http://localhost:6666/cross-search?q=rust%20async&limit=5&total_limit=20"
+curl "http://localhost:8997/cross-search?q=rust%20async&limit=5&total_limit=20&mode=hybrid"
 ```
 
-### Document Operations
+## Mutating Surfaces
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/upsert` | POST | Insert/update document |
-| `/index` | POST | Index text with full pipeline |
-| `/expand/{ns}/{id}` | GET | Expand onion slice (children) |
-| `/parent/{ns}/{id}` | GET | Get parent slice |
-| `/ns/{namespace}` | DELETE | Purge entire namespace |
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/upsert` | POST | Upsert one chunk directly |
+| `/index` | POST | Index content through the chunking pipeline |
+| `/delete/{ns}/{id}` | POST | Delete one document |
+| `/ns/{namespace}` | DELETE | Purge a namespace |
+| `/refresh` | POST | Refresh cached namespace inventory |
+| `/sse/optimize` | POST | Stream optimize progress |
 
-**POST /upsert**
+### Auth Model
+
+Read-only routes stay public. Mutating routes require:
+
+```text
+Authorization: Bearer <token>
+```
+
+when the daemon is started with `--auth-token` or `MEMEX_AUTH_TOKEN`.
+
+### `POST /upsert`
+
 ```bash
-curl -X POST http://localhost:6666/upsert \
+curl -X POST http://localhost:8997/upsert \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MEMEX_AUTH_TOKEN" \
   -d '{
     "namespace": "memories",
     "id": "memory-001",
@@ -199,81 +191,56 @@ curl -X POST http://localhost:6666/upsert \
   }'
 ```
 
-Response:
-```json
-{"status": "ok", "id": "memory-001", "namespace": "memories"}
-```
+### `POST /index`
 
-**POST /index** (full pipeline with chunking)
 ```bash
-curl -X POST http://localhost:6666/index \
+curl -X POST http://localhost:8997/index \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $MEMEX_AUTH_TOKEN" \
   -d '{
     "namespace": "docs",
-    "text": "Long document text to be chunked...",
+    "content": "Long document text to be chunked...",
     "slice_mode": "onion",
-    "dedup": true
+    "metadata": {"source": "manual"}
   }'
 ```
 
-## Using with Claude Code Hooks
+## Dashboard Notes
 
-The HTTP API is designed for Claude Code hooks (fast, non-blocking):
+The embedded dashboard now boots from `/api/discovery`, then drills into:
+
+- `/api/browse` and `/api/browse/{ns}` for document lists
+- `/search` for targeted queries
+
+If the dashboard shows a loading state for a long time, inspect discovery directly:
 
 ```bash
-# In your hook script:
-MEMEX_URL="${MEMEX_URL:-http://localhost:6666}"
-
-# Health check (1s timeout)
-curl -s --max-time 1 "$MEMEX_URL/health" >/dev/null 2>&1 || exit 0
-
-# Search (2s timeout)
-curl -s --max-time 2 "$MEMEX_URL/cross-search?q=your+query&limit=3"
-
-# Upsert (5s timeout for writes)
-curl -s --max-time 5 -X POST "$MEMEX_URL/upsert" \
-  -H "Content-Type: application/json" \
-  -d '{"namespace":"ns","id":"id","content":"text"}'
+curl http://localhost:8987/api/discovery
 ```
 
-## Performance Notes
+If discovery stays in `status = "loading"`, run:
 
-| Operation | CLI | HTTP API |
-|-----------|-----|----------|
-| Search | ~5000ms | ~50ms |
-| Upsert | ~3000ms | ~100ms |
-| Health check | N/A | ~5ms |
-
-The difference is because CLI loads the full LanceDB index on each invocation,
-while HTTP server keeps it in RAM.
+```bash
+rmcp-memex optimize
+```
 
 ## Troubleshooting
 
-### "Too many open files"
+### Dashboard Stuck In Loading
 
-Database is fragmented. Run:
-```bash
-rmcp-memex optimize
-# or
-make optimize
-```
+1. Check liveness: `curl http://localhost:8997/health`
+2. Check discovery: `curl http://localhost:8987/api/discovery`
+3. If `status` remains `"loading"`, run `rmcp-memex optimize`
 
-### Dashboard shows blank/loading forever
+### Port Conflict
 
-1. Check server is running: `curl http://localhost:6666/health`
-2. Check cache status: `curl http://localhost:6666/api/status`
-3. If `cache_ready: false` persists, run `rmcp-memex optimize`
+Change the port in your config and restart:
 
-### Port conflict
-
-Change port in config and plist:
-```bash
+```toml
 # ~/.rmcp-servers/rmcp-memex/config.toml
-http_port = 6666
-
-# ~/Library/LaunchAgents/ai.libraxis.rmcp-memex.plist
-<string>--http-port</string>
-<string>6666</string>
+http_port = 8997
 ```
 
-Then restart: `make restart`
+### Network Exposure
+
+If you bind the daemon beyond localhost, set `--auth-token` and explicit CORS origins.

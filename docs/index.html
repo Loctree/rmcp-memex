@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rmcp-memex | Shared memory for MCP agents</title>
+  <meta
+    name="description"
+    content="rmcp-memex is a Rust MCP memory kernel with RAG, hybrid search, and HTTP/SSE transport for multi-agent workflows."
+  >
+  <meta name="theme-color" content="#101523">
+  <!-- nosemgrep: html.security.audit.missing-integrity.missing-integrity -->
+  <link rel="canonical" href="https://vetcoders.github.io/rmcp-memex/">
+  <meta property="og:title" content="rmcp-memex">
+  <meta
+    property="og:description"
+    content="Shared memory for MCP agents with one canonical transport surface, release automation, and launch-ready docs."
+  >
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://vetcoders.github.io/rmcp-memex/">
+  <meta property="og:image" content="https://vetcoders.github.io/rmcp-memex/assets/social-card.svg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="rmcp-memex">
+  <meta
+    name="twitter:description"
+    content="A Rust MCP memory kernel with RAG, hybrid search, and HTTP/SSE transport for multi-agent workflows."
+  >
+  <meta name="twitter:image" content="https://vetcoders.github.io/rmcp-memex/assets/social-card.svg">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <a class="brand" href="#top">rmcp-memex</a>
+      <nav class="nav">
+        <a href="#install">Install</a>
+        <a href="#transports">Transports</a>
+        <a href="#release">Release</a>
+        <a href="https://github.com/VetCoders/rmcp-memex">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Rust MCP kernel for shared agent memory</p>
+          <h1>One canonical memory surface for local MCP and multi-agent daemon mode.</h1>
+          <p class="lede">
+            rmcp-memex combines RAG, hybrid vector plus BM25 search, namespace isolation,
+            and HTTP/SSE transport so multiple agents can use the same memory pool without
+            fighting over LanceDB locks.
+          </p>
+          <div class="cta-row">
+            <a class="button button-primary" href="https://github.com/VetCoders/rmcp-memex/releases">Download Releases</a>
+            <a class="button button-secondary" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/RELEASE.md">Open Release Runbook</a>
+          </div>
+          <div class="command-card">
+            <span class="command-label">Quick install</span>
+            <code>curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh</code>
+          </div>
+        </div>
+
+        <aside class="hero-panel">
+          <div class="stat">
+            <span class="stat-label">Primary binary</span>
+            <strong>rmcp-memex</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Transport modes</span>
+            <strong>stdio + HTTP/SSE</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Search model</span>
+            <strong>Vector + BM25 hybrid</strong>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Release path</span>
+            <strong>GitHub Releases + checksums</strong>
+          </div>
+        </aside>
+      </section>
+
+      <section class="grid-section" id="transports">
+        <article class="card">
+          <h2>Transport parity without drift</h2>
+          <p>
+            The stdio MCP server and HTTP/SSE daemon now route through the same core
+            dispatch surface. Release prep includes parity coverage so transport bugs
+            fail before they ship.
+          </p>
+        </article>
+        <article class="card">
+          <h2>Built for real multi-agent use</h2>
+          <p>
+            Use stdio for local MCP hosts or switch to HTTP/SSE when several agents
+            need one shared memory backend. The daemon mode removes the lock-contention
+            pain of direct LanceDB access, and HTTP clients can bootstrap from one
+            canonical <code>/api/discovery</code> surface.
+          </p>
+        </article>
+        <article class="card">
+          <h2>Release-ready install path</h2>
+          <p>
+            GitHub Releases ship platform tarballs, SHA256 checksums, and a one-line
+            installer that keeps the canonical <code>rmcp-memex</code> binary front and
+            center while preserving a legacy <code>rmcp_memex</code> symlink for older
+            automation.
+          </p>
+        </article>
+      </section>
+
+      <section class="feature-band" id="install">
+        <div>
+          <p class="eyebrow">Install and run</p>
+          <h2>The shortest path from stranger to first query.</h2>
+        </div>
+        <div class="code-stack">
+          <pre><code>curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+rmcp-memex serve
+rmcp-memex serve --http-port 6660 --http-only</code></pre>
+        </div>
+      </section>
+
+      <section class="docs-grid">
+        <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/README.md">
+          <span class="doc-kicker">Start here</span>
+          <h3>README</h3>
+          <p>Product overview, library usage, and MCP tool surface.</p>
+        </a>
+        <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/02_configuration.md">
+          <span class="doc-kicker">Configuration</span>
+          <h3>Provider and storage setup</h3>
+          <p>Embedding providers, storage paths, and deployment-friendly defaults.</p>
+        </a>
+        <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/HTTP_API.md">
+          <span class="doc-kicker">HTTP/SSE</span>
+          <h3>Daemon reference</h3>
+          <p>Start with <code>/api/discovery</code>, then drill into browse, search, and write routes.</p>
+        </a>
+        <a class="doc-card" href="https://github.com/VetCoders/rmcp-memex/blob/main/docs/RELEASE.md">
+          <span class="doc-kicker">Release ops</span>
+          <h3>Runbook</h3>
+          <p>Preflight checks, tagging, artifact verification, and launch follow-through.</p>
+        </a>
+      </section>
+
+      <section class="release-panel" id="release">
+        <div>
+          <p class="eyebrow">Release contract</p>
+          <h2>What shipping now means.</h2>
+        </div>
+        <ul class="checklist">
+          <li>Canonical binary naming across Cargo, local signing pipeline, and installer</li>
+          <li>Locally built and signed release artifacts uploaded to GitHub Releases</li>
+          <li>Static launch page source for GitHub Pages with zero client-side JS dependency</li>
+          <li>Library-only and package smoke checks in CI, not just the default feature build</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>Vibecrafted with AI Agents by VetCoders.</p>
+      <div class="footer-links">
+        <a href="https://github.com/VetCoders/rmcp-memex/releases">Releases</a>
+        <a href="https://github.com/VetCoders/rmcp-memex/security">Security</a>
+        <a href="https://github.com/VetCoders/rmcp-memex">Source</a>
+      </div>
+    </footer>
+  </div>
+</body>
+</html>

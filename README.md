@@ -7,7 +7,34 @@ It exposes two explicit transport modes from a single canonical surface:
 1.  **`stdio` (Standard MCP)**: Native MCP integration for local agents (e.g., Claude Desktop).
 2.  **`HTTP/SSE` (Multi-Agent Daemon)**: A central daemon mode allowing concurrent AI agents to access the same memory pool over the network, resolving LanceDB's exclusive lock constraints.
 
-> **Note on Aliases:** The published package and primary entrypoint is `rmcp-memex`. For operational convenience, it installs the aliases `rust-memex`, `rmmx`, and `rmemex`. These are strictly convenience links to the identical `rmcp-memex` kernel, not separate products.
+> **Binary Name:** `rmcp-memex` is the only supported binary name. The GitHub installer also creates `rmcp_memex` as a legacy compatibility symlink for older scripts.
+>
+> **MCP Contract:** The current MCP surface is intentionally tools-only. `initialize` advertises `tools`, while `resources/*` is not implemented yet.
+
+## Release Surface
+
+- Quick install: `curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh`
+- Prebuilt binary bundles: [GitHub Releases](https://github.com/VetCoders/rmcp-memex/releases) uploaded from locally built and signed artifacts
+- Release runbook: [docs/RELEASE.md](docs/RELEASE.md)
+- Configuration guide: [docs/02_configuration.md](docs/02_configuration.md)
+- HTTP/SSE reference: [docs/HTTP_API.md](docs/HTTP_API.md)
+- Static launch page source: `docs/index.html` published by `.github/workflows/pages.yml`
+
+## Quick Start
+
+```bash
+# Install from the latest GitHub Release
+curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+
+# Start the MCP server
+rmcp-memex serve
+
+# Open the local dashboard in your browser
+rmcp-memex dashboard
+
+# Or run the multi-agent HTTP/SSE daemon
+rmcp-memex sse
+```
 
 ## Overview
 
@@ -79,10 +106,10 @@ As an MCP (Model Context Protocol) server, `rmcp-memex` provides:
 
 ```toml
 # Full library with CLI
-rmcp-memex = "0.4"
+rmcp-memex = "0.5"
 
 # Library only (no CLI dependencies)
-rmcp-memex = { version = "0.4", default-features = false }
+rmcp-memex = { version = "0.5", default-features = false }
 ```
 
 ### Basic Usage
@@ -190,24 +217,26 @@ let results = engine.search_with_mode("semantic concept", 10, SearchMode::Vector
 let results = engine.search_with_mode("best of both", 10, SearchMode::Hybrid).await?;
 ```
 
-### Agent Tools API
+### MCP Contract and In-Process Helpers
 
-For MCP-compatible AI agents:
+Use `tool_definitions()` when you need the exact MCP tool metadata exposed by
+the stdio and HTTP/SSE transports. The helper functions below are for in-process
+Rust callers; they are a local convenience layer, not a second public MCP
+contract. Their names intentionally differ from MCP tool names so the two
+surfaces do not drift together by accident.
 
 ```rust
-use rmcp_memex::{MemexEngine, tool_definitions, memory_store, memory_search};
+use rmcp_memex::{MemexEngine, search_documents, store_document, tool_definitions};
 use serde_json::json;
 
 let engine = MemexEngine::for_app("agent", "memory").await?;
 
-// Get tool definitions for MCP registration
+// Canonical MCP tool surface exposed by rmcp-memex transports
 let tools = tool_definitions();
-for tool in &tools {
-    println!("Tool: {} - {}", tool.name, tool.description);
-}
+assert!(tools.iter().any(|tool| tool.name == "memory_upsert"));
 
-// Use tool functions
-let result = memory_store(
+// Local Rust helpers for in-process callers
+let result = store_document(
     &engine,
     "mem-1".to_string(),
     "Important information to remember".to_string(),
@@ -215,7 +244,7 @@ let result = memory_store(
 ).await?;
 assert!(result.success);
 
-let results = memory_search(&engine, "important".to_string(), 5, None).await?;
+let results = search_documents(&engine, "important".to_string(), 5, None).await?;
 ```
 
 ### Feature Flags
@@ -471,7 +500,10 @@ MLX_MAX_BATCH_ITEMS=32
 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
 ```
 
-**From source:**
+Prebuilt GitHub Release bundles are the canonical install path and avoid compiling
+the full LanceDB-heavy Rust dependency graph on the target machine.
+
+**From source (development only):**
 ```bash
 cargo install --path .
 ```
@@ -479,21 +511,22 @@ cargo install --path .
 ### Running
 
 ```bash
-# Default mode (all features)
+# Canonical MCP surface
 rmcp-memex serve
-
-# Memory-only mode (no filesystem access)
-rmcp-memex serve --mode memory
 
 # With security enabled
 rmcp-memex serve --security-enabled
 
 # With HTTP/SSE server for multi-agent access
-rmcp-memex serve --http-port 6660
+rmcp-memex serve --http-port 8997
 
 # HTTP-only daemon mode (no MCP stdio)
-rmcp-memex serve --http-port 6660 --http-only
+rmcp-memex serve --http-port 8997 --http-only
 ```
+
+`rmcp-memex` always exposes one canonical MCP tool surface. To narrow runtime
+access, use `--allowed-paths`, HTTP auth, or namespace security rather than a
+separate "memory/full" mode switch.
 
 ## HTTP/SSE Server (Multi-Agent Access)
 
@@ -507,7 +540,7 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 │                     rmcp-memex daemon                        │
 │  ┌─────────────────┐    ┌─────────────────┐                 │
 │  │   MCP Server    │    │   HTTP/SSE      │                 │
-│  │   (stdio)       │    │   (port 6660)   │                 │
+│  │   (stdio)       │    │   (port 8997)   │                 │
 │  └────────┬────────┘    └────────┬────────┘                 │
 │           │                      │                          │
 │           └──────────┬───────────┘                          │
@@ -531,8 +564,8 @@ The HTTP/SSE server solves this by providing a central access point for multiple
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check (status, db_path, embedding_provider) |
-| `/search` | POST | Vector search with optional layer filter |
-| `/sse/search` | GET | SSE streaming search (real-time results) |
+| `/search` | POST | Search with optional `project`, `layer`, and `deep` filters (`k` alias supported) |
+| `/sse/search` | GET | SSE streaming search with optional `project`, `layer`, and `deep` filters |
 | `/upsert` | POST | Add/update document |
 | `/index` | POST | Full pipeline indexing with onion slices |
 | `/expand/{ns}/{id}` | GET | Expand onion slice (get children) |
@@ -554,7 +587,7 @@ Configure in `~/.claude.json`:
   "mcpServers": {
     "rmcp-memex": {
       "type": "sse",
-      "url": "http://localhost:6660/sse/"
+      "url": "http://localhost:8997/sse/"
     }
   }
 }
@@ -563,24 +596,27 @@ Configure in `~/.claude.json`:
 ### Usage Examples
 
 ```bash
+# Open the local dashboard
+rmcp-memex dashboard --db-path ~/.ai-memories/lancedb
+
 # Start daemon
-rmcp-memex serve --http-port 6660 --http-only --db-path ~/.ai-memories/lancedb &
+rmcp-memex sse --db-path ~/.ai-memories/lancedb &
 
 # Health check
-curl http://localhost:6660/health
+curl http://localhost:8997/health
 
 # Store document
-curl -X POST http://localhost:6660/upsert \
+curl -X POST http://localhost:8997/upsert \
   -H "Content-Type: application/json" \
   -d '{"namespace": "agent1", "id": "mem1", "content": "Important context..."}'
 
 # Search
-curl -X POST http://localhost:6660/search \
+curl -X POST http://localhost:8997/search \
   -H "Content-Type: application/json" \
-  -d '{"query": "context", "namespace": "agent1", "limit": 10}'
+  -d '{"query": "context", "namespace": "agent1", "k": 10, "project": "Vista", "deep": true}'
 
 # SSE streaming search
-curl -N "http://localhost:6660/sse/search?query=context&namespace=agent1&limit=5"
+curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5&project=Vista&layer=1"
 ```
 
 ### Multi-Host Database Paths
@@ -602,9 +638,8 @@ The TUI wizard auto-detects hostname and offers:
 ### Configuration (TOML)
 
 ```toml
-# ~/.rmcp-servers/config/rmcp-memex.toml
+# ~/.rmcp-servers/rmcp-memex/config.toml
 
-mode = "full"
 db_path = "~/.rmcp-servers/rmcp-memex/lancedb"
 cache_mb = 4096
 log_level = "info"

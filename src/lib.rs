@@ -1,8 +1,10 @@
+pub mod auth;
 pub mod common;
 pub mod embeddings;
 pub mod engine;
 pub mod handlers;
 pub mod http;
+pub mod mcp_core;
 pub mod mcp_protocol;
 mod mcp_runtime;
 pub mod path_utils;
@@ -26,17 +28,21 @@ use anyhow::Result;
 use tracing::Level;
 
 // Re-export core types for library consumers
+pub use auth::{
+    AuthDenial, AuthManager, AuthResult, Scope, TokenEntry, TokenStoreFile, TokenStoreV2,
+};
 pub use embeddings::{
     DEFAULT_REQUIRED_DIMENSION, DimensionAdapter, EmbeddingClient, EmbeddingConfig, MLXBridge,
     MlxConfig, MlxMergeOptions, ProviderConfig, RerankerConfig, TokenConfig,
-    cross_dimension_search_adapt, estimate_tokens, infer_embedding_dimension, safe_chunk_size,
-    truncate_to_token_limit, validate_batch_tokens, validate_chunk_tokens,
+    cross_dimension_search_adapt, estimate_tokens, safe_chunk_size, truncate_to_token_limit,
+    validate_batch_tokens, validate_chunk_tokens,
 };
 pub use handlers::{MCPServer, create_server};
-pub use mcp_protocol::{
+pub use mcp_core::{
     McpCore, McpDispatch, McpTransport, shared_initialize_result, shared_tools_list_result,
 };
-pub use mcp_runtime::{build_mcp_core, dispatch_mcp_payload, dispatch_mcp_request};
+pub use mcp_core::{dispatch_mcp_jsonrpc_request, dispatch_mcp_payload, dispatch_mcp_request};
+pub use mcp_runtime::build_mcp_core;
 pub use preprocessing::{
     IntegrityRecommendation, Message, PreprocessingConfig, PreprocessingStats, Preprocessor,
     TextIntegrityMetrics,
@@ -48,6 +54,9 @@ pub use query::{
 pub use rag::{
     Chunk as PipelineChunk,
     ContextPrefixConfig,
+    CrossStoreRecoveryBatchReport,
+    CrossStoreRecoveryReport,
+    CrossStoreRecoveryState,
     EmbeddedChunk,
     EnrichedChunk,
     FileContent,
@@ -55,7 +64,10 @@ pub use rag::{
     OnionSlice,
     OnionSliceConfig,
     PipelineConfig,
+    PipelineEvent,
+    PipelineGovernorConfig,
     PipelineResult,
+    PipelineSnapshot,
     PipelineStats,
     RAGPipeline,
     SearchOptions,
@@ -65,6 +77,8 @@ pub use rag::{
     compute_content_hash,
     create_enriched_chunks,
     create_onion_slices,
+    inspect_cross_store_recovery,
+    repair_cross_store_recovery,
     // Async pipeline exports
     run_pipeline,
 };
@@ -72,18 +86,20 @@ pub use search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
     StemLanguage,
 };
+#[allow(deprecated)]
 pub use security::{NamespaceAccessManager, NamespaceSecurityConfig};
 pub use storage::{
-    ChromaDocument, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
+    ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryDocumentRef,
+    CrossStoreRecoveryStatus, GcConfig, GcStats, StorageManager, TableStats, parse_duration_string,
 };
 
 // High-level engine API
 pub use engine::{BatchResult, MemexConfig, MemexEngine, MetaFilter, StoreItem};
 
-// Agent tools API (MCP-compatible)
+// Canonical MCP metadata plus local Rust helper API.
 pub use tools::{
-    ToolDefinition, ToolResult, memory_delete, memory_delete_by_filter, memory_get, memory_search,
-    memory_store, memory_store_batch, tool_definitions,
+    ToolDefinition, ToolResult, delete_document, delete_documents_by_filter, get_document,
+    search_documents, store_document, store_documents_batch, tool_definitions,
 };
 
 // CLI-only re-exports (require indicatif, ratatui, crossterm)
@@ -97,9 +113,6 @@ pub use tui::{
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Enabled features (namespaced strings). Currently informational/reserved.
-    pub features: Vec<String>,
-
     /// Cache size in MB for moka in-memory cache
     pub cache_mb: usize,
 
@@ -130,11 +143,6 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            features: vec![
-                "filesystem".to_string(),
-                "memory".to_string(),
-                "search".to_string(),
-            ],
             cache_mb: 4096,
             db_path: "~/.rmcp-servers/rmcp-memex/lancedb".to_string(),
             max_request_bytes: 5 * 1024 * 1024,
@@ -148,20 +156,6 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Create a memory-only configuration (no filesystem access).
-    /// Suitable for pure vector memory server use cases.
-    pub fn for_memory_only() -> Self {
-        Self {
-            features: vec!["memory".to_string(), "search".to_string()],
-            ..Self::default()
-        }
-    }
-
-    /// Create a full RAG configuration with all features enabled.
-    pub fn for_full_rag() -> Self {
-        Self::default()
-    }
-
     #[doc(alias = "with_db_path")]
     pub fn with_storage_path(mut self, db_path: impl Into<String>) -> Self {
         self.db_path = db_path.into();
@@ -171,11 +165,6 @@ impl ServerConfig {
     #[deprecated(note = "use with_storage_path")]
     pub fn with_db_path(self, db_path: impl Into<String>) -> Self {
         self.with_storage_path(db_path)
-    }
-
-    pub fn with_features(mut self, features: Vec<String>) -> Self {
-        self.features = features;
-        self
     }
 }
 
@@ -192,7 +181,6 @@ mod lib_tests {
     #[test]
     fn default_config_has_expected_values() {
         let cfg = ServerConfig::default();
-        assert!(cfg.features.contains(&"filesystem".to_string()));
         assert_eq!(cfg.cache_mb, 4096);
         assert_eq!(cfg.db_path, "~/.rmcp-servers/rmcp-memex/lancedb");
         assert_eq!(cfg.max_request_bytes, 5 * 1024 * 1024);

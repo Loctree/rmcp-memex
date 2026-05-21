@@ -1,12 +1,14 @@
 [package]
 name = "rmcp-memex"
-version = "0.4.1"
+version = "0.5.1"
 edition = "2024"
 build = "src/build.rs"
-description = "RAG/memory MCP server with LanceDB vector storage"
+description = "High-performance semantic indexing with MCP server and blazing-fast LanceDB vector storage."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/VetCoders/rmcp-memex"
 homepage = "https://github.com/VetCoders/rmcp-memex"
+documentation = "https://docs.rs/rmcp-memex"
+readme = "README.md"
 keywords = ["mcp", "rag", "embeddings", "lancedb", "vector-search"]
 categories = ["development-tools", "database"]
 
@@ -14,7 +16,7 @@ categories = ["development-tools", "database"]
 default = ["cli", "provider-cascade"]
 
 # CLI feature: enables the binary, TUI wizard, and progress bars
-cli = ["clap", "indicatif", "ratatui", "crossterm"]
+cli = ["clap", "indicatif", "ratatui", "crossterm", "sysinfo"]
 
 # Provider cascade: current Ollama/OpenAI-compatible embedding approach
 provider-cascade = []
@@ -29,24 +31,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "rmcp-memex"
 path = "src/bin/rmcp_memex.rs"
-required-features = ["cli"]
-
-# Convenience alias for rmcp-memex
-[[bin]]
-name = "rust-memex"
-path = "src/bin/rust_memex.rs"
-required-features = ["cli"]
-
-# Convenience alias for rmcp-memex
-[[bin]]
-name = "rmmx"
-path = "src/bin/rmmx.rs"
-required-features = ["cli"]
-
-# Convenience alias for rmcp-memex
-[[bin]]
-name = "rmemex"
-path = "src/bin/rmemex.rs"
 required-features = ["cli"]
 
 [dependencies]
@@ -67,7 +51,7 @@ arrow-schema = "56.2"
 futures = "0.3"
 
 # HTTP & APIs
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 axum = { version = "0.8", features = ["json"] }
 tokio-stream = "0.1"
 tower-http = { version = "0.6", features = ["cors"] }
@@ -86,6 +70,12 @@ regex = "1.11"
 # Cryptographic hashing for deduplication
 sha2 = "0.10"
 
+# Constant-time comparison for auth tokens (prevents timing attacks)
+subtle = "2.5"
+
+# Argon2id password hashing for token-at-rest security
+argon2 = "0.5"
+
 # Utils
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
@@ -99,6 +89,7 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.29", optional = true }
 indicatif = { version = "0.17", optional = true }
+sysinfo = { version = "0.33", optional = true }
 
 # BM25 keyword search (hybrid search with vector)
 tantivy = "0.22"
@@ -108,6 +99,7 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3.14"
+tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
 # Keep local directory namespaces without pulling unused cloud backends into the graph.

@@ -28,8 +28,8 @@
 //! // Full routing with recommendations
 //! let router = QueryRouter::new();
 //! let decision = router.route("what imports main.rs");
-//! if decision.delegate_to_loctree {
-//!     println!("Suggested: {}", decision.loctree_suggestion.unwrap().command);
+//! if let Some(suggestion) = decision.loctree_suggestion {
+//!     println!("Suggested: {}", suggestion.command);
 //! }
 //! ```
 

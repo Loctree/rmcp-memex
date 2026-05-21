@@ -6,15 +6,8 @@ use walkdir::WalkDir;
 
 use rmcp_memex::{NamespaceSecurityConfig, ServerConfig, path_utils};
 
-#[allow(dead_code)]
-fn parse_features(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
+pub const DEFAULT_DASHBOARD_PORT: u16 = 8987;
+pub const DEFAULT_SSE_PORT: u16 = 8997;
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
@@ -72,10 +65,12 @@ fn load_or_discover_config(explicit_path: Option<&str>) -> Result<(FileConfig, O
 use crate::cli::config::*;
 #[derive(Parser, Debug)]
 #[command(
+    name = "rmcp-memex",
+    bin_name = "rmcp-memex",
     author,
     version,
-    about = "rmcp-memex: Custom Rust MCP kernel for RAG and long-term memory.\nPrimary entrypoint. Supports stdio (native MCP) & SSE/HTTP (multi-agent) transports.\n(Aliases: rust-memex, rmmx, rmemex)",
-    long_about = "rmcp-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nNote: rust-memex, rmmx, and rmemex are strictly convenience aliases for this identical kernel, not separate products."
+    about = "rmcp-memex: custom Rust MCP kernel for RAG and long-term memory.\nCanonical entrypoint for stdio (native MCP) and HTTP/SSE (multi-agent) transports.",
+    long_about = "rmcp-memex is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.\n\nIt exposes two explicit transport modes from a single canonical surface:\n1. stdio (Standard MCP): Native MCP integration for local agents.\n2. HTTP/SSE (Multi-Agent Daemon): Central daemon mode allowing concurrent AI agents to access the same memory pool over the network.\n\nrmcp-memex is the only supported binary name. The GitHub installer may also create rmcp_memex as a legacy compatibility symlink for older scripts."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -85,12 +80,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub config: Option<String>,
 
-    /// Server mode: "memory" (memory-only, no filesystem) or "full" (all features)
-    #[arg(long, value_parser = ["memory", "full"], global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, value_parser = ["memory", "full"], global = true, hide = true)]
     pub mode: Option<String>,
 
-    /// Enable specific features (comma-separated). Overrides --mode if set.
-    #[arg(long, global = true)]
+    /// Legacy compatibility shim. Ignored at runtime.
+    #[arg(long, global = true, hide = true)]
     pub features: Option<String>,
 
     /// Cache size in MB
@@ -128,7 +123,7 @@ pub struct Cli {
     /// HTTP/SSE server port for multi-agent access.
     /// When set, starts an HTTP server alongside MCP stdio.
     /// Agents can query via HTTP instead of holding LanceDB lock directly.
-    /// Example: --http-port 6660
+    /// Example: --http-port 8997
     #[arg(long, global = true)]
     pub http_port: Option<u16>,
 
@@ -152,12 +147,49 @@ pub struct Cli {
     /// when bound to non-localhost, or permissive when bound to localhost.
     #[arg(long, global = true)]
     pub cors_origins: Option<String>,
+
+    /// Allow binding to non-loopback addresses without --auth-token.
+    /// By default, binding to e.g. 0.0.0.0 without auth is a hard error.
+    /// This flag downgrades it to a warning.
+    #[arg(long, global = true)]
+    pub allow_network_without_auth: bool,
+
+    /// Auth enforcement mode for HTTP endpoints.
+    /// - mutating-only (default): bearer required only on mutating + MCP routes
+    /// - all-routes: bearer required on ALL routes
+    /// - namespace-acl: reserved for Track C (namespace-level ACL)
+    #[arg(long, global = true, default_value = "mutating-only",
+           value_parser = ["mutating-only", "all-routes", "namespace-acl"])]
+    pub auth_mode: String,
+
+    /// Allow passing bearer token as ?token= query parameter on read GET endpoints.
+    /// Disabled by default. Only effective when --auth-mode is all-routes.
+    #[arg(long, global = true)]
+    pub allow_query_token: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Run the MCP server (default if no subcommand specified)
     Serve,
+
+    /// Run the local dashboard server and open it in the default browser.
+    Dashboard {
+        /// Dashboard HTTP port (default: 8987)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+
+        /// Do not open the dashboard in a browser after startup
+        #[arg(long)]
+        no_open: bool,
+    },
+
+    /// Run the HTTP/SSE daemon on the agent-facing port.
+    Sse {
+        /// HTTP/SSE port (default: 8997)
+        #[arg(long, short = 'p')]
+        port: Option<u16>,
+    },
 
     /// Launch interactive configuration wizard
     #[command(alias = "config")]
@@ -260,13 +292,13 @@ pub enum Commands {
         #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
         dedup: bool,
 
-        /// Show smart progress bar with ETA based on calibration.
-        /// Displays three phases: pre-scan, calibration, and indexing progress.
+        /// Show progress bar with ETA when running in an interactive terminal.
+        /// Non-interactive runs fall back to line logs.
         #[arg(long)]
         progress: bool,
 
         /// Resume from last checkpoint if interrupted.
-        /// Saves progress after each file to .index-checkpoint.json.
+        /// Saves progress after each committed file to .index-checkpoint-<namespace>.json.
         /// On restart, skips already indexed files and continues.
         #[arg(long)]
         resume: bool,
@@ -274,9 +306,20 @@ pub enum Commands {
         /// Enable async pipeline mode for concurrent indexing.
         /// Runs file reading, chunking, embedding, and storage in parallel
         /// using tokio channels. Can significantly speed up large batch operations.
-        /// Note: Pipeline mode ignores --progress and --resume flags.
+        /// Supports live progress output and commit-based resume checkpoints.
         #[arg(long)]
         pipeline: bool,
+
+        /// Maximum number of embedding requests to keep in flight in pipeline mode.
+        /// With --pipeline-governor disabled this is a fixed concurrency limit.
+        /// With --pipeline-governor enabled this becomes the governor's ceiling.
+        #[arg(long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=8))]
+        pipeline_embed_concurrency: u8,
+
+        /// Enable adaptive pipeline flow control for embedding batch sizes and concurrency.
+        /// Uses embed latency and queue pressure to increase slowly and back off quickly.
+        #[arg(long)]
+        pipeline_governor: bool,
 
         /// Number of files to process in parallel (default: 4, max: 16).
         /// Higher values can speed up indexing on multi-core systems,
@@ -579,6 +622,31 @@ pub enum Commands {
         json: bool,
     },
 
+    /// Inspect or repair pending Lance/BM25 recovery ledgers
+    ///
+    /// This is the explicit recovery contract for partial cross-store writes.
+    /// It does not claim crash-safe atomicity. Instead it inspects persisted
+    /// batch ledgers, reports divergence, and can replay BM25 writes to match
+    /// current Lance truth.
+    ///
+    /// Examples:
+    ///   rmcp-memex repair-writes
+    ///   rmcp-memex repair-writes --execute
+    ///   rmcp-memex repair-writes -n memories --json
+    RepairWrites {
+        /// Limit inspection/repair to a single namespace
+        #[arg(long, short = 'n')]
+        namespace: Option<String>,
+
+        /// Actually execute reconciliation. Default is dry-run/report-only.
+        #[arg(long)]
+        execute: bool,
+
+        /// Output results as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Search across all namespaces
     ///
     /// Performs a unified search across every namespace, merging and ranking results.
@@ -767,6 +835,88 @@ pub enum Commands {
         db_path: Option<String>,
     },
 
+    /// Reprocess exported JSONL into a fresh namespace using the current chunker
+    ///
+    /// Useful when the original source files are gone but the namespace export is valuable.
+    /// The command collapses onion families back to a single canonical document, optionally
+    /// preprocesses the text, and re-indexes it with the requested slice mode.
+    ///
+    /// Examples:
+    ///   rmcp-memex export -n kodowanie -o kodowanie.jsonl
+    ///   rmcp-memex reprocess -i kodowanie.jsonl -n kodowanie-v2 --slice-mode onion-fast
+    ///   rmcp-memex reprocess -i memories.jsonl -n memories-v2 --preprocess --dry-run
+    #[command(alias = "reindex-export")]
+    Reprocess {
+        /// Target namespace for rebuilt documents
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Input JSONL file produced by 'export'
+        #[arg(long, short = 'i', required = true)]
+        input: PathBuf,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
+    /// Reindex an existing rmcp-memex namespace into '<namespace>-reindexed'
+    ///
+    /// This is the in-database equivalent of 'export -> reprocess' for namespaced
+    /// rmcp-memex stores. It reads the existing namespace, collapses onion families
+    /// back to canonical documents, and writes a rebuilt namespace without touching
+    /// the source data.
+    ///
+    /// Examples:
+    ///   rmcp-memex reindex -n kodowanie
+    ///   rmcp-memex reindex -n kodowanie --dry-run
+    ///   rmcp-memex reindex -n kodowanie --target-namespace kodowanie-v2 --slice-mode onion-fast
+    Reindex {
+        /// Source namespace to rebuild
+        #[arg(long, short = 'n', required = true)]
+        namespace: String,
+
+        /// Target namespace override (default: '<namespace>-reindexed')
+        #[arg(long)]
+        target_namespace: Option<String>,
+
+        /// Slice mode for the rebuilt namespace
+        #[arg(long, short = 's', default_value = "onion", value_parser = ["onion", "onion-fast", "fast", "flat"])]
+        slice_mode: String,
+
+        /// Apply preprocessing before rebuilding documents
+        #[arg(long)]
+        preprocess: bool,
+
+        /// Skip documents already rebuilt with the same source hash
+        #[arg(long)]
+        skip_existing: bool,
+
+        /// Show what would be rebuilt without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Database path override
+        #[arg(long)]
+        db_path: Option<String>,
+    },
+
     /// Audit database quality and text integrity
     ///
     /// Analyzes namespaces for embedding quality, text integrity (>90% target),
@@ -819,6 +969,81 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Manage auth tokens with per-token scopes and namespace ACL
+    ///
+    /// Create, list, revoke, and rotate bearer tokens for HTTP API access.
+    /// Each token is hashed with argon2id at rest. The plaintext is shown
+    /// ONCE on creation and can never be retrieved again.
+    ///
+    /// Examples:
+    ///   rmcp-memex auth create --description "iPhone" --scopes read,write --namespaces kb:claude,kb:mikserka
+    ///   rmcp-memex auth list
+    ///   rmcp-memex auth revoke --id monika-iphone
+    ///   rmcp-memex auth rotate --id monika-iphone
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+}
+
+/// Auth token management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum AuthAction {
+    /// Create a new auth token
+    ///
+    /// Generates a new token with specified scopes and namespace access.
+    /// The plaintext token is printed ONCE and never stored.
+    Create {
+        /// Human-readable token identifier (e.g., "monika-iphone")
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Description of what this token is for
+        #[arg(long, required = true)]
+        description: String,
+
+        /// Comma-separated scopes: read, write, admin
+        #[arg(long, default_value = "read,write")]
+        scopes: String,
+
+        /// Comma-separated namespace ACL. Use "*" for all namespaces.
+        #[arg(long, default_value = "*")]
+        namespaces: String,
+
+        /// Token expiry (RFC 3339 timestamp, e.g., "2026-12-31T00:00:00Z")
+        #[arg(long)]
+        expires_at: Option<String>,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List all tokens (without revealing plaintext)
+    List {
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Revoke (delete) a token by its ID
+    Revoke {
+        /// Token ID to revoke
+        #[arg(long, required = true)]
+        id: String,
+    },
+
+    /// Rotate a token: revoke old, create new with same metadata
+    Rotate {
+        /// Token ID to rotate
+        #[arg(long, required = true)]
+        id: String,
+
+        /// Output as JSON instead of human-readable format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -828,57 +1053,50 @@ impl Cli {
             eprintln!("Using config: {}", path);
         }
 
+        let legacy_mode = self.mode.clone().or_else(|| file_cfg.mode.clone());
+        let legacy_features = self.features.clone().or_else(|| file_cfg.features.clone());
+        if legacy_mode.is_some() || legacy_features.is_some() {
+            eprintln!(
+                "Warning: legacy mode/features settings are ignored. rmcp-memex now exposes one canonical MCP surface; constrain access with --allowed-paths, HTTP auth, or namespace security instead."
+            );
+        }
+
         // Extract embedding config first (before any moves from file_cfg)
         let embeddings = file_cfg.resolve_embedding_config();
-
-        // Determine base config from mode (CLI > file > default)
-        let mode = self.mode.as_deref().or(file_cfg.mode.as_deref());
-        let base_cfg = match mode {
-            Some("memory") => ServerConfig::for_memory_only(),
-            Some("full") => ServerConfig::for_full_rag(),
-            _ => ServerConfig::default(),
-        };
-
-        // CLI --features overrides mode-derived features
-        let features = self
-            .features
-            .or(file_cfg.features)
-            .map(|s| parse_features(&s))
-            .unwrap_or(base_cfg.features);
+        let default_cfg = ServerConfig::default();
 
         // Build security config from CLI and file settings
         let security_enabled = self.security_enabled || file_cfg.security_enabled.unwrap_or(false);
         let token_store_path = self.token_store_path.or(file_cfg.token_store_path);
 
         Ok(ServerConfig {
-            features,
             cache_mb: self
                 .cache_mb
                 .or(file_cfg.cache_mb)
-                .unwrap_or(base_cfg.cache_mb),
+                .unwrap_or(default_cfg.cache_mb),
             db_path: self
                 .db_path
                 .or(file_cfg.db_path)
-                .unwrap_or(base_cfg.db_path),
+                .unwrap_or(default_cfg.db_path),
             max_request_bytes: self
                 .max_request_bytes
                 .or(file_cfg.max_request_bytes)
-                .unwrap_or(base_cfg.max_request_bytes),
+                .unwrap_or(default_cfg.max_request_bytes),
             log_level: self
                 .log_level
                 .or(file_cfg.log_level)
                 .map(|s| parse_log_level(&s))
-                .unwrap_or(base_cfg.log_level),
+                .unwrap_or(default_cfg.log_level),
             allowed_paths: self
                 .allowed_paths
                 .or(file_cfg.allowed_paths)
-                .unwrap_or(base_cfg.allowed_paths),
+                .unwrap_or(default_cfg.allowed_paths),
             security: NamespaceSecurityConfig {
                 enabled: security_enabled,
                 token_store_path,
             },
             embeddings,
-            hybrid: base_cfg.hybrid,
+            hybrid: default_cfg.hybrid,
         })
     }
 }
@@ -949,4 +1167,109 @@ pub fn collect_files(
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn legacy_mode_and_features_flags_parse_but_do_not_change_server_shape() {
+        let tmp = tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "mode = \"memory\"\nfeatures = \"memory,search\"\n",
+        )
+        .unwrap();
+
+        let cli = Cli::parse_from([
+            "rmcp-memex",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--mode",
+            "full",
+            "--features",
+            "filesystem,memory,search",
+            "serve",
+        ]);
+        let config = cli.into_server_config().unwrap();
+        let defaults = ServerConfig::default();
+
+        assert_eq!(config.db_path, defaults.db_path);
+        assert_eq!(config.cache_mb, defaults.cache_mb);
+        assert_eq!(config.max_request_bytes, defaults.max_request_bytes);
+        assert_eq!(config.allowed_paths, defaults.allowed_paths);
+    }
+    #[test]
+    fn dashboard_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rmcp-memex", "dashboard"]);
+
+        match cli.command {
+            Some(Commands::Dashboard { port, no_open }) => {
+                assert_eq!(port, None);
+                assert!(!no_open);
+            }
+            other => panic!("expected dashboard command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sse_command_parses_without_explicit_port() {
+        let cli = Cli::parse_from(["rmcp-memex", "sse"]);
+
+        match cli.command {
+            Some(Commands::Sse { port }) => assert_eq!(port, None),
+            other => panic!("expected sse command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn repair_writes_command_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "repair-writes", "--execute", "-n", "memories"]);
+
+        match cli.command {
+            Some(Commands::RepairWrites {
+                namespace,
+                execute,
+                json,
+            }) => {
+                assert_eq!(namespace.as_deref(), Some("memories"));
+                assert!(execute);
+                assert!(!json);
+            }
+            other => panic!("expected repair-writes command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn auth_mode_flag_parses_all_routes() {
+        let cli = Cli::parse_from(["rmcp-memex", "--auth-mode", "all-routes", "serve"]);
+        assert_eq!(cli.auth_mode, "all-routes");
+    }
+
+    #[test]
+    fn auth_mode_defaults_to_mutating_only() {
+        let cli = Cli::parse_from(["rmcp-memex", "serve"]);
+        assert_eq!(cli.auth_mode, "mutating-only");
+    }
+
+    #[test]
+    fn allow_network_without_auth_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "--allow-network-without-auth", "serve"]);
+        assert!(cli.allow_network_without_auth);
+    }
+
+    #[test]
+    fn allow_query_token_parses() {
+        let cli = Cli::parse_from(["rmcp-memex", "--allow-query-token", "serve"]);
+        assert!(cli.allow_query_token);
+    }
+
+    #[test]
+    fn auth_mode_rejects_invalid_value() {
+        let result = Cli::try_parse_from(["rmcp-memex", "--auth-mode", "bogus", "serve"]);
+        assert!(result.is_err());
+    }
 }

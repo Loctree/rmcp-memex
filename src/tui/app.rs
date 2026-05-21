@@ -4,20 +4,23 @@
 //! Implements the new wizard flow with EmbedderSetup as the first configuration step.
 
 use crate::embeddings::{
-    DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, ProviderConfig, infer_embedding_dimension,
+    DEFAULT_REQUIRED_DIMENSION, EmbeddingConfig, ProviderConfig, probe_provider_dimension,
 };
 use crate::tui::detection::{
     DetectedProvider, ProviderKind, check_health, detect_providers, dimension_explanation,
 };
 use crate::tui::health::{HealthCheckResult, HealthChecker};
 use crate::tui::host_detection::{
-    ExtendedHostKind, HostDetection, detect_extended_hosts, generate_extended_snippet,
-    write_extended_host_config,
+    DEFAULT_MUX_CONFIG_PATH, DEFAULT_MUX_SERVICE_NAME, DEFAULT_MUX_SOCKET_PATH, ExtendedHostKind,
+    HostDetection, detect_extended_hosts, generate_extended_snippet, generate_extended_snippet_mux,
+    write_extended_host_config, write_extended_host_config_mux, write_mux_service_config,
 };
 use crate::tui::indexer::{
-    DataSetupOption, DataSetupState, DataSetupSubStep, ImportMode, IndexProgress, import_lancedb,
-    start_indexing,
+    DataSetupOption, DataSetupState, DataSetupSubStep, FanOut, ImportMode, IndexControl,
+    IndexEventSink, IndexTelemetrySnapshot, SharedIndexTelemetry, TracingSink, TuiTelemetrySink,
+    collect_indexable_files, import_lancedb, new_index_telemetry, start_indexing, validate_path,
 };
+use crate::tui::monitor::{MonitorSnapshot, spawn_monitor};
 use anyhow::{Result, anyhow};
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -25,10 +28,16 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::prelude::*;
+use reqwest::Client;
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+
+const DEFAULT_INDEX_PARALLELISM: usize = 4;
+const DEFAULT_MEMEX_CONFIG_PATH: &str = "~/.rmcp-servers/rmcp-memex/config.toml";
 
 /// Configuration for running the wizard.
 #[derive(Debug, Clone, Default)]
@@ -108,6 +117,17 @@ impl WizardStep {
     }
 }
 
+/// How trustworthy the currently selected embedding dimension is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DimensionTruth {
+    /// No verified dimension yet — requires probe or manual entry.
+    Pending,
+    /// Verified by a live embedding probe against the provider.
+    Probed,
+    /// Explicitly set by the operator.
+    Manual,
+}
+
 /// Embedder configuration state for the wizard.
 #[derive(Debug, Clone)]
 pub struct EmbedderState {
@@ -123,6 +143,14 @@ pub struct EmbedderState {
     pub manual_model: String,
     /// Required embedding dimension
     pub dimension: usize,
+    /// Where the current dimension came from.
+    pub dimension_truth: DimensionTruth,
+    /// Whether a live dimension probe is currently pending.
+    pub dimension_probe_in_flight: bool,
+    /// Last live probe error, if any.
+    pub dimension_probe_error: Option<String>,
+    /// Provider config queued for the next live probe attempt.
+    pub pending_dimension_probe: Option<ProviderConfig>,
     /// Whether to use manual configuration instead of detected
     pub use_manual: bool,
 }
@@ -136,6 +164,10 @@ impl Default for EmbedderState {
             manual_url: "http://localhost:11434".to_string(),
             manual_model: String::new(),
             dimension: DEFAULT_REQUIRED_DIMENSION,
+            dimension_truth: DimensionTruth::Pending,
+            dimension_probe_in_flight: false,
+            dimension_probe_error: None,
+            pending_dimension_probe: None,
             use_manual: false,
         }
     }
@@ -161,9 +193,179 @@ impl EmbedderState {
         }
     }
 
+    pub fn selected_base_url(&self) -> Option<&str> {
+        if self.use_manual {
+            let url = self.manual_url.trim();
+            if url.is_empty() { None } else { Some(url) }
+        } else {
+            self.selected_provider
+                .as_ref()
+                .map(|provider| provider.base_url.trim())
+                .filter(|url| !url.is_empty())
+        }
+    }
+
+    pub fn dimension_display(&self) -> String {
+        if self.dimension_probe_in_flight {
+            return "probing...".to_string();
+        }
+
+        let suffix = match self.dimension_truth {
+            DimensionTruth::Pending => "pending",
+            DimensionTruth::Probed => "probed",
+            DimensionTruth::Manual => "manual",
+        };
+
+        format!("{} [{}]", self.dimension, suffix)
+    }
+
     /// Get dimension explanation text
-    pub fn dimension_hint(&self) -> &'static str {
-        dimension_explanation(self.dimension)
+    pub fn dimension_hint(&self) -> String {
+        if self.dimension_probe_in_flight {
+            return "Probing the provider for the actual vector size.".to_string();
+        }
+
+        if let Some(error) = &self.dimension_probe_error {
+            let concise_error = error.lines().next().unwrap_or(error).trim();
+            return match self.dimension_truth {
+                DimensionTruth::Manual => format!(
+                    "Manual override is active. Probe failed, but the operator-supplied dimension will be used. Probe error: {concise_error}"
+                ),
+                _ => format!(
+                    "Live probe failed. Run Health Check or set the dimension manually before writing config. Probe error: {concise_error}"
+                ),
+            };
+        }
+
+        match self.dimension_truth {
+            DimensionTruth::Pending => {
+                if let Some(model) = self.selected_model() {
+                    format!(
+                        "No verified dimension for `{model}` yet. Run a probe or enter the dimension manually."
+                    )
+                } else {
+                    "Select an embedding model or enter one manually.".to_string()
+                }
+            }
+            DimensionTruth::Probed => format!(
+                "Verified live against the provider. {}",
+                dimension_explanation(self.dimension)
+            ),
+            DimensionTruth::Manual => format!(
+                "Set manually by the operator. {}",
+                dimension_explanation(self.dimension)
+            ),
+        }
+    }
+
+    pub fn dimension_write_blocker(&self) -> Option<String> {
+        if self.dimension_probe_in_flight {
+            return Some(
+                "Embedding dimension is still being probed. Wait for the live probe to finish or set a manual dimension.".to_string(),
+            );
+        }
+
+        match self.dimension_truth {
+            DimensionTruth::Pending => Some(
+                "Embedding dimension has not been verified. Let the live probe succeed or enter the dimension manually before writing config.".to_string(),
+            ),
+            DimensionTruth::Probed | DimensionTruth::Manual => None,
+        }
+    }
+
+    fn reset_probe_state(&mut self) {
+        self.dimension_probe_in_flight = false;
+        self.dimension_probe_error = None;
+        self.pending_dimension_probe = None;
+    }
+
+    fn schedule_dimension_probe(&mut self, provider: ProviderConfig) {
+        self.pending_dimension_probe = Some(provider);
+        self.dimension_probe_in_flight = true;
+        self.dimension_probe_error = None;
+    }
+
+    fn current_provider_config(&self) -> Option<ProviderConfig> {
+        let model = self.selected_model()?;
+        let base_url = self.selected_base_url()?.to_string();
+
+        Some(ProviderConfig {
+            name: if self.use_manual {
+                "manual".to_string()
+            } else if let Some(provider) = &self.selected_provider {
+                match provider.kind {
+                    ProviderKind::Ollama => "ollama-local".to_string(),
+                    ProviderKind::Mlx => "mlx-local".to_string(),
+                    ProviderKind::OpenAICompat => "openai-compat".to_string(),
+                    ProviderKind::Manual => "manual".to_string(),
+                }
+            } else {
+                "manual".to_string()
+            },
+            base_url,
+            model,
+            priority: 1,
+            ..Default::default()
+        })
+    }
+
+    fn refresh_manual_dimension_state(&mut self) {
+        self.selected_provider = None;
+        self.dimension_probe_error = None;
+        self.dimension = DEFAULT_REQUIRED_DIMENSION;
+        self.dimension_truth = DimensionTruth::Pending;
+
+        let model = self.manual_model.trim();
+        if model.is_empty() {
+            self.pending_dimension_probe = None;
+            self.dimension_probe_in_flight = false;
+            return;
+        }
+
+        if let Some(provider) = self.current_provider_config() {
+            self.schedule_dimension_probe(provider);
+        } else {
+            self.dimension_probe_in_flight = false;
+            self.pending_dimension_probe = None;
+        }
+    }
+
+    fn set_manual_dimension(&mut self, dimension: usize) {
+        self.dimension = dimension;
+        self.dimension_truth = DimensionTruth::Manual;
+        self.reset_probe_state();
+    }
+
+    fn apply_detected_provider(&mut self, provider: DetectedProvider) {
+        self.use_manual = false;
+        self.selected_provider = Some(provider);
+        self.dimension_probe_error = None;
+        self.dimension = DEFAULT_REQUIRED_DIMENSION;
+        self.dimension_truth = DimensionTruth::Pending;
+
+        if let Some(provider) = self.current_provider_config() {
+            self.schedule_dimension_probe(provider);
+        } else {
+            self.dimension_probe_in_flight = false;
+            self.pending_dimension_probe = None;
+        }
+    }
+
+    fn apply_probe_result(&mut self, result: Result<usize>) {
+        self.dimension_probe_in_flight = false;
+
+        match result {
+            Ok(dimension) => {
+                self.dimension = dimension;
+                self.dimension_truth = DimensionTruth::Probed;
+                self.dimension_probe_error = None;
+            }
+            Err(error) => {
+                self.dimension_probe_error = Some(error.to_string());
+            }
+        }
+
+        self.pending_dimension_probe = None;
     }
 
     /// Update embedding config from state
@@ -238,6 +440,14 @@ pub enum DbPathMode {
     PerHost,
 }
 
+/// How hosts connect to rmcp-memex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeploymentMode {
+    #[default]
+    PerHostStdio,
+    SharedMux,
+}
+
 /// Editable memex configuration.
 #[derive(Debug, Clone)]
 pub struct MemexCfg {
@@ -245,13 +455,14 @@ pub struct MemexCfg {
     pub cache_mb: usize,
     pub log_level: String,
     pub max_request_bytes: usize,
-    pub mode: String,
     /// Current machine hostname (auto-detected)
     pub hostname: String,
     /// Database path mode (shared vs per-host)
     pub db_path_mode: DbPathMode,
     /// HTTP/SSE server port (None = disabled, Some(port) = enabled)
     pub http_port: Option<u16>,
+    /// Whether hosts launch rmcp-memex directly or via rmcp_mux_proxy.
+    pub deployment_mode: DeploymentMode,
 }
 
 impl Default for MemexCfg {
@@ -263,10 +474,10 @@ impl Default for MemexCfg {
             cache_mb: 4096,
             log_level: "info".to_string(),
             max_request_bytes: 10 * 1024 * 1024, // 10MB
-            mode: "full".to_string(),
             hostname,
             db_path_mode: DbPathMode::Shared,
             http_port: None,
+            deployment_mode: DeploymentMode::PerHostStdio,
         }
     }
 }
@@ -285,6 +496,7 @@ impl MemexCfg {
 pub struct App {
     pub step: WizardStep,
     pub memex_cfg: MemexCfg,
+    pub config_path: String,
     /// Embedder configuration state (new EmbedderSetup step)
     pub embedder_state: EmbedderState,
     /// Derived embedding config (updated from embedder_state)
@@ -307,27 +519,87 @@ pub struct App {
     pub health_running: bool,
     /// Data setup state
     pub data_setup: DataSetupState,
-    /// Progress receiver for indexing operations
-    pub index_progress_rx: Option<mpsc::Receiver<IndexProgress>>,
+    /// Latest telemetry receiver for the indexing dashboard.
+    pub telemetry_rx: Option<watch::Receiver<IndexTelemetrySnapshot>>,
+    /// Latest system monitor receiver for the dashboard.
+    pub monitor_rx: Option<watch::Receiver<MonitorSnapshot>>,
+    /// Scheduler control sender.
+    pub index_control_tx: Option<mpsc::Sender<IndexControl>>,
+    /// Running indexing task.
+    pub index_task: Option<JoinHandle<Result<()>>>,
+    /// Running monitor sampler task.
+    pub monitor_task: Option<JoinHandle<()>>,
+    /// Background dimension probe task paired with its generation token.
+    pub dimension_probe_task: Option<(u64, JoinHandle<Result<usize>>)>,
+    /// Monotonic token that invalidates stale probe completions.
+    pub dimension_probe_generation: u64,
+    /// Current requested indexer parallelism.
+    pub index_parallelism: usize,
+    /// Whether the indexer is currently paused.
+    pub index_paused: bool,
     /// Whether rmcp-memex config has been written
     pub config_written: bool,
+    /// Resolved mux proxy command/path if available.
+    pub mux_proxy_command: Option<String>,
+}
+
+fn which_mux_proxy() -> Option<String> {
+    which_binary(&["rmcp_mux_proxy", "rmcp-mux-proxy"])
 }
 
 impl App {
+    pub fn mux_proxy_on_path(&self) -> bool {
+        self.mux_proxy_command.is_some()
+    }
+
+    pub fn mux_proxy_command(&self) -> Option<&str> {
+        self.mux_proxy_command.as_deref()
+    }
+
+    fn required_mux_proxy_command(&self) -> Result<&str> {
+        self.mux_proxy_command().ok_or_else(|| {
+            anyhow!(
+                "Shared mux mode requires `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH before writing host configs."
+            )
+        })
+    }
+
+    fn toggle_deployment_mode(&mut self) {
+        self.memex_cfg.deployment_mode = match self.memex_cfg.deployment_mode {
+            DeploymentMode::PerHostStdio => {
+                if self.mux_proxy_on_path() {
+                    DeploymentMode::SharedMux
+                } else {
+                    self.messages.push(
+                        "[WARN] Shared mux mode is unavailable until `rmcp_mux_proxy` or `rmcp-mux-proxy` is on PATH.".to_string(),
+                    );
+                    DeploymentMode::PerHostStdio
+                }
+            }
+            DeploymentMode::SharedMux => DeploymentMode::PerHostStdio,
+        };
+    }
+
     pub fn new(config: WizardConfig) -> Self {
+        let WizardConfig {
+            config_path,
+            dry_run,
+        } = config;
         let hosts = detect_extended_hosts();
-        let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp_memex".to_string());
+        let binary_path = which_rmcp_memex().unwrap_or_else(|| "rmcp-memex".to_string());
         let embedder_state = EmbedderState::default();
         let embedding_config = embedder_state.build_embedding_config();
+        let mux_proxy_command = which_mux_proxy();
 
         Self {
             step: WizardStep::Welcome,
             memex_cfg: MemexCfg::default(),
+            config_path: config_path.unwrap_or_else(|| DEFAULT_MEMEX_CONFIG_PATH.to_string()),
             embedder_state,
             embedding_config,
             hosts,
             selected_hosts: Vec::new(),
-            dry_run: config.dry_run,
+            dry_run,
             messages: Vec::new(),
             focus: 0,
             binary_path,
@@ -339,8 +611,17 @@ impl App {
             health_result: None,
             health_running: false,
             data_setup: DataSetupState::new(),
-            index_progress_rx: None,
+            telemetry_rx: None,
+            monitor_rx: None,
+            index_control_tx: None,
+            index_task: None,
+            monitor_task: None,
+            dimension_probe_task: None,
+            dimension_probe_generation: 0,
+            index_parallelism: DEFAULT_INDEX_PARALLELISM,
+            index_paused: false,
             config_written: false,
+            mux_proxy_command,
         }
     }
 
@@ -348,7 +629,7 @@ impl App {
         if let Some(next) = self.step.next() {
             // On leaving EmbedderSetup, update the embedding config
             if self.step == WizardStep::EmbedderSetup {
-                self.embedding_config = self.embedder_state.build_embedding_config();
+                self.refresh_embedding_config();
             }
             self.step = next;
             self.focus = 0;
@@ -393,19 +674,30 @@ impl App {
     }
 
     pub fn generate_snippets(&self) -> Vec<(ExtendedHostKind, String)> {
-        let effective_path = self.memex_cfg.resolved_db_path();
+        let config_path = self.resolved_config_path();
         self.get_selected_hosts()
             .iter()
             .map(|(kind, _detection)| {
-                let mut snippet =
-                    generate_extended_snippet(*kind, &self.binary_path, &effective_path);
-                // Add HTTP port arg if configured
-                if let Some(port) = self.memex_cfg.http_port {
-                    snippet = snippet.replace(
-                        "\"serve\"",
-                        &format!("\"serve\", \"--http-port\", \"{}\"", port),
-                    );
-                }
+                let snippet = match self.memex_cfg.deployment_mode {
+                    DeploymentMode::PerHostStdio => generate_extended_snippet(
+                        *kind,
+                        &self.binary_path,
+                        &config_path,
+                        self.memex_cfg.http_port,
+                    ),
+                    DeploymentMode::SharedMux => self
+                        .mux_proxy_command()
+                        .map(|proxy_command| {
+                            generate_extended_snippet_mux(
+                                *kind,
+                                proxy_command,
+                                DEFAULT_MUX_SOCKET_PATH,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            "Shared mux unavailable: install `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH before generating host snippets.".to_string()
+                        }),
+                };
                 (*kind, snippet)
             })
             .collect()
@@ -414,7 +706,7 @@ impl App {
     pub fn run_health_check(&mut self) {
         self.health_status = Some("Checking...".to_string());
 
-        // Try to run rmcp_memex --version
+        // Prefer the canonical binary name, but allow the legacy alias when present.
         match std::process::Command::new(&self.binary_path)
             .arg("--version")
             .output()
@@ -437,6 +729,8 @@ impl App {
             "[INFO] Host: {} (path mode: {:?})",
             self.memex_cfg.hostname, self.memex_cfg.db_path_mode
         ));
+        self.messages
+            .push(format!("[INFO] Config path: {}", self.config_path));
 
         // Check db_path (use effective path)
         let effective_path = self.memex_cfg.resolved_db_path();
@@ -458,7 +752,12 @@ impl App {
     }
 
     pub fn write_configs(&mut self) -> Result<()> {
-        let effective_path = self.memex_cfg.resolved_db_path();
+        let config_path = self.resolved_config_path();
+        let mux_proxy_command = if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+            Some(self.required_mux_proxy_command()?.to_string())
+        } else {
+            None
+        };
 
         if self.dry_run {
             self.messages.push("DRY RUN: No files written".to_string());
@@ -468,8 +767,21 @@ impl App {
             ));
             for &idx in &self.selected_hosts.clone() {
                 if let Some((kind, detection)) = self.hosts.get(idx) {
-                    let snippet =
-                        generate_extended_snippet(*kind, &self.binary_path, &effective_path);
+                    let snippet = match self.memex_cfg.deployment_mode {
+                        DeploymentMode::PerHostStdio => generate_extended_snippet(
+                            *kind,
+                            &self.binary_path,
+                            &config_path,
+                            self.memex_cfg.http_port,
+                        ),
+                        DeploymentMode::SharedMux => generate_extended_snippet_mux(
+                            *kind,
+                            mux_proxy_command
+                                .as_deref()
+                                .expect("mux proxy command must exist in shared mode"),
+                            DEFAULT_MUX_SOCKET_PATH,
+                        ),
+                    };
                     self.messages.push(format!(
                         "Would write to {} ({}):\n{}",
                         kind.label(),
@@ -478,15 +790,75 @@ impl App {
                     ));
                 }
             }
+            if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+                self.messages.push(format!(
+                    "Would write mux service config to {}",
+                    DEFAULT_MUX_CONFIG_PATH
+                ));
+            }
             return Ok(());
         }
 
         let mut success_count = 0;
         let mut error_count = 0;
 
+        if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+            match write_mux_service_config(
+                &self.binary_path,
+                &config_path,
+                self.memex_cfg.http_port,
+                self.memex_cfg.max_request_bytes,
+                &self.memex_cfg.log_level,
+            ) {
+                Ok(result) => {
+                    if let Some(backup) = result.backup_path {
+                        self.messages.push(format!(
+                            "[OK] {} backup: {}",
+                            result.host_name,
+                            backup.display()
+                        ));
+                    }
+                    if result.created {
+                        self.messages.push(format!(
+                            "[OK] {} created: {}",
+                            result.host_name,
+                            result.config_path.display()
+                        ));
+                    } else {
+                        self.messages.push(format!(
+                            "[OK] {} updated: {}",
+                            result.host_name,
+                            result.config_path.display()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    self.messages
+                        .push(format!("[ERR] rmcp-mux service config failed: {}", error));
+                    return Err(error);
+                }
+            }
+        }
+
         for &idx in &self.selected_hosts.clone() {
             if let Some((kind, _detection)) = self.hosts.get(idx) {
-                match write_extended_host_config(*kind, &self.binary_path, &effective_path) {
+                let write_result = match self.memex_cfg.deployment_mode {
+                    DeploymentMode::PerHostStdio => write_extended_host_config(
+                        *kind,
+                        &self.binary_path,
+                        &config_path,
+                        self.memex_cfg.http_port,
+                    ),
+                    DeploymentMode::SharedMux => write_extended_host_config_mux(
+                        *kind,
+                        mux_proxy_command
+                            .as_deref()
+                            .expect("mux proxy command must exist in shared mode"),
+                        DEFAULT_MUX_SOCKET_PATH,
+                    ),
+                };
+
+                match write_result {
                     Ok(result) => {
                         success_count += 1;
                         if let Some(backup) = result.backup_path {
@@ -524,6 +896,12 @@ impl App {
                 "\nConfiguration complete! {} host(s) configured.",
                 success_count
             ));
+            if self.memex_cfg.deployment_mode == DeploymentMode::SharedMux {
+                self.messages.push(format!(
+                    "Start the shared daemon with: rmcp_mux --config {} --service {}",
+                    DEFAULT_MUX_CONFIG_PATH, DEFAULT_MUX_SERVICE_NAME
+                ));
+            }
         }
         if error_count > 0 {
             self.messages.push(format!(
@@ -535,8 +913,8 @@ impl App {
         Ok(())
     }
 
-    fn settings_field_count(&self) -> usize {
-        7 // db_path, db_path_mode, http_port, cache_mb, log_level, max_request_bytes, mode
+    pub(crate) fn settings_field_count(&self) -> usize {
+        7
     }
 
     pub fn get_field_value(&self, field: usize) -> String {
@@ -553,8 +931,108 @@ impl App {
             3 => self.memex_cfg.cache_mb.to_string(),
             4 => self.memex_cfg.log_level.clone(),
             5 => self.memex_cfg.max_request_bytes.to_string(),
-            6 => self.memex_cfg.mode.clone(),
+            6 => match self.memex_cfg.deployment_mode {
+                DeploymentMode::PerHostStdio => {
+                    if self.mux_proxy_on_path() {
+                        "Per-host (direct)".to_string()
+                    } else {
+                        "Per-host (shared unavailable)".to_string()
+                    }
+                }
+                DeploymentMode::SharedMux => {
+                    if self.mux_proxy_on_path() {
+                        "Shared (mux)".to_string()
+                    } else {
+                        "Shared (blocked: proxy missing)".to_string()
+                    }
+                }
+            },
             _ => String::new(),
+        }
+    }
+
+    pub fn resolved_config_path(&self) -> String {
+        let expanded = shellexpand::tilde(&self.config_path).to_string();
+        let path = PathBuf::from(&expanded);
+        if path.is_absolute() {
+            expanded
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(path).display().to_string()
+        } else {
+            expanded
+        }
+    }
+
+    fn refresh_embedding_config(&mut self) {
+        self.embedding_config = self.embedder_state.build_embedding_config();
+    }
+
+    fn invalidate_dimension_probe_generation(&mut self) {
+        self.dimension_probe_generation = self.dimension_probe_generation.wrapping_add(1);
+    }
+
+    fn cancel_dimension_probe_task(&mut self) {
+        if let Some((_, handle)) = self.dimension_probe_task.take() {
+            handle.abort();
+        }
+        self.invalidate_dimension_probe_generation();
+    }
+
+    fn start_dimension_probe_task(&mut self, rt: &tokio::runtime::Handle) {
+        if self.dimension_probe_task.is_some() {
+            return;
+        }
+
+        let Some(provider) = self.embedder_state.pending_dimension_probe.take() else {
+            return;
+        };
+
+        let generation = self.dimension_probe_generation;
+        let task = rt.spawn(async move {
+            let client = Client::builder()
+                .timeout(Duration::from_secs(8))
+                .connect_timeout(Duration::from_secs(3))
+                .build()
+                .unwrap_or_default();
+
+            probe_provider_dimension(&client, &provider).await
+        });
+
+        self.dimension_probe_task = Some((generation, task));
+    }
+
+    fn apply_dimension_probe_completion(&mut self, generation: u64, result: Result<usize>) -> bool {
+        if generation != self.dimension_probe_generation {
+            return false;
+        }
+
+        self.embedder_state.apply_probe_result(result);
+        self.refresh_embedding_config();
+        true
+    }
+
+    fn poll_dimension_probe_task(&mut self, rt: &tokio::runtime::Handle) {
+        let Some((generation, handle)) = self.dimension_probe_task.take() else {
+            return;
+        };
+
+        if !handle.is_finished() {
+            self.dimension_probe_task = Some((generation, handle));
+            return;
+        }
+
+        let join_result = tokio::task::block_in_place(|| rt.block_on(handle));
+        match join_result {
+            Ok(result) => {
+                let _ = self.apply_dimension_probe_completion(generation, result);
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                let _ = self.apply_dimension_probe_completion(
+                    generation,
+                    Err(anyhow!("dimension probe task failed: {}", error)),
+                );
+            }
         }
     }
 
@@ -587,7 +1065,7 @@ impl App {
                     self.memex_cfg.max_request_bytes = v;
                 }
             }
-            6 => self.memex_cfg.mode = value,
+            6 => self.toggle_deployment_mode(),
             _ => {}
         }
     }
@@ -597,6 +1075,50 @@ impl App {
         if self.input_mode || self.data_setup.input_mode {
             self.handle_input_key(key);
             return;
+        }
+
+        if self.step == WizardStep::DataSetup
+            && self.data_setup.sub_step == DataSetupSubStep::Indexing
+        {
+            match key {
+                KeyCode::Char(' ') => {
+                    let next = if self.index_paused {
+                        IndexControl::Resume
+                    } else {
+                        IndexControl::Pause
+                    };
+                    if self.send_index_control(next) {
+                        self.index_paused = !self.index_paused;
+                    }
+                    return;
+                }
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    self.index_parallelism = self.index_parallelism.saturating_add(1);
+                    if !self
+                        .send_index_control(IndexControl::SetParallelism(self.index_parallelism))
+                    {
+                        self.index_parallelism = self.index_parallelism.saturating_sub(1).max(1);
+                    }
+                    return;
+                }
+                KeyCode::Char('-') => {
+                    let previous = self.index_parallelism;
+                    self.index_parallelism = self.index_parallelism.saturating_sub(1).max(1);
+                    if previous != self.index_parallelism
+                        && !self.send_index_control(IndexControl::SetParallelism(
+                            self.index_parallelism,
+                        ))
+                    {
+                        self.index_parallelism = previous;
+                    }
+                    return;
+                }
+                KeyCode::Char('s') => {
+                    let _ = self.send_index_control(IndexControl::Stop);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         match key {
@@ -614,11 +1136,8 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.handle_up(),
             KeyCode::Down | KeyCode::Char('j') => self.handle_down(),
             KeyCode::Char(' ') => self.handle_space(),
-            KeyCode::Char('r') => {
-                // Retry health check
-                if self.step == WizardStep::HealthCheck && !self.health_running {
-                    self.trigger_health_check();
-                }
+            KeyCode::Char('r') if self.step == WizardStep::HealthCheck && !self.health_running => {
+                self.trigger_health_check();
             }
             _ => {}
         }
@@ -667,23 +1186,24 @@ impl App {
                         // Handle embedder setup fields
                         if self.step == WizardStep::EmbedderSetup && self.embedder_state.use_manual
                         {
+                            self.cancel_dimension_probe_task();
                             match field {
                                 0 => self.embedder_state.manual_url = self.input_buffer.clone(),
                                 1 => {
                                     self.embedder_state.manual_model = self.input_buffer.clone();
-                                    if let Some(dim) =
-                                        infer_embedding_dimension(&self.embedder_state.manual_model)
-                                    {
-                                        self.embedder_state.dimension = dim;
-                                    }
+                                    self.embedder_state.refresh_manual_dimension_state();
                                 }
                                 2 => {
                                     if let Ok(dim) = self.input_buffer.parse() {
-                                        self.embedder_state.dimension = dim;
+                                        self.embedder_state.set_manual_dimension(dim);
                                     }
                                 }
                                 _ => {}
                             }
+                            if field == 0 {
+                                self.embedder_state.refresh_manual_dimension_state();
+                            }
+                            self.refresh_embedding_config();
                         } else {
                             self.set_field_value(field, self.input_buffer.clone());
                         }
@@ -724,15 +1244,11 @@ impl App {
                 self.editing_field = Some(self.focus);
                 self.input_buffer = self.get_field_value(self.focus);
             }
-            WizardStep::HostSelection => {
-                if self.focus < self.hosts.len() {
-                    self.toggle_host(self.focus);
-                }
+            WizardStep::HostSelection if self.focus < self.hosts.len() => {
+                self.toggle_host(self.focus);
             }
-            WizardStep::HealthCheck => {
-                if !self.health_running {
-                    self.trigger_health_check();
-                }
+            WizardStep::HealthCheck if !self.health_running => {
+                self.trigger_health_check();
             }
             WizardStep::DataSetup => {
                 self.handle_data_setup_enter();
@@ -766,15 +1282,17 @@ impl App {
             };
         } else if self.focus < self.embedder_state.detected_providers.len() {
             // Select a detected provider
+            self.cancel_dimension_probe_task();
             let provider = self.embedder_state.detected_providers[self.focus].clone();
-            self.embedder_state.dimension = provider
-                .inferred_dimension()
-                .unwrap_or(self.embedder_state.dimension);
-            self.embedder_state.selected_provider = Some(provider);
+            self.embedder_state.apply_detected_provider(provider);
+            self.refresh_embedding_config();
         } else {
             // Switch to manual configuration (last option)
+            self.cancel_dimension_probe_task();
             self.embedder_state.use_manual = true;
             self.focus = 0;
+            self.embedder_state.refresh_manual_dimension_state();
+            self.refresh_embedding_config();
         }
     }
 
@@ -861,9 +1379,69 @@ impl App {
         }
     }
 
+    fn send_index_control(&mut self, control: IndexControl) -> bool {
+        let Some(tx) = self.index_control_tx.clone() else {
+            return false;
+        };
+
+        match tx.try_send(control) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.messages
+                    .push("[WARN] Index control queue is full; try again in a moment.".to_string());
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.messages
+                    .push("[WARN] Indexing controls are no longer available.".to_string());
+                self.index_control_tx = None;
+                false
+            }
+        }
+    }
+
+    pub fn current_index_telemetry(&self) -> Option<IndexTelemetrySnapshot> {
+        self.telemetry_rx
+            .as_ref()
+            .map(|receiver| receiver.borrow().clone())
+    }
+
+    pub fn current_monitor_snapshot(&self) -> Option<MonitorSnapshot> {
+        self.monitor_rx
+            .as_ref()
+            .map(|receiver| receiver.borrow().clone())
+    }
+
+    fn finish_indexing_from_snapshot(&mut self, snapshot: &IndexTelemetrySnapshot) {
+        if let Some(error) = &snapshot.fatal_error {
+            self.messages.push(format!(
+                "[ERR] Indexing failed after {}/{} files: {}",
+                snapshot.processed, snapshot.total, error
+            ));
+        } else if snapshot.stopped_early {
+            self.messages.push(format!(
+                "[WARN] Indexing stopped after {}/{} files ({} indexed, {} skipped, {} failed).",
+                snapshot.processed,
+                snapshot.total,
+                snapshot.indexed,
+                snapshot.skipped,
+                snapshot.failed
+            ));
+        } else {
+            self.messages.push(format!(
+                "[OK] Indexing finished: {} indexed, {} skipped, {} failed, {} chunks.",
+                snapshot.indexed, snapshot.skipped, snapshot.failed, snapshot.total_chunks
+            ));
+        }
+
+        self.data_setup.sub_step = DataSetupSubStep::Complete;
+        self.stop_indexing_tasks();
+    }
+
     /// Trigger the async health check
     pub fn trigger_health_check(&mut self) {
         self.health_running = true;
+        self.health_result = None;
         self.health_status = Some("Running health checks...".to_string());
         self.messages.clear();
 
@@ -895,8 +1473,9 @@ impl App {
         }
 
         let checker = HealthChecker::new();
+        let effective_path = self.memex_cfg.resolved_db_path();
         let result = checker
-            .run_all(&self.embedding_config, &self.memex_cfg.db_path)
+            .run_all(&self.embedding_config, &effective_path)
             .await;
 
         self.health_result = Some(result.clone());
@@ -915,25 +1494,101 @@ impl App {
 
     /// Start the indexing task
     fn start_indexing_task(&mut self) {
-        if let Some(ref source_path) = self.data_setup.source_path
-            && let Some(ref namespace) = self.data_setup.namespace
-        {
-            let path = PathBuf::from(shellexpand::tilde(source_path).to_string());
-            let rx = start_indexing(
-                path,
-                namespace.clone(),
-                self.embedding_config.clone(),
-                self.memex_cfg.db_path.clone(),
-            );
-            self.index_progress_rx = Some(rx);
+        let Some(source_path) = self.data_setup.source_path.clone() else {
+            return;
+        };
+        let Some(namespace) = self.data_setup.namespace.clone() else {
+            return;
+        };
+
+        let path = match validate_path(&source_path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.data_setup.validation_error = Some(error.to_string());
+                self.data_setup.sub_step = DataSetupSubStep::EnterPath;
+                self.data_setup.input_mode = true;
+                self.data_setup.input_buffer = source_path;
+                return;
+            }
+        };
+
+        let files = match collect_indexable_files(&path) {
+            Ok(files) if !files.is_empty() => files,
+            Ok(_) => {
+                self.data_setup.validation_error =
+                    Some("No indexable files found in the selected directory.".to_string());
+                self.data_setup.sub_step = DataSetupSubStep::EnterPath;
+                self.data_setup.input_mode = true;
+                self.data_setup.input_buffer = source_path;
+                return;
+            }
+            Err(error) => {
+                self.data_setup.validation_error = Some(error.to_string());
+                self.data_setup.sub_step = DataSetupSubStep::EnterPath;
+                self.data_setup.input_mode = true;
+                self.data_setup.input_buffer = source_path;
+                return;
+            }
+        };
+
+        self.data_setup.validation_error = None;
+        self.messages.clear();
+        self.stop_indexing_tasks();
+
+        let total_files = files.len();
+        let (telemetry_tx, telemetry_rx) = new_index_telemetry();
+        let telemetry_tx: SharedIndexTelemetry = telemetry_tx;
+        let tui_sink = Arc::new(TuiTelemetrySink::new(Arc::new(telemetry_tx)));
+        let tracing_sink = Arc::new(TracingSink);
+        let sinks: Vec<Arc<dyn IndexEventSink>> = vec![tui_sink, tracing_sink];
+        let sink: Arc<dyn IndexEventSink> = Arc::new(FanOut::new(sinks));
+        let (control_tx, control_rx) =
+            mpsc::channel(crate::tui::indexer::INDEX_CONTROL_CHANNEL_CAPACITY);
+
+        self.index_task = Some(start_indexing(
+            path,
+            files,
+            namespace.clone(),
+            self.embedding_config.clone(),
+            self.memex_cfg.resolved_db_path(),
+            sink,
+            control_rx,
+            self.index_parallelism,
+        ));
+
+        let (monitor_rx, monitor_task) = spawn_monitor(Duration::from_secs(1));
+
+        self.telemetry_rx = Some(telemetry_rx);
+        self.monitor_rx = Some(monitor_rx);
+        self.index_control_tx = Some(control_tx);
+        self.monitor_task = Some(monitor_task);
+        self.index_paused = false;
+        self.messages.push(format!(
+            "[INFO] Indexing {} files into namespace {}.",
+            total_files, namespace
+        ));
+    }
+
+    fn stop_indexing_tasks(&mut self) {
+        if let Some(handle) = self.index_task.take() {
+            handle.abort();
         }
+        if let Some(handle) = self.monitor_task.take() {
+            handle.abort();
+        }
+
+        self.telemetry_rx = None;
+        self.monitor_rx = None;
+        self.index_control_tx = None;
+        self.index_paused = false;
     }
 
     /// Perform LanceDB import
     fn perform_import(&mut self) {
         if let Some(ref source_path) = self.data_setup.source_path {
             let source = PathBuf::from(shellexpand::tilde(source_path).to_string());
-            let target = PathBuf::from(shellexpand::tilde(&self.memex_cfg.db_path).to_string());
+            let target =
+                PathBuf::from(shellexpand::tilde(&self.memex_cfg.resolved_db_path()).to_string());
 
             // Run import synchronously for now (it's mostly IO)
             let rt = tokio::runtime::Handle::try_current();
@@ -958,30 +1613,6 @@ impl App {
         }
     }
 
-    /// Check for indexing progress updates
-    pub fn poll_index_progress(&mut self) {
-        if let Some(ref mut rx) = self.index_progress_rx {
-            while let Ok(progress) = rx.try_recv() {
-                self.data_setup.progress = Some(progress.clone());
-                if progress.complete {
-                    if let Some(ref error) = progress.error {
-                        self.messages
-                            .push(format!("[ERR] Indexing failed: {}", error));
-                    } else {
-                        self.messages.push(format!(
-                            "[OK] Indexed {} files ({} skipped)",
-                            progress.processed - progress.skipped,
-                            progress.skipped
-                        ));
-                    }
-                    self.data_setup.sub_step = DataSetupSubStep::Complete;
-                    self.index_progress_rx = None;
-                    break;
-                }
-            }
-        }
-    }
-
     /// Run provider detection asynchronously
     pub async fn run_provider_detection(&mut self) {
         if self.embedder_state.detecting {
@@ -994,12 +1625,15 @@ impl App {
                 .detected_providers
                 .iter()
                 .find(|p| p.is_usable())
+                .cloned()
             {
-                self.embedder_state.selected_provider = Some(provider.clone());
-                self.embedder_state.dimension = provider
-                    .inferred_dimension()
-                    .unwrap_or(self.embedder_state.dimension);
+                self.cancel_dimension_probe_task();
+                self.embedder_state.apply_detected_provider(provider);
+            } else {
+                self.cancel_dimension_probe_task();
+                self.embedder_state.reset_probe_state();
             }
+            self.refresh_embedding_config();
         }
     }
 
@@ -1032,11 +1666,6 @@ impl App {
             self.memex_cfg.max_request_bytes
         ));
 
-        // HTTP/SSE server configuration
-        if let Some(port) = self.memex_cfg.http_port {
-            toml.push_str("\n# HTTP/SSE server for multi-agent access\n");
-            toml.push_str(&format!("http_port = {}\n", port));
-        }
         toml.push('\n');
 
         // Embeddings configuration
@@ -1094,11 +1723,14 @@ impl App {
             ));
         }
 
+        if let Some(reason) = self.embedder_state.dimension_write_blocker() {
+            return Err(anyhow!(reason));
+        }
+
         if self.dry_run {
             self.messages
                 .push("DRY RUN: Config would be written to:".to_string());
-            self.messages
-                .push("  ~/.rmcp-servers/rmcp-memex/config.toml".to_string());
+            self.messages.push(format!("  {}", self.config_path));
             self.messages.push(String::new());
             self.messages.push("Generated config:".to_string());
             self.messages.push("---".to_string());
@@ -1110,14 +1742,17 @@ impl App {
             return Ok(());
         }
 
-        // Create config directory
-        let config_dir = shellexpand::tilde("~/.rmcp-servers/rmcp-memex").to_string();
-        let config_path = format!("{}/config.toml", config_dir);
-
-        std::fs::create_dir_all(&config_dir)?;
+        let config_path = self.resolved_config_path();
+        let config_file = PathBuf::from(&config_path);
+        let config_dir = config_file.parent().ok_or_else(|| {
+            anyhow!(
+                "Cannot determine parent directory for config path {}",
+                self.config_path
+            )
+        })?;
+        std::fs::create_dir_all(config_dir)?;
 
         // Backup existing config if present
-        let config_file = PathBuf::from(&config_path);
         if config_file.exists() {
             let backup_path = format!("{}.bak.{}", config_path, timestamp());
             std::fs::copy(&config_file, &backup_path)?;
@@ -1132,7 +1767,7 @@ impl App {
             .push(format!("[OK] Config written: {}", config_path));
 
         // Create database directory if needed
-        let db_path = shellexpand::tilde(&self.memex_cfg.db_path).to_string();
+        let db_path = shellexpand::tilde(&self.memex_cfg.resolved_db_path()).to_string();
         if let Some(parent) = PathBuf::from(&db_path).parent()
             && !parent.exists()
         {
@@ -1144,8 +1779,15 @@ impl App {
         self.config_written = true;
         self.messages.push(String::new());
         self.messages.push("Configuration complete!".to_string());
-        self.messages
-            .push("Run 'rmcp_memex serve' to start the server.".to_string());
+        if self.config_path == DEFAULT_MEMEX_CONFIG_PATH {
+            self.messages
+                .push("Run 'rmcp-memex serve' to start the server.".to_string());
+        } else {
+            self.messages.push(format!(
+                "Run 'rmcp-memex serve --config {}' to start the server.",
+                self.config_path
+            ));
+        }
 
         Ok(())
     }
@@ -1161,12 +1803,18 @@ fn timestamp() -> String {
 }
 
 fn which_rmcp_memex() -> Option<String> {
-    std::process::Command::new("which")
-        .arg("rmcp_memex")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    which_binary(&["rmcp-memex", "rmcp_memex"])
+}
+
+fn which_binary(candidates: &[&str]) -> Option<String> {
+    candidates.iter().find_map(|binary| {
+        std::process::Command::new("which")
+            .arg(binary)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    })
 }
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -1213,10 +1861,27 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
     };
 
     loop {
-        terminal.draw(|f| render(f, app))?;
+        app.start_dimension_probe_task(&rt);
+        app.poll_dimension_probe_task(&rt);
 
-        // Poll for index progress updates
-        app.poll_index_progress();
+        let current_telemetry = app.current_index_telemetry();
+        if app.step == WizardStep::DataSetup
+            && app.data_setup.sub_step == DataSetupSubStep::Indexing
+            && let Some(snapshot) = current_telemetry.as_ref()
+            && snapshot.complete
+        {
+            app.finish_indexing_from_snapshot(snapshot);
+        }
+        let current_monitor = app.current_monitor_snapshot();
+
+        terminal.draw(|frame| {
+            render(
+                frame,
+                app,
+                current_telemetry.as_ref(),
+                current_monitor.as_ref(),
+            )
+        })?;
 
         // Handle async provider detection
         if app.embedder_state.detecting {
@@ -1246,9 +1911,142 @@ fn run_app(terminal: &mut Tui, app: &mut App) -> Result<()> {
         }
 
         if app.should_quit {
+            app.cancel_dimension_probe_task();
+            app.stop_indexing_tasks();
             break;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::detection::ProviderStatus;
+
+    fn detected_provider(model: &str) -> DetectedProvider {
+        DetectedProvider {
+            kind: ProviderKind::Ollama,
+            base_url: "http://localhost:11434".to_string(),
+            port: 11434,
+            models: vec![model.to_string()],
+            suggested_model: Some(model.to_string()),
+            status: ProviderStatus::Online(model.to_string()),
+        }
+    }
+
+    #[test]
+    fn detected_provider_selection_queues_probe_as_pending() {
+        let mut state = EmbedderState::default();
+        state.apply_detected_provider(detected_provider("qwen3-embedding:8b"));
+
+        assert_eq!(state.dimension, DEFAULT_REQUIRED_DIMENSION);
+        assert_eq!(state.dimension_truth, DimensionTruth::Pending);
+        assert!(state.dimension_probe_in_flight);
+        assert!(state.pending_dimension_probe.is_some());
+        assert!(state.dimension_write_blocker().is_some());
+    }
+
+    #[test]
+    fn manual_dimension_override_is_writable_without_probe() {
+        let mut state = EmbedderState {
+            use_manual: true,
+            manual_url: "http://localhost:11434".to_string(),
+            manual_model: "custom-embed".to_string(),
+            ..EmbedderState::default()
+        };
+
+        state.set_manual_dimension(1536);
+
+        assert_eq!(state.dimension, 1536);
+        assert_eq!(state.dimension_truth, DimensionTruth::Manual);
+        assert!(!state.dimension_probe_in_flight);
+        assert!(state.dimension_write_blocker().is_none());
+    }
+
+    #[test]
+    fn unknown_manual_model_without_probe_stays_blocked() {
+        let mut state = EmbedderState {
+            use_manual: true,
+            manual_model: "custom-embed".to_string(),
+            manual_url: String::new(),
+            ..EmbedderState::default()
+        };
+
+        state.refresh_manual_dimension_state();
+
+        assert_eq!(state.dimension_truth, DimensionTruth::Pending);
+        assert!(state.dimension_write_blocker().is_some());
+    }
+
+    #[test]
+    fn stale_probe_completion_cannot_override_newer_manual_choice() {
+        let mut app = App::new(WizardConfig::default());
+        app.embedder_state
+            .apply_detected_provider(detected_provider("qwen3-embedding:8b"));
+        app.refresh_embedding_config();
+
+        app.dimension_probe_generation = 5;
+        app.cancel_dimension_probe_task();
+        app.embedder_state.set_manual_dimension(1536);
+        app.refresh_embedding_config();
+
+        let applied = app.apply_dimension_probe_completion(5, Ok(4096));
+
+        assert!(!applied);
+        assert_eq!(app.embedder_state.dimension, 1536);
+        assert_eq!(app.embedder_state.dimension_truth, DimensionTruth::Manual);
+        assert_eq!(app.embedding_config.required_dimension, 1536);
+    }
+
+    #[test]
+    fn shared_mux_write_requires_resolved_proxy_command() {
+        let mut app = App::new(WizardConfig {
+            dry_run: true,
+            ..WizardConfig::default()
+        });
+        app.memex_cfg.deployment_mode = DeploymentMode::SharedMux;
+        app.mux_proxy_command = None;
+
+        let error = app
+            .write_configs()
+            .expect_err("shared mux should be blocked");
+        assert!(
+            error
+                .to_string()
+                .contains("Shared mux mode requires `rmcp_mux_proxy` or `rmcp-mux-proxy` on PATH")
+        );
+    }
+
+    #[test]
+    fn deployment_mode_toggle_without_proxy_stays_direct_and_warns() {
+        let mut app = App::new(WizardConfig::default());
+        app.mux_proxy_command = None;
+
+        app.set_field_value(6, String::new());
+
+        assert_eq!(app.memex_cfg.deployment_mode, DeploymentMode::PerHostStdio);
+        assert_eq!(
+            app.get_field_value(6),
+            "Per-host (shared unavailable)".to_string()
+        );
+        assert!(
+            app.messages
+                .last()
+                .expect("warning message")
+                .contains("Shared mux mode is unavailable")
+        );
+    }
+
+    #[test]
+    fn deployment_mode_toggle_with_proxy_enables_shared_mux() {
+        let mut app = App::new(WizardConfig::default());
+        app.mux_proxy_command = Some("/usr/local/bin/rmcp-mux-proxy".to_string());
+
+        app.set_field_value(6, String::new());
+
+        assert_eq!(app.memex_cfg.deployment_mode, DeploymentMode::SharedMux);
+        assert_eq!(app.get_field_value(6), "Shared (mux)".to_string());
+    }
 }

@@ -3,9 +3,72 @@
 //! These tests focus on the storage layer using temp directories.
 //! Tests that require embeddings (Ollama) are skipped if unavailable.
 
-use rmcp_memex::{BatchResult, MemexConfig, MetaFilter, StorageManager, StoreItem};
+use axum::{Json, Router, extract::State, routing::post};
+use rmcp_memex::{
+    BatchResult, ChromaDocument, EmbeddingConfig, MemexConfig, MemexEngine, MetaFilter,
+    ProviderConfig, StorageManager, StoreItem,
+};
+use serde::Deserialize;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::{net::TcpListener, task::JoinHandle};
+
+#[derive(Clone)]
+struct MockEmbeddingState {
+    dimension: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct MockEmbeddingRequest {
+    input: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MockEmbeddingResponse {
+    data: Vec<MockEmbeddingData>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct MockEmbeddingData {
+    embedding: Vec<f32>,
+}
+
+async fn mock_embeddings(
+    State(state): State<MockEmbeddingState>,
+    Json(request): Json<MockEmbeddingRequest>,
+) -> Json<MockEmbeddingResponse> {
+    let data = request
+        .input
+        .into_iter()
+        .map(|_| MockEmbeddingData {
+            embedding: vec![0.25_f32; state.dimension],
+        })
+        .collect();
+
+    Json(MockEmbeddingResponse { data })
+}
+
+async fn start_mock_embedding_server(dimension: usize) -> (String, JoinHandle<()>) {
+    let app = Router::new()
+        .route("/v1/embeddings", post(mock_embeddings))
+        .with_state(MockEmbeddingState { dimension });
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind mock embedding server");
+    let address = listener
+        .local_addr()
+        .expect("Failed to get mock embedding server address");
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock embedding server failed");
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    (format!("http://{}", address), handle)
+}
 
 // =============================================================================
 // STORAGE MANAGER TESTS (No embeddings required)
@@ -189,8 +252,6 @@ async fn test_storage_document_operations() {
 /// Test search with dummy embeddings (verifies storage layer)
 #[tokio::test]
 async fn test_storage_search_operations() {
-    use rmcp_memex::ChromaDocument;
-
     let tmp = TempDir::new().expect("Failed to create temp dir");
     let db_path = tmp.path().join("lancedb");
 
@@ -237,8 +298,6 @@ async fn test_storage_search_operations() {
 /// Test namespace isolation
 #[tokio::test]
 async fn test_namespace_isolation() {
-    use rmcp_memex::ChromaDocument;
-
     let tmp = TempDir::new().expect("Failed to create temp dir");
     let db_path = tmp.path().join("lancedb");
 
@@ -356,6 +415,98 @@ async fn test_content_hash_storage() {
     assert!(exists_after);
 }
 
+#[tokio::test]
+async fn test_delete_by_filter_scans_past_first_page() {
+    const DIMENSION: usize = 8;
+    let (base_url, server_handle) = start_mock_embedding_server(DIMENSION).await;
+
+    let tmp = TempDir::new().expect("Failed to create temp dir");
+    let db_path = tmp.path().join("lancedb");
+
+    let embedding_config = EmbeddingConfig {
+        required_dimension: DIMENSION,
+        max_batch_chars: 32_000,
+        max_batch_items: 16,
+        providers: vec![ProviderConfig {
+            name: "mock".to_string(),
+            base_url,
+            model: "mock-embedder".to_string(),
+            priority: 1,
+            endpoint: "/v1/embeddings".to_string(),
+        }],
+        reranker: Default::default(),
+    };
+
+    let mut config = MemexConfig::new("delete-filter-test", "filter-ns")
+        .with_dimension(DIMENSION)
+        .with_db_path(db_path.to_str().unwrap())
+        .with_embedding_config(embedding_config);
+    config.enable_hybrid = false;
+
+    let engine = MemexEngine::new(config)
+        .await
+        .expect("Failed to create engine");
+    let storage = engine.storage();
+
+    let docs: Vec<ChromaDocument> = (0..1105)
+        .map(|idx| {
+            let doc_type = if idx >= 1000 { "target" } else { "keep" };
+            ChromaDocument::new_flat(
+                format!("doc-{idx:04}"),
+                "filter-ns".to_string(),
+                vec![0.5_f32; DIMENSION],
+                json!({ "doc_type": doc_type, "idx": idx }),
+                format!("Document {idx}"),
+            )
+        })
+        .collect();
+
+    storage
+        .add_to_store(docs)
+        .await
+        .expect("Failed to seed documents");
+
+    let deleted = engine
+        .delete_by_filter(MetaFilter {
+            doc_type: Some("target".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("delete_by_filter should succeed");
+
+    assert_eq!(
+        deleted, 105,
+        "all target docs past the first page should delete"
+    );
+
+    let remaining = storage
+        .all_documents(Some("filter-ns"), 2000)
+        .await
+        .expect("Failed to read remaining documents");
+    let remaining_target = remaining
+        .iter()
+        .filter(|doc| doc.metadata["doc_type"] == "target")
+        .count();
+    let remaining_keep = remaining
+        .iter()
+        .filter(|doc| doc.metadata["doc_type"] == "keep")
+        .count();
+
+    assert_eq!(remaining_target, 0, "target docs should be fully removed");
+    assert_eq!(remaining_keep, 1000, "non-matching docs should remain");
+
+    let deleted_again = engine
+        .delete_by_filter(MetaFilter {
+            doc_type: Some("target".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("idempotent delete_by_filter should succeed");
+    assert_eq!(deleted_again, 0, "second delete should find nothing");
+
+    server_handle.abort();
+}
+
 // =============================================================================
 // BATCH OPERATIONS TESTS
 // =============================================================================
@@ -363,8 +514,6 @@ async fn test_content_hash_storage() {
 /// Test adding many documents in batch
 #[tokio::test]
 async fn test_batch_add_many_documents() {
-    use rmcp_memex::ChromaDocument;
-
     let tmp = TempDir::new().expect("Failed to create temp dir");
     let db_path = tmp.path().join("lancedb");
 

@@ -6,7 +6,7 @@ use tokio::sync::Mutex;
 
 use rmcp_memex::{
     BM25Config, EmbeddingClient, EmbeddingConfig, HybridConfig, HybridSearcher, RAGPipeline,
-    SearchMode, SliceLayer, StorageManager, path_utils,
+    SearchMode, SearchOptions, SliceLayer, StorageManager, path_utils,
 };
 
 #[allow(dead_code)]
@@ -154,7 +154,10 @@ pub async fn run_search(config: SearchConfig<'_>) -> Result<()> {
                 query_embedding,
                 Some(&namespace),
                 limit,
-                layer_filter,
+                SearchOptions {
+                    layer_filter,
+                    project_filter: None,
+                },
             )
             .await?;
 
@@ -482,7 +485,7 @@ pub async fn run_cross_search(
                 query_embedding.clone(),
                 Some(ns.as_str()),
                 limit_per_ns,
-                None,
+                SearchOptions::default(),
             )
             .await?;
 

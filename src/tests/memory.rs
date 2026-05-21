@@ -1,6 +1,8 @@
 use crate::{
-    BM25Config, BM25Index, EmbeddingConfig, MLXBridge, ProviderConfig, SearchOptions, SliceLayer,
-    SliceMode, compute_content_hash, rag::RAGPipeline, storage::StorageManager,
+    BM25Config, BM25Index, ChromaDocument, CrossStoreRecoveryBatch, CrossStoreRecoveryStatus,
+    EmbeddingConfig, MLXBridge, ProviderConfig, SearchOptions, SliceLayer, SliceMode,
+    compute_content_hash, inspect_cross_store_recovery, rag::RAGPipeline,
+    repair_cross_store_recovery, storage::StorageManager,
 };
 use anyhow::{Result, anyhow};
 use serde_json::json;
@@ -114,6 +116,136 @@ async fn rag_pipeline_syncs_bm25_writes() -> Result<()> {
     let results = bm25.search("kota", Some("testns"), 10)?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, "doc1");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rag_pipeline_rolls_back_lance_write_when_bm25_write_fails() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let bm25 = Arc::new(BM25Index::new(
+        &BM25Config::default()
+            .with_path(bm25_path.to_string_lossy().into_owned())
+            .with_read_only(true),
+    )?);
+    let rag = RAGPipeline::new_with_bm25(mlx, storage.clone(), Some(bm25)).await?;
+
+    let err = rag
+        .index_text_with_mode(
+            Some("rollback-ns"),
+            "doc1".to_string(),
+            "This batch should never survive a failed BM25 write because rollback keeps LanceDB truthful."
+                .to_string(),
+            json!({"kind": "rollback-guard"}),
+            SliceMode::Flat,
+        )
+        .await
+        .expect_err("read-only BM25 should reject the write path");
+
+    assert!(
+        err.to_string().contains("read-only mode"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        storage
+            .get_all_in_namespace("rollback-ns")
+            .await?
+            .is_empty(),
+        "LanceDB rows should be rolled back when BM25 indexing fails"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn repair_cross_store_replays_bm25_for_pending_lance_batch() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
+    storage.ensure_collection().await?;
+
+    let bm25 =
+        BM25Index::new(&BM25Config::default().with_path(bm25_path.to_string_lossy().into_owned()))?;
+
+    let text = "Recoverable divergence batch should be replayed into BM25 after Lance survives.";
+    let document = ChromaDocument::new_flat_with_hash(
+        "doc1".to_string(),
+        "repair-ns".to_string(),
+        vec![0.1, 0.2],
+        json!({"kind": "repairable"}),
+        text.to_string(),
+        compute_content_hash(text),
+    );
+    let batch = CrossStoreRecoveryBatch::from_documents(std::slice::from_ref(&document));
+
+    storage.persist_cross_store_recovery_batch(&batch)?;
+    storage.add_to_store(vec![document]).await?;
+
+    let inspect = inspect_cross_store_recovery(&storage, &bm25, Some("repair-ns")).await?;
+    assert_eq!(inspect.pending_batches, 1);
+    assert_eq!(inspect.divergent_batches, 1);
+    assert_eq!(inspect.documents_missing_bm25, 1);
+
+    let repaired = repair_cross_store_recovery(&storage, &bm25, Some("repair-ns")).await?;
+    assert_eq!(repaired.batches_repaired, 1);
+    assert_eq!(repaired.repaired_documents, 1);
+    assert_eq!(repaired.cleared_batches, 1);
+    assert!(storage.list_cross_store_recovery_batches()?.is_empty());
+
+    let results = bm25.search("recoverable", Some("repair-ns"), 10)?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].0, "doc1");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn repair_cross_store_clears_rolled_back_batches_as_skipped() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+    let bm25_path = tmp.path().join(".bm25");
+
+    let storage = StorageManager::new_lance_only(&db_path.to_string_lossy()).await?;
+    storage.ensure_collection().await?;
+
+    let bm25 =
+        BM25Index::new(&BM25Config::default().with_path(bm25_path.to_string_lossy().into_owned()))?;
+
+    let text = "This batch was rolled back before BM25 could keep it.";
+    let document = ChromaDocument::new_flat_with_hash(
+        "doc1".to_string(),
+        "rollback-ledger-ns".to_string(),
+        vec![0.3, 0.4],
+        json!({"kind": "rolled-back"}),
+        text.to_string(),
+        compute_content_hash(text),
+    );
+    let mut batch = CrossStoreRecoveryBatch::from_documents(std::slice::from_ref(&document));
+    batch.status = CrossStoreRecoveryStatus::RolledBack;
+    batch.last_error =
+        Some("BM25 write failed after Lance persist; lance_rollback_failures=0".to_string());
+    storage.persist_cross_store_recovery_batch(&batch)?;
+
+    let inspect = inspect_cross_store_recovery(&storage, &bm25, Some("rollback-ledger-ns")).await?;
+    assert_eq!(inspect.pending_batches, 1);
+    assert_eq!(inspect.rolled_back_batches, 1);
+    assert_eq!(inspect.documents_missing_lance, 1);
+
+    let repaired = repair_cross_store_recovery(&storage, &bm25, Some("rollback-ledger-ns")).await?;
+    assert_eq!(repaired.rolled_back_batches, 1);
+    assert_eq!(repaired.skipped_documents, 1);
+    assert_eq!(repaired.cleared_batches, 1);
+    assert!(storage.list_cross_store_recovery_batches()?.is_empty());
 
     Ok(())
 }
@@ -345,6 +477,168 @@ async fn test_has_content_hash() -> Result<()> {
         .has_content_hash("hash-test", &fake_hash)
         .await?;
     assert!(!fake_exists, "Non-existent hash should return false");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_upsert_replaces_onion_family_by_original_id() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let rag = RAGPipeline::new(mlx, storage.clone()).await?;
+    let namespace = "memory-upsert-onion";
+    let initial_text = "This is a long document about indexing and embeddings. It exists to force onion slicing during the first upsert. \
+The content is intentionally verbose and repetitive so the outer and core layers both exist and can later be replaced cleanly. \
+Project Vista keeps appearing here to provide a stable metadata anchor for search filters.";
+    let updated_text = "This is an updated long document about project search filters, namespace cache invalidation, and release hardening. \
+It should fully replace the previous onion family instead of appending stale slices. \
+The text stays comfortably above the slicing threshold so onion-fast still writes both outer and core documents.";
+
+    rag.memory_upsert(
+        namespace,
+        "doc-1".to_string(),
+        initial_text.to_string(),
+        json!({"slice_mode": "onion-fast", "project": "Vista"}),
+    )
+    .await?;
+
+    let initial_docs = rag
+        .storage_manager()
+        .get_all_in_namespace(namespace)
+        .await?;
+    assert_eq!(
+        initial_docs.len(),
+        2,
+        "onion-fast should create outer + core"
+    );
+    assert!(
+        initial_docs
+            .iter()
+            .all(|doc| doc.metadata["original_id"] == "doc-1")
+    );
+
+    let fetched = rag
+        .lookup_memory(namespace, "doc-1")
+        .await?
+        .ok_or_else(|| anyhow!("expected lookup by original id to resolve onion family"))?;
+    assert_eq!(fetched.layer, Some(SliceLayer::Outer));
+    assert_eq!(fetched.metadata["original_id"], "doc-1");
+
+    rag.memory_upsert(
+        namespace,
+        "doc-1".to_string(),
+        updated_text.to_string(),
+        json!({"slice_mode": "onion-fast", "project": "Vista"}),
+    )
+    .await?;
+
+    let updated_docs = rag
+        .storage_manager()
+        .get_all_in_namespace(namespace)
+        .await?;
+    assert_eq!(
+        updated_docs.len(),
+        2,
+        "upsert should replace the onion family instead of duplicating it"
+    );
+    assert!(
+        updated_docs
+            .iter()
+            .all(|doc| doc.metadata["original_id"] == "doc-1")
+    );
+    assert!(
+        updated_docs
+            .iter()
+            .any(|doc| doc.document.contains("namespace cache invalidation")),
+        "updated content should be present in the stored family"
+    );
+
+    let deleted = rag.remove_memory(namespace, "doc-1").await?;
+    assert_eq!(
+        deleted, 2,
+        "remove_memory should delete the whole onion family"
+    );
+    assert!(
+        rag.storage_manager()
+            .get_all_in_namespace(namespace)
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn flat_memory_upsert_keeps_original_id_for_chunked_family_operations() -> Result<()> {
+    let mlx = require_mlx!(try_mlx_bridge().await);
+
+    let tmp = tempfile::tempdir()?;
+    let db_path = tmp.path().join(".lancedb");
+
+    let storage = Arc::new(StorageManager::new_lance_only(&db_path.to_string_lossy()).await?);
+    storage.ensure_collection().await?;
+
+    let rag = RAGPipeline::new(mlx, storage.clone()).await?;
+    let namespace = "memory-upsert-flat";
+    let original_id = "../customer-notes/../../alpha";
+    let text = "Operator notes about cache invalidation, path hardening, and release readiness. "
+        .repeat(80);
+
+    rag.memory_upsert(
+        namespace,
+        original_id.to_string(),
+        text,
+        json!({"project": "Pathless"}),
+    )
+    .await?;
+
+    let docs = rag
+        .storage_manager()
+        .get_all_in_namespace(namespace)
+        .await?;
+    assert!(
+        docs.len() > 1,
+        "flat memory upsert should chunk this long document into a family"
+    );
+    assert!(
+        docs.iter()
+            .all(|doc| doc.metadata["original_id"] == original_id),
+        "every flat family chunk should remember the caller's original id"
+    );
+    assert!(
+        docs.iter()
+            .all(|doc| doc.id == original_id || doc.id.contains("::chunk::")),
+        "chunk ids should stay in the memory-id domain instead of pretending to be file paths"
+    );
+
+    let fetched = rag
+        .lookup_memory(namespace, original_id)
+        .await?
+        .ok_or_else(|| anyhow!("expected lookup by original id to resolve flat family"))?;
+    assert_eq!(fetched.metadata["original_id"], original_id);
+    assert_eq!(
+        fetched.metadata["chunk_index"], 0,
+        "lookup should deterministically return the first flat chunk"
+    );
+
+    let deleted = rag.remove_memory(namespace, original_id).await?;
+    assert_eq!(
+        deleted,
+        docs.len(),
+        "remove_memory should delete the whole flat family by original id"
+    );
+    assert!(
+        rag.storage_manager()
+            .get_all_in_namespace(namespace)
+            .await?
+            .is_empty()
+    );
 
     Ok(())
 }

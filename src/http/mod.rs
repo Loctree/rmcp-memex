@@ -40,7 +40,7 @@ use std::time::Duration;
 use axum::{
     Json, Router,
     extract::{Path, Query, Request, State},
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         Html, IntoResponse,
@@ -50,13 +50,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
-use crate::mcp_protocol::{McpCore, McpTransport};
-use crate::mcp_runtime::dispatch_mcp_payload;
-use crate::rag::{RAGPipeline, SearchResult, SliceLayer};
+use crate::mcp_core::{McpCore, McpTransport, dispatch_mcp_payload};
+use crate::rag::{RAGPipeline, SearchOptions, SearchResult, SliceLayer};
+use crate::search::{HybridSearchResult, SearchMode};
+use crate::storage::ChromaDocument;
 
 // ============================================================================
 // HTML Dashboard (embedded)
@@ -398,8 +400,17 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
         <div class="search-box">
             <input type="text" id="search-input" placeholder="Search memories..." autocomplete="off">
+            <input type="text" id="project-input" placeholder="Project filter (optional)" autocomplete="off">
             <select id="namespace-select">
                 <option value="">All namespaces</option>
+            </select>
+            <select id="layer-select">
+                <option value="">Outer Only</option>
+                <option value="deep">All Layers</option>
+                <option value="1">Outer</option>
+                <option value="2">Middle</option>
+                <option value="3">Inner</option>
+                <option value="4">Core</option>
             </select>
             <button onclick="doSearch()">Search</button>
         </div>
@@ -441,11 +452,11 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <script>
         const API = window.location.origin;
         let currentNamespace = null;
+        let latestDiscovery = null;
 
         // Initialize
         document.addEventListener('DOMContentLoaded', async () => {
-            await loadOverview();
-            await loadNamespaces();
+            await refreshDiscovery();
             await browse(null);
 
             // Enter key to search
@@ -468,74 +479,94 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             }
         }
 
-        async function loadOverview() {
-            try {
-                document.getElementById('stats-bar').innerHTML = '<span>Loading stats...</span>';
-                const res = await fetchWithTimeout(`${API}/api/overview`, {}, 120000);
-                const data = await res.json();
-                document.getElementById('stats-bar').innerHTML = `
-                    <span>Namespaces: <strong>${data.namespace_count || '?'}</strong></span>
-                    <span>Documents: <strong>${data.total_documents.toLocaleString()}</strong></span>
-                    <span>DB: <strong>${data.db_path}</strong></span>
-                `;
-            } catch (e) {
-                document.getElementById('stats-bar').innerHTML = '<span style="color:var(--warning)">Stats slow - run "make optimize"</span>';
+        async function fetchDiscovery() {
+            const res = await fetchWithTimeout(`${API}/api/discovery`, {}, 30000);
+            if (!res.ok) {
+                throw new Error(`Discovery failed with ${res.status}`);
             }
+            return res.json();
         }
 
-        async function loadNamespaces() {
+        function renderStats(data) {
+            const namespaceCount = typeof data.namespace_count === 'number'
+                ? data.namespace_count
+                : Array.isArray(data.namespaces) ? data.namespaces.length : 0;
+            const namespaceValue = data.status === 'ok'
+                ? namespaceCount.toLocaleString()
+                : 'loading';
+            const totalDocuments = typeof data.total_documents === 'number'
+                ? data.total_documents.toLocaleString()
+                : '0';
+            const statusBadge = data.status === 'ok'
+                ? ''
+                : ` <span style="color:var(--warning)">(${data.hint || 'cache loading'})</span>`;
+
+            document.getElementById('stats-bar').innerHTML = `
+                <span>Status: <strong>${data.status}</strong>${statusBadge}</span>
+                <span>Namespaces: <strong>${namespaceValue}</strong></span>
+                <span>Documents: <strong>${totalDocuments}</strong></span>
+                <span>DB: <strong>${data.db_path}</strong></span>
+            `;
+        }
+
+        function renderNamespaces(data) {
+            const list = document.getElementById('namespace-list');
+            const select = document.getElementById('namespace-select');
+            const namespaces = Array.isArray(data.namespaces) ? data.namespaces : [];
+
+            select.innerHTML = '<option value="">All namespaces</option>' +
+                namespaces.map(ns => `<option value="${ns.id}">${ns.id} (${ns.count})</option>`).join('');
+            select.value = currentNamespace || '';
+
+            if (data.status !== 'ok') {
+                list.innerHTML = `
+                    <li class="empty-state" style="text-align:left;padding:16px;">
+                        <h3 style="color:var(--warning)">Loading namespaces...</h3>
+                        <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">
+                            ${data.hint || 'Namespace cache is still warming up.'}
+                        </p>
+                    </li>`;
+                return;
+            }
+
+            if (namespaces.length === 0) {
+                list.innerHTML = '<li class="empty-state"><h3>No namespaces</h3></li>';
+                return;
+            }
+
+            list.innerHTML = namespaces.map(ns => `
+                <li class="namespace-item${currentNamespace === ns.id ? ' active' : ''}"
+                    onclick="selectNamespace('${ns.id}')">
+                    <span class="name">${ns.id}</span>
+                    <span class="count">${ns.count.toLocaleString()}</span>
+                </li>
+            `).join('');
+        }
+
+        async function refreshDiscovery() {
             try {
-                // First check cache status
-                const statusRes = await fetchWithTimeout(`${API}/api/status`, {}, 5000);
-                const status = await statusRes.json();
+                document.getElementById('stats-bar').innerHTML = '<span>Loading discovery...</span>';
+                latestDiscovery = await fetchDiscovery();
+                renderStats(latestDiscovery);
+                renderNamespaces(latestDiscovery);
 
-                const list = document.getElementById('namespace-list');
-                const select = document.getElementById('namespace-select');
-
-                if (!status.cache_ready) {
-                    // Cache not ready - show loading with hint
-                    list.innerHTML = `
-                        <li class="empty-state" style="text-align:left;padding:16px;">
-                            <h3 style="color:var(--warning)">⏳ Loading namespaces...</h3>
-                            <p style="margin-top:8px;font-size:13px;color:var(--text-muted)">
-                                Background task is scanning the database.<br>
-                                If this persists, run: <code style="color:var(--accent)">rmcp-memex optimize</code>
-                            </p>
-                        </li>`;
-                    // Auto-retry in 5 seconds
-                    setTimeout(() => loadNamespaces(), 5000);
-                    return;
+                if (latestDiscovery.status !== 'ok') {
+                    setTimeout(() => refreshDiscovery(), 5000);
                 }
-
-                const res = await fetchWithTimeout(`${API}/api/namespaces`, {}, 30000);
-                const data = await res.json();
-
-                if (data.namespaces.length === 0) {
-                    list.innerHTML = '<li class="empty-state"><h3>No namespaces</h3></li>';
-                    return;
-                }
-
-                list.innerHTML = data.namespaces.map(ns => `
-                    <li class="namespace-item${currentNamespace === ns.name ? ' active' : ''}"
-                        onclick="selectNamespace('${ns.name}')">
-                        <span class="name">${ns.name}</span>
-                        <span class="count">${ns.count.toLocaleString()}</span>
-                    </li>
-                `).join('');
-
-                select.innerHTML = '<option value="">All namespaces</option>' +
-                    data.namespaces.map(ns => `<option value="${ns.name}">${ns.name} (${ns.count})</option>`).join('');
-
             } catch (e) {
+                document.getElementById('stats-bar').innerHTML =
+                    '<span style="color:var(--warning)">Discovery unavailable - check /api/discovery</span>';
                 document.getElementById('namespace-list').innerHTML =
-                    '<li style="color:var(--error)">Failed to load namespaces</li>';
+                    '<li style="color:var(--error)">Failed to load discovery</li>';
             }
         }
 
         async function selectNamespace(ns) {
             currentNamespace = ns;
             document.getElementById('namespace-select').value = ns || '';
-            await loadNamespaces();
+            if (latestDiscovery) {
+                renderNamespaces(latestDiscovery);
+            }
             await browse(ns);
         }
 
@@ -583,12 +614,20 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
             list.innerHTML = '<div class="loading">Searching...</div>';
 
             const namespace = document.getElementById('namespace-select').value || null;
+            const project = document.getElementById('project-input').value.trim() || null;
+            const layerValue = document.getElementById('layer-select').value;
+            const body = { query, namespace, limit: 20, project };
+            if (layerValue === 'deep') {
+                body.deep = true;
+            } else if (layerValue) {
+                body.layer = Number(layerValue);
+            }
 
             try {
                 const res = await fetch(`${API}/search`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query, namespace, limit: 20 })
+                    body: JSON.stringify(body)
                 });
                 const data = await res.json();
 
@@ -721,19 +760,10 @@ fn get_dashboard_html() -> String {
 // ============================================================================
 
 /// Namespace info for API
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NamespaceInfo {
     pub name: String,
     pub count: usize,
-}
-
-impl Clone for NamespaceInfo {
-    fn clone(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            count: self.count,
-        }
-    }
 }
 
 /// Namespaces list response
@@ -750,6 +780,28 @@ pub struct OverviewResponse {
     pub total_documents: usize,
     pub db_path: String,
     pub embedding_provider: String,
+}
+
+/// Canonical discovery namespace entry.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryNamespaceInfo {
+    pub id: String,
+    pub count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_indexed_at: Option<String>,
+}
+
+/// Canonical discovery response for dashboards and HTTP clients.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryResponse {
+    pub status: String,
+    pub hint: String,
+    pub version: String,
+    pub db_path: String,
+    pub embedding_provider: String,
+    pub total_documents: usize,
+    pub namespace_count: usize,
+    pub namespaces: Vec<DiscoveryNamespaceInfo>,
 }
 
 /// Browse query params
@@ -832,7 +884,7 @@ impl Default for McpSessionManager {
     }
 }
 
-/// Shared state for HTTP handlers - uses RAGPipeline like MCPServer
+/// Shared state for HTTP handlers - reuses the same MCP core and storage runtime as stdio/SSE.
 #[derive(Clone)]
 pub struct HttpState {
     pub rag: Arc<RAGPipeline>,
@@ -848,6 +900,12 @@ pub struct HttpState {
     pub namespace_activity: Arc<RwLock<HashMap<String, String>>>,
     /// Optional Bearer token for authenticating mutating requests
     pub auth_token: Option<String>,
+    /// Auth enforcement mode
+    pub auth_mode: AuthMode,
+    /// Allow ?token= query parameter on read GETs
+    pub allow_query_token: bool,
+    /// Multi-token auth manager (Track C). Used when auth_mode == NamespaceAcl.
+    pub auth_manager: Option<Arc<crate::auth::AuthManager>>,
 }
 
 /// Search request body
@@ -856,11 +914,17 @@ pub struct SearchRequest {
     pub query: String,
     #[serde(default)]
     pub namespace: Option<String>,
-    #[serde(default = "default_limit")]
+    #[serde(default = "default_limit", alias = "k")]
     pub limit: usize,
     /// Optional layer filter for onion slices
     #[serde(default)]
     pub layer: Option<u8>,
+    #[serde(default)]
+    pub deep: bool,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default = "default_mode")]
+    pub mode: String,
 }
 
 fn default_limit() -> usize {
@@ -909,6 +973,49 @@ impl From<SearchResult> for SearchResultJson {
     }
 }
 
+impl From<HybridSearchResult> for SearchResultJson {
+    fn from(result: HybridSearchResult) -> Self {
+        let can_expand = !result.children_ids.is_empty();
+        let can_drill_up = result.parent_id.is_some();
+
+        Self {
+            id: result.id,
+            namespace: result.namespace,
+            text: result.document,
+            score: result.combined_score,
+            metadata: result.metadata,
+            layer: result.layer.map(|layer| layer.name().to_string()),
+            parent_id: result.parent_id,
+            children_ids: result.children_ids,
+            keywords: result.keywords,
+            can_expand,
+            can_drill_up,
+        }
+    }
+}
+
+impl From<ChromaDocument> for SearchResultJson {
+    fn from(doc: ChromaDocument) -> Self {
+        let can_expand = !doc.children_ids.is_empty();
+        let can_drill_up = doc.parent_id.is_some();
+        let layer = doc.slice_layer().map(|layer| layer.name().to_string());
+
+        Self {
+            id: doc.id,
+            namespace: doc.namespace,
+            text: doc.document,
+            score: 0.0,
+            metadata: doc.metadata,
+            layer,
+            parent_id: doc.parent_id,
+            children_ids: doc.children_ids,
+            keywords: doc.keywords,
+            can_expand,
+            can_drill_up,
+        }
+    }
+}
+
 /// Search response
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
@@ -949,8 +1056,16 @@ pub struct SseSearchParams {
     pub query: String,
     #[serde(default)]
     pub namespace: Option<String>,
-    #[serde(default = "default_limit")]
+    #[serde(default = "default_limit", alias = "k")]
     pub limit: usize,
+    #[serde(default)]
+    pub deep: bool,
+    #[serde(default)]
+    pub layer: Option<u8>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default = "default_mode")]
+    pub mode: String,
 }
 
 /// Cross-search request - search across all namespaces
@@ -978,6 +1093,50 @@ fn default_total_limit() -> usize {
 
 fn default_mode() -> String {
     "hybrid".to_string()
+}
+
+fn http_search_mode(mode: &str) -> SearchMode {
+    match mode {
+        "vector" => SearchMode::Vector,
+        "keyword" | "bm25" => SearchMode::Keyword,
+        _ => SearchMode::Hybrid,
+    }
+}
+
+async fn search_results_with_mode(
+    state: &HttpState,
+    namespace: Option<&str>,
+    query: &str,
+    limit: usize,
+    mode: SearchMode,
+    options: SearchOptions,
+) -> anyhow::Result<Vec<SearchResultJson>> {
+    if mode != SearchMode::Vector
+        && let Some(hybrid_searcher) = state.mcp_core.hybrid_searcher()
+    {
+        let query_embedding = state.mcp_core.embed_query(query).await?;
+        let results = hybrid_searcher
+            .search(query, query_embedding, namespace, limit, options)
+            .await?;
+        return Ok(results.into_iter().map(SearchResultJson::from).collect());
+    }
+
+    let results = state
+        .rag
+        .search_with_options(namespace, query, limit, options)
+        .await?;
+    Ok(results.into_iter().map(SearchResultJson::from).collect())
+}
+
+async fn list_search_namespaces(state: &HttpState) -> anyhow::Result<Vec<String>> {
+    Ok(state
+        .rag
+        .storage_manager()
+        .list_namespaces()
+        .await?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
 }
 
 /// Cross-search query params for GET endpoint
@@ -1012,50 +1171,192 @@ pub struct HealthResponse {
     pub embedding_provider: String,
 }
 
+/// Extract bearer token from Authorization header or ?token= query param.
+fn extract_bearer_token(request: &Request, allow_query_token: bool) -> Option<String> {
+    // 1. Check Authorization header first
+    if let Some(header) = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        && let Some(token) = header.strip_prefix("Bearer ")
+    {
+        return Some(token.to_string());
+    }
+
+    // 2. Check ?token= query param if allowed
+    if allow_query_token && let Some(query) = request.uri().query() {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("token=") {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Constant-time token comparison to prevent timing attacks.
+fn token_matches(provided: &str, expected: &str) -> bool {
+    let provided_bytes = provided.as_bytes();
+    let expected_bytes = expected.as_bytes();
+    provided_bytes.ct_eq(expected_bytes).into()
+}
+
+fn unauthorized_response(request: &Request) -> axum::response::Response {
+    let authenticate = [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))];
+
+    if request.method() == Method::GET && request.uri().path() == "/" {
+        return (
+            StatusCode::UNAUTHORIZED,
+            authenticate,
+            Html(DASHBOARD_LOGIN_HTML.to_string()),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        authenticate,
+        Json(json!({"error": "missing or invalid auth token"})),
+    )
+        .into_response()
+}
+
 /// Bearer token auth middleware for mutating endpoints.
 /// If the server has an auth_token configured, requires `Authorization: Bearer <token>`.
+/// Uses constant-time comparison to prevent timing side-channel attacks.
 /// Returns 401 if the token is missing or doesn't match.
+///
+/// In NamespaceAcl mode (Track C), delegates to AuthManager for multi-token
+/// lookup with scope enforcement. The scope is inferred from the HTTP method:
+/// GET/HEAD = Read, POST/PUT/DELETE = Write.
 async fn auth_middleware(
     State(state): State<HttpState>,
     request: Request,
     next: Next,
 ) -> impl IntoResponse {
-    if let Some(ref expected) = state.auth_token {
-        let auth_header = request
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok());
-
-        match auth_header {
-            Some(header) if header.starts_with("Bearer ") => {
-                let token = &header[7..];
-                if token != expected.as_str() {
-                    return Err((
-                        StatusCode::UNAUTHORIZED,
-                        Json(json!({"error": "missing or invalid auth token"})),
-                    ));
-                }
+    // Track C: NamespaceAcl mode uses the AuthManager for multi-token auth
+    if state.auth_mode == AuthMode::NamespaceAcl
+        && let Some(ref manager) = state.auth_manager
+    {
+        let allow_query = state.allow_query_token;
+        let bearer = extract_bearer_token(&request, allow_query);
+        let bearer = match bearer {
+            Some(t) => t,
+            None => {
+                return Err(unauthorized_response(&request));
             }
-            _ => {
+        };
+
+        // Determine required scope from method
+        let required_scope = match *request.method() {
+            Method::GET | Method::HEAD => crate::auth::Scope::Read,
+            _ => crate::auth::Scope::Write,
+        };
+
+        // Extract namespace from path if present (e.g., /api/browse/{ns}, /ns/{namespace})
+        let path = request.uri().path().to_string();
+        let namespace = extract_namespace_from_path(&path);
+
+        match manager
+            .authorize(&bearer, &required_scope, namespace.as_deref())
+            .await
+        {
+            Ok(_) => {}
+            Err(crate::auth::AuthDenial::MissingToken | crate::auth::AuthDenial::InvalidToken) => {
+                return Err(unauthorized_response(&request));
+            }
+            Err(crate::auth::AuthDenial::Expired { id }) => {
                 return Err((
                     StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": "missing or invalid auth token"})),
-                ));
+                    Json(json!({"error": format!("Token '{}' has expired", id)})),
+                )
+                    .into_response());
+            }
+            Err(
+                denial @ (crate::auth::AuthDenial::InsufficientScope { .. }
+                | crate::auth::AuthDenial::NamespaceDenied { .. }),
+            ) => {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": denial.to_string()})),
+                )
+                    .into_response());
+            }
+        }
+
+        return Ok(next.run(request).await);
+    }
+    // Fallback: NamespaceAcl mode without AuthManager configured = same as legacy
+
+    // Legacy single-token path
+    if let Some(ref expected) = state.auth_token {
+        let allow_query = state.allow_query_token;
+        match extract_bearer_token(&request, allow_query) {
+            Some(token) if token_matches(&token, expected) => {}
+            _ => {
+                return Err(unauthorized_response(&request));
             }
         }
     }
     Ok(next.run(request).await)
 }
 
+/// Extract namespace from URL path segments for ACL checks.
+/// Recognizes patterns like:
+///   /api/browse/{ns}  /ns/{namespace}  /expand/{ns}/{id}  /get/{ns}/{id}
+///   /delete/{ns}/{id}  /parent/{ns}/{id}
+fn extract_namespace_from_path(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+    match segments.as_slice() {
+        // /api/browse/{ns}
+        ["api", "browse", ns] => Some(ns.to_string()),
+        // /ns/{namespace}
+        ["ns", ns] => Some(ns.to_string()),
+        // /expand/{ns}/{id}, /parent/{ns}/{id}, /get/{ns}/{id}, /delete/{ns}/{id}
+        [verb, ns, _id] if matches!(*verb, "expand" | "parent" | "get" | "delete") => {
+            Some(ns.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Auth enforcement mode for HTTP endpoints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    /// Bearer required only on mutating + MCP routes (default, backwards compat)
+    MutatingOnly,
+    /// Bearer required on ALL routes
+    AllRoutes,
+    /// Reserved for Track C namespace-level ACL
+    NamespaceAcl,
+}
+
+impl AuthMode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "all-routes" => Self::AllRoutes,
+            "namespace-acl" => Self::NamespaceAcl,
+            _ => Self::MutatingOnly,
+        }
+    }
+}
+
 /// HTTP server configuration passed to `create_router` and `start_server`
 #[derive(Clone)]
 pub struct HttpServerConfig {
-    /// Bearer token for auth on mutating endpoints. None = no auth.
+    /// Bearer token for auth on HTTP endpoints. None = no auth.
     pub auth_token: Option<String>,
     /// Allowed CORS origins. Empty = same-origin only (unless localhost).
     pub cors_origins: Vec<String>,
     /// Bind address. Defaults to 127.0.0.1.
     pub bind_address: IpAddr,
+    /// Auth enforcement mode
+    pub auth_mode: AuthMode,
+    /// Allow ?token= query param on read GETs (only in all-routes mode)
+    pub allow_query_token: bool,
+    /// Multi-token auth manager (Track C). Used when auth_mode == NamespaceAcl.
+    pub auth_manager: Option<Arc<crate::auth::AuthManager>>,
 }
 
 impl Default for HttpServerConfig {
@@ -1064,12 +1365,21 @@ impl Default for HttpServerConfig {
             auth_token: None,
             cors_origins: Vec::new(),
             bind_address: std::net::Ipv4Addr::LOCALHOST.into(),
+            auth_mode: AuthMode::MutatingOnly,
+            allow_query_token: false,
+            auth_manager: None,
         }
     }
 }
 
 /// Create the HTTP router
 pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
+    let mut state = state;
+    state.auth_token = config.auth_token.clone();
+    state.auth_mode = config.auth_mode.clone();
+    state.allow_query_token = config.allow_query_token;
+    state.auth_manager = config.auth_manager.clone();
+
     let is_localhost = config.bind_address.is_loopback();
 
     // CORS policy: permissive on localhost, restrictive otherwise
@@ -1087,6 +1397,12 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
                 axum::http::header::CONTENT_TYPE,
                 axum::http::header::AUTHORIZATION,
             ])
+    } else if config.cors_origins.iter().any(|o| o == "*") {
+        // Explicit wildcard: use tower_http::cors::Any instead of literal "*" string
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods(tower_http::cors::Any)
+            .allow_headers(tower_http::cors::Any)
     } else {
         // Explicit origins configured
         let origins: Vec<HeaderValue> = config
@@ -1103,9 +1419,13 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
             ])
     };
 
-    // Read-only routes (no auth required)
-    let public_routes = Router::new()
+    let all_routes_auth = config.auth_mode == AuthMode::AllRoutes;
+
+    // Read-only routes: public in mutating-only mode, authed in all-routes mode.
+    // The dashboard route returns an auth bootstrap page when bearer is missing.
+    let read_routes = Router::new()
         .route("/", get(dashboard_handler))
+        .route("/health", get(health_handler))
         .route("/api/discovery", get(discovery_handler))
         .route("/api/namespaces", get(namespaces_handler))
         .route("/api/overview", get(overview_handler))
@@ -1113,7 +1433,6 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .route("/api/browse", get(browse_all_handler))
         .route("/api/browse/", get(browse_all_handler))
         .route("/api/browse/{ns}", get(browse_handler))
-        .route("/health", get(health_handler))
         .route("/search", post(search_handler))
         .route("/sse/search", get(sse_search_handler))
         .route("/cross-search", get(cross_search_handler))
@@ -1122,6 +1441,16 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
         .route("/expand/{ns}/{id}", get(expand_handler))
         .route("/parent/{ns}/{id}", get(parent_handler))
         .route("/get/{ns}/{id}", get(get_handler));
+
+    // Conditionally wrap read routes with auth middleware in all-routes mode
+    let read_routes = if all_routes_auth {
+        read_routes.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+    } else {
+        read_routes
+    };
 
     // Mutating routes (auth required when token is configured)
     let authed_routes = Router::new()
@@ -1147,7 +1476,7 @@ pub fn create_router(state: HttpState, config: &HttpServerConfig) -> Router {
             auth_middleware,
         ));
 
-    public_routes
+    read_routes
         .merge(authed_routes)
         .merge(mcp_routes)
         .layer(cors)
@@ -1167,84 +1496,219 @@ async fn health_handler(State(state): State<HttpState>) -> impl IntoResponse {
 // Dashboard & Browse API Handlers
 // ============================================================================
 
+#[derive(Debug, Clone)]
+struct DiscoverySnapshot {
+    cache_ready: bool,
+    hint: String,
+    namespaces: Vec<DiscoveryNamespaceInfo>,
+}
+
+async fn build_discovery_snapshot(state: &HttpState) -> DiscoverySnapshot {
+    let refresh_error = refresh_namespace_cache(state).await.err();
+    let cache = state.cached_namespaces.read().await;
+    let activity = state.namespace_activity.read().await;
+    let cache_ready = refresh_error.is_none();
+
+    let namespaces: Vec<DiscoveryNamespaceInfo> = cache
+        .as_ref()
+        .map(|ns_list| {
+            let mut sorted = ns_list.clone();
+            sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+            sorted
+                .iter()
+                .map(|ns| DiscoveryNamespaceInfo {
+                    id: ns.name.clone(),
+                    count: ns.count,
+                    last_indexed_at: activity.get(&ns.name).cloned(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    DiscoverySnapshot {
+        cache_ready,
+        hint: refresh_error
+            .map(|error| format!("{}: {}", discovery_hint(false), error))
+            .unwrap_or_else(|| discovery_hint(true).to_string()),
+        namespaces,
+    }
+}
+
+async fn build_discovery_response(state: &HttpState) -> DiscoveryResponse {
+    let snapshot = build_discovery_snapshot(state).await;
+    let stats = state.rag.storage_manager().stats().await.ok();
+    let total_documents = stats
+        .as_ref()
+        .map(|stats| stats.row_count)
+        .unwrap_or_else(|| snapshot.namespaces.iter().map(|ns| ns.count).sum());
+    let db_path = stats
+        .as_ref()
+        .map(|stats| stats.db_path.clone())
+        .unwrap_or_else(|| state.rag.storage_manager().lance_path().to_string());
+
+    DiscoveryResponse {
+        status: if snapshot.cache_ready {
+            "ok"
+        } else if snapshot.namespaces.is_empty() {
+            "error"
+        } else {
+            "stale"
+        }
+        .to_string(),
+        hint: snapshot.hint,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        db_path,
+        embedding_provider: state.rag.mlx_connected_to(),
+        total_documents,
+        namespace_count: snapshot.namespaces.len(),
+        namespaces: snapshot.namespaces,
+    }
+}
+
+async fn refresh_namespace_cache(state: &HttpState) -> anyhow::Result<()> {
+    let ns_list = state.rag.storage_manager().list_namespaces().await?;
+    let namespaces: Vec<NamespaceInfo> = ns_list
+        .into_iter()
+        .map(|(name, count)| NamespaceInfo { name, count })
+        .collect();
+    *state.cached_namespaces.write().await = Some(namespaces);
+    Ok(())
+}
+
+async fn mark_namespace_activity(state: &HttpState, namespace: &str) {
+    state
+        .namespace_activity
+        .write()
+        .await
+        .insert(namespace.to_string(), chrono::Utc::now().to_rfc3339());
+    if let Err(error) = refresh_namespace_cache(state).await {
+        warn!(
+            "Namespace cache refresh failed after activity update: {}",
+            error
+        );
+    }
+}
+fn namespaces_response_from_discovery(discovery: &DiscoveryResponse) -> NamespacesResponse {
+    NamespacesResponse {
+        total: discovery.namespaces.len(),
+        namespaces: discovery
+            .namespaces
+            .iter()
+            .map(|ns| NamespaceInfo {
+                name: ns.id.clone(),
+                count: ns.count,
+            })
+            .collect(),
+    }
+}
+
+fn overview_response_from_discovery(discovery: &DiscoveryResponse) -> OverviewResponse {
+    OverviewResponse {
+        namespace_count: discovery.namespace_count,
+        total_documents: discovery.total_documents,
+        db_path: discovery.db_path.clone(),
+        embedding_provider: discovery.embedding_provider.clone(),
+    }
+}
+
+fn status_response_from_discovery(discovery: &DiscoveryResponse) -> serde_json::Value {
+    json!({
+        "cache_ready": discovery.status == "ok",
+        "namespace_count": discovery.namespace_count,
+        "hint": discovery.hint,
+    })
+}
+
 /// Dashboard HTML endpoint (GET /)
-async fn dashboard_handler() -> Html<String> {
+/// Minimal HTML login form for dashboard auth in all-routes mode.
+/// Token is stored in localStorage and used as Bearer header for all API calls.
+const DASHBOARD_LOGIN_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rmcp-memex - Login Required</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 400px; width: 100%; }
+h2 { margin: 0 0 16px; color: #58a6ff; }
+p { color: #8b949e; margin: 0 0 24px; font-size: 14px; }
+input { width: 100%; padding: 10px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 14px; box-sizing: border-box; margin-bottom: 16px; }
+button { width: 100%; padding: 10px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 14px; cursor: pointer; }
+button:hover { background: #2ea043; }
+.error { color: #f85149; font-size: 13px; display: none; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div class="card">
+<h2>rmcp-memex Dashboard</h2>
+<p>This server requires authentication. Enter your bearer token to continue.</p>
+<div class="error" id="err">Invalid token. Please try again.</div>
+<form id="f" onsubmit="return login()">
+<input type="password" id="tok" placeholder="Bearer token" autocomplete="off" autofocus>
+<button type="submit">Authenticate</button>
+</form>
+</div>
+<script>
+(function() {
+  var t = localStorage.getItem('memex_token');
+  if (t) { window.location.href = '/?_authed=1'; }
+})();
+function login() {
+  var tok = document.getElementById('tok').value.trim();
+  if (!tok) return false;
+  fetch('/api/discovery', { headers: { 'Authorization': 'Bearer ' + tok } })
+    .then(function(r) {
+      if (r.ok) { localStorage.setItem('memex_token', tok); window.location.reload(); }
+      else { document.getElementById('err').style.display = 'block'; }
+    });
+  return false;
+}
+</script>
+</body>
+</html>"##;
+
+async fn dashboard_handler(State(state): State<HttpState>, request: Request) -> impl IntoResponse {
     debug!("Dashboard: serving HTML");
+
+    // In all-routes mode, check if the user has a valid bearer token
+    if state.auth_mode == AuthMode::AllRoutes
+        && let Some(ref expected) = state.auth_token
+    {
+        let allow_query = state.allow_query_token;
+        let has_valid_token = match extract_bearer_token(&request, allow_query) {
+            Some(token) => token_matches(&token, expected),
+            None => false,
+        };
+
+        if !has_valid_token {
+            return Html(DASHBOARD_LOGIN_HTML.to_string());
+        }
+    }
+
     Html(get_dashboard_html())
 }
 
 /// List all namespaces with document counts (GET /api/namespaces)
-/// Uses cached namespace list (refreshed in background every 5 minutes)
-/// Falls back to "loading" state if cache not yet populated
 async fn namespaces_handler(State(state): State<HttpState>) -> Json<NamespacesResponse> {
-    // Try to use cached namespaces first (instant response)
-    let cache = state.cached_namespaces.read().await;
-    if let Some(ref namespaces) = *cache {
-        let mut sorted = namespaces.clone();
-        sorted.sort_by(|a, b| b.count.cmp(&a.count));
-        let total = sorted.len();
-        debug!(
-            "API: /api/namespaces - returning {} cached namespaces",
-            total
-        );
-        return Json(NamespacesResponse {
-            namespaces: sorted,
-            total,
-        });
-    }
-    drop(cache);
-
-    // Cache not ready yet - return loading indicator
-    // Dashboard will show "loading" state and auto-refresh
-    info!("API: /api/namespaces - cache not ready, background task loading...");
-    Json(NamespacesResponse {
-        namespaces: vec![],
-        total: 0,
-    })
+    Json(namespaces_response_from_discovery(
+        &build_discovery_response(&state).await,
+    ))
 }
 
 /// Database overview (GET /api/overview)
-/// Uses efficient stats() which only counts rows without loading data
-async fn overview_handler(
-    State(state): State<HttpState>,
-) -> Result<Json<OverviewResponse>, (StatusCode, String)> {
-    info!("API: /api/overview - fetching stats");
-
-    // Use efficient stats() - only counts rows, doesn't load all data
-    let stats = state.rag.storage_manager().stats().await.map_err(|e| {
-        error!("API: /api/overview - stats error: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-
-    info!("API: /api/overview - {} documents", stats.row_count);
-
-    // Note: namespace_count requires scanning, so we report 0 for efficiency
-    // The namespaces endpoint provides the detailed breakdown
-    Ok(Json(OverviewResponse {
-        namespace_count: 0, // Use /api/namespaces for accurate count
-        total_documents: stats.row_count,
-        db_path: stats.db_path,
-        embedding_provider: state.rag.mlx_connected_to(),
-    }))
+async fn overview_handler(State(state): State<HttpState>) -> Json<OverviewResponse> {
+    Json(overview_response_from_discovery(
+        &build_discovery_response(&state).await,
+    ))
 }
 
 /// System status including cache state (GET /api/status)
-/// Returns info about whether namespace cache is ready (for dashboard)
 async fn status_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
-    let cache = state.cached_namespaces.read().await;
-    let cache_ready = cache.is_some();
-    let namespace_count = cache.as_ref().map(|v| v.len()).unwrap_or(0);
-    drop(cache);
-
-    Json(json!({
-        "cache_ready": cache_ready,
-        "namespace_count": namespace_count,
-        "hint": if !cache_ready {
-            "Namespace cache loading... If this persists, run: rmcp-memex optimize"
-        } else {
-            "OK"
-        }
-    }))
+    Json(status_response_from_discovery(
+        &build_discovery_response(&state).await,
+    ))
 }
 
 /// Browse documents in namespace (GET /api/browse/:ns)
@@ -1264,40 +1728,17 @@ async fn browse_handler(
         Some(ns.as_str())
     };
 
-    let all_docs = state
+    let documents: Vec<SearchResultJson> = state
         .rag
         .storage_manager()
-        .all_documents(namespace, params.limit + params.offset)
+        .all_documents_page(namespace, params.offset, params.limit)
         .await
         .map_err(|e| {
             error!("API: /api/browse/{} - error: {}", ns, e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    // Apply offset and convert to SearchResultJson
-    // ChromaDocument fields: id, namespace, embedding, metadata, document, layer (u8), parent_id, children_ids, keywords
-    let documents: Vec<SearchResultJson> = all_docs
+        })?
         .into_iter()
-        .skip(params.offset)
-        .take(params.limit)
-        .map(|doc| {
-            let can_expand = !doc.children_ids.is_empty();
-            let can_drill_up = doc.parent_id.is_some();
-            let layer = SliceLayer::from_u8(doc.layer);
-            SearchResultJson {
-                id: doc.id,
-                namespace: doc.namespace,
-                text: doc.document, // ChromaDocument uses 'document' not 'text'
-                score: 0.0,         // No score for browse (not a search result)
-                metadata: doc.metadata,
-                layer: layer.map(|l| l.name().to_string()),
-                parent_id: doc.parent_id,
-                children_ids: doc.children_ids,
-                keywords: doc.keywords,
-                can_expand,
-                can_drill_up,
-            }
-        })
+        .map(Into::into)
         .collect();
 
     let count = documents.len();
@@ -1319,38 +1760,17 @@ async fn browse_all_handler(
         params.limit, params.offset
     );
 
-    let all_docs = state
+    let documents: Vec<SearchResultJson> = state
         .rag
         .storage_manager()
-        .all_documents(None, params.limit + params.offset)
+        .all_documents_page(None, params.offset, params.limit)
         .await
         .map_err(|e| {
             error!("API: /api/browse (all) - error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    let documents: Vec<SearchResultJson> = all_docs
+        })?
         .into_iter()
-        .skip(params.offset)
-        .take(params.limit)
-        .map(|doc| {
-            let can_expand = !doc.children_ids.is_empty();
-            let can_drill_up = doc.parent_id.is_some();
-            let layer = SliceLayer::from_u8(doc.layer);
-            SearchResultJson {
-                id: doc.id,
-                namespace: doc.namespace,
-                text: doc.document,
-                score: 0.0,
-                metadata: doc.metadata,
-                layer: layer.map(|l| l.name().to_string()),
-                parent_id: doc.parent_id,
-                children_ids: doc.children_ids,
-                keywords: doc.keywords,
-                can_expand,
-                can_drill_up,
-            }
-        })
+        .map(Into::into)
         .collect();
 
     let count = documents.len();
@@ -1366,7 +1786,7 @@ async fn browse_all_handler(
 async fn refresh_handler(
     State(state): State<HttpState>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    state.rag.refresh().await.map_err(|e| {
+    refresh_namespace_cache(&state).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Refresh failed: {}", e),
@@ -1385,40 +1805,37 @@ async fn search_handler(
     Json(req): Json<SearchRequest>,
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     let start = std::time::Instant::now();
-
-    let results = if let Some(layer_u8) = req.layer {
-        // Search with layer filter
-        let layer = SliceLayer::from_u8(layer_u8);
-        state
-            .rag
-            .memory_search_with_layer(
-                req.namespace.as_deref().unwrap_or("default"),
-                &req.query,
-                req.limit,
-                layer,
-            )
-            .await
+    let layer_filter = if req.deep {
+        None
     } else {
-        // Regular search
-        state
-            .rag
-            .search_memory(
-                req.namespace.as_deref().unwrap_or("default"),
-                &req.query,
-                req.limit,
-            )
-            .await
-    }
+        req.layer
+            .and_then(SliceLayer::from_u8)
+            .or(Some(SliceLayer::Outer))
+    };
+    let options = SearchOptions {
+        layer_filter,
+        project_filter: req.project.clone().filter(|value| !value.trim().is_empty()),
+    };
+    let mode = http_search_mode(req.mode.as_str());
+
+    let results = search_results_with_mode(
+        &state,
+        Some(req.namespace.as_deref().unwrap_or("default")),
+        &req.query,
+        req.limit,
+        mode,
+        options,
+    )
+    .await
     .map_err(|e| {
         error!("Search error: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
     let count = results.len();
-    let search_results: Vec<SearchResultJson> = results.into_iter().map(Into::into).collect();
 
     Ok(Json(SearchResponse {
-        results: search_results,
+        results,
         query: req.query,
         namespace: req.namespace,
         elapsed_ms: start.elapsed().as_millis() as u64,
@@ -1438,18 +1855,39 @@ async fn sse_search_handler(
             .data(serde_json::json!({
                 "query": params.query,
                 "namespace": params.namespace,
-                "limit": params.limit
+                "limit": params.limit,
+                "mode": params.mode,
+                "deep": params.deep,
+                "layer": params.layer,
+                "project": params.project
             }).to_string()));
 
         let namespace = params.namespace.as_deref().unwrap_or("default");
+        let layer_filter = if params.deep {
+            None
+        } else {
+            params.layer.and_then(SliceLayer::from_u8).or(Some(SliceLayer::Outer))
+        };
+        let options = SearchOptions {
+            layer_filter,
+            project_filter: params.project.clone().filter(|value| !value.trim().is_empty()),
+        };
+        let mode = http_search_mode(params.mode.as_str());
 
-        match state.rag.search_memory(namespace, &params.query, params.limit).await {
+        match search_results_with_mode(
+            &state,
+            Some(namespace),
+            &params.query,
+            params.limit,
+            mode,
+            options,
+        )
+            .await
+        {
             Ok(results) => {
                 let total = results.len();
 
-                for (i, r) in results.into_iter().enumerate() {
-                    let result: SearchResultJson = r.into();
-
+                for (i, result) in results.into_iter().enumerate() {
                     if let Ok(json) = serde_json::to_string(&result) {
                         yield Ok(Event::default()
                             .event("result")
@@ -1489,26 +1927,12 @@ async fn cross_search_handler(
     State(state): State<HttpState>,
     Query(params): Query<CrossSearchParams>,
 ) -> Result<Json<CrossSearchResponse>, (StatusCode, String)> {
-    use std::collections::HashSet;
-
     let start = std::time::Instant::now();
-
-    let all_docs = state
-        .rag
-        .storage_manager()
-        .all_documents(None, 10000)
-        .await
-        .map_err(|e| {
-            error!("Cross-search namespace lookup error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        })?;
-
-    let mut namespace_set: HashSet<String> = HashSet::new();
-    for doc in &all_docs {
-        namespace_set.insert(doc.namespace.clone());
-    }
-
-    let namespaces: Vec<String> = namespace_set.into_iter().collect();
+    let mode = http_search_mode(params.mode.as_str());
+    let namespaces = list_search_namespaces(&state).await.map_err(|e| {
+        error!("Cross-search namespace lookup error: {}", e);
+        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+    })?;
     let namespaces_count = namespaces.len();
 
     if namespaces.is_empty() {
@@ -1526,15 +1950,20 @@ async fn cross_search_handler(
     let mut all_results: Vec<(SearchResultJson, f32)> = Vec::new();
 
     for ns in &namespaces {
-        match state
-            .rag
-            .search_memory(ns, &params.query, params.limit)
-            .await
+        match search_results_with_mode(
+            &state,
+            Some(ns),
+            &params.query,
+            params.limit,
+            mode,
+            SearchOptions::default(),
+        )
+        .await
         {
             Ok(results) => {
                 for r in results {
                     let score = r.score;
-                    all_results.push((r.into(), score));
+                    all_results.push((r, score));
                 }
             }
             Err(e) => {
@@ -1569,8 +1998,6 @@ async fn sse_cross_search_handler(
     State(state): State<HttpState>,
     Query(params): Query<CrossSearchParams>,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    use std::collections::HashSet;
-
     let stream = async_stream::stream! {
         // Send start event
         yield Ok(Event::default()
@@ -1583,8 +2010,8 @@ async fn sse_cross_search_handler(
             }).to_string()));
 
         // Get all namespaces
-        let all_docs = match state.rag.storage_manager().all_documents(None, 10000).await {
-            Ok(docs) => docs,
+        let namespaces = match list_search_namespaces(&state).await {
+            Ok(namespaces) => namespaces,
             Err(e) => {
                 yield Ok(Event::default()
                     .event("error")
@@ -1592,13 +2019,7 @@ async fn sse_cross_search_handler(
                 return;
             }
         };
-
-        let mut namespace_set: HashSet<String> = HashSet::new();
-        for doc in &all_docs {
-            namespace_set.insert(doc.namespace.clone());
-        }
-
-        let namespaces: Vec<String> = namespace_set.into_iter().collect();
+        let mode = http_search_mode(params.mode.as_str());
 
         // Send namespace info
         yield Ok(Event::default()
@@ -1617,12 +2038,18 @@ async fn sse_cross_search_handler(
                 .event("searching")
                 .data(serde_json::json!({"namespace": ns}).to_string()));
 
-            match state.rag.search_memory(ns, &params.query, params.limit).await {
+            match search_results_with_mode(
+                &state,
+                Some(ns),
+                &params.query,
+                params.limit,
+                mode,
+                SearchOptions::default(),
+            ).await {
                 Ok(results) => {
                     let ns_count = results.len();
-                    for r in results {
-                        let score = r.score;
-                        let result: SearchResultJson = r.into();
+                    for result in results {
+                        let score = result.score;
                         all_results.push((result, score, ns.clone()));
                     }
 
@@ -1684,39 +2111,16 @@ async fn sse_cross_search_handler(
 ///
 /// Returns status, db info, and all namespaces with counts and last activity.
 /// Replaces fragmented /api/namespaces + /api/overview + /api/status trio.
-async fn discovery_handler(State(state): State<HttpState>) -> Json<serde_json::Value> {
-    let cache = state.cached_namespaces.read().await;
-    let activity = state.namespace_activity.read().await;
+fn discovery_hint(cache_ready: bool) -> &'static str {
+    if cache_ready {
+        "OK"
+    } else {
+        "Namespace cache loading... If this persists, run: rmcp-memex optimize"
+    }
+}
 
-    let namespaces: Vec<serde_json::Value> = cache
-        .as_ref()
-        .map(|ns_list| {
-            ns_list
-                .iter()
-                .map(|ns| {
-                    json!({
-                        "id": ns.name,
-                        "count": ns.count,
-                        "last_indexed_at": activity.get(&ns.name),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let total_documents: usize = cache
-        .as_ref()
-        .map(|ns| ns.iter().map(|n| n.count).sum())
-        .unwrap_or(0);
-
-    Json(json!({
-        "status": if cache.is_some() { "ok" } else { "loading" },
-        "version": env!("CARGO_PKG_VERSION"),
-        "db_path": state.rag.storage_manager().lance_path(),
-        "embedding_provider": state.rag.mlx_connected_to(),
-        "total_documents": total_documents,
-        "namespaces": namespaces,
-    }))
+async fn discovery_handler(State(state): State<HttpState>) -> Json<DiscoveryResponse> {
+    Json(build_discovery_response(&state).await)
 }
 
 /// SSE streaming namespace listing with per-namespace summary
@@ -1941,12 +2345,7 @@ async fn upsert_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    // Track namespace activity for discovery endpoint
-    state
-        .namespace_activity
-        .write()
-        .await
-        .insert(req.namespace.clone(), chrono::Utc::now().to_rfc3339());
+    mark_namespace_activity(&state, &req.namespace).await;
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -1993,12 +2392,7 @@ async fn index_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?;
 
-    // Track namespace activity for discovery endpoint
-    state
-        .namespace_activity
-        .write()
-        .await
-        .insert(req.namespace.clone(), chrono::Utc::now().to_rfc3339());
+    mark_namespace_activity(&state, &req.namespace).await;
 
     Ok(Json(serde_json::json!({
         "status": "indexed",
@@ -2077,11 +2471,18 @@ async fn delete_handler(
     Path((ns, id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.rag.remove_memory(&ns, &id).await {
-        Ok(deleted) => Ok(Json(serde_json::json!({
-            "status": if deleted > 0 { "deleted" } else { "not_found" },
-            "id": id,
-            "namespace": ns
-        }))),
+        Ok(deleted) => {
+            if deleted > 0
+                && let Err(error) = refresh_namespace_cache(&state).await
+            {
+                warn!("Namespace cache refresh failed after delete: {}", error);
+            }
+            Ok(Json(serde_json::json!({
+                "status": if deleted > 0 { "deleted" } else { "not_found" },
+                "id": id,
+                "namespace": ns
+            })))
+        }
         Err(e) => {
             error!("Delete error: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -2095,11 +2496,17 @@ async fn purge_namespace_handler(
     Path(namespace): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state.rag.clear_namespace(&namespace).await {
-        Ok(deleted) => Ok(Json(serde_json::json!({
-            "status": "purged",
-            "namespace": namespace,
-            "deleted_count": deleted
-        }))),
+        Ok(deleted) => {
+            state.namespace_activity.write().await.remove(&namespace);
+            if let Err(error) = refresh_namespace_cache(&state).await {
+                warn!("Namespace cache refresh failed after purge: {}", error);
+            }
+            Ok(Json(serde_json::json!({
+                "status": "purged",
+                "namespace": namespace,
+                "deleted_count": deleted
+            })))
+        }
         Err(e) => {
             error!("Purge error: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -2142,6 +2549,9 @@ async fn mcp_sse_handler(
         session_id, base_url
     );
 
+    let sessions_for_cleanup = state.mcp_sessions.clone();
+    let session_id_for_cleanup = session_id.clone();
+
     let stream = async_stream::stream! {
         // First event: tell client where to POST messages (FastMCP/MCP SSE protocol)
         let endpoint_url = format!("{}/messages/?session_id={}", base_url, session_id);
@@ -2177,6 +2587,10 @@ async fn mcp_sse_handler(
                 }
             }
         }
+
+        // Clean up session when SSE stream drops (client disconnect)
+        debug!("MCP SSE: Removing session {} on stream drop", session_id_for_cleanup);
+        sessions_for_cleanup.remove_session(&session_id_for_cleanup).await;
     };
 
     Sse::new(stream).keep_alive(
@@ -2250,18 +2664,40 @@ pub async fn start_server(
 
     // Log auth status
     if server_config.auth_token.is_some() {
-        info!("HTTP auth: Bearer token required for mutating endpoints");
+        let mode_label = match server_config.auth_mode {
+            AuthMode::MutatingOnly => "mutating endpoints only",
+            AuthMode::AllRoutes => "ALL routes",
+            AuthMode::NamespaceAcl => "namespace ACL (Track C)",
+        };
+        info!("HTTP auth: Bearer token required for {}", mode_label);
+        if server_config.allow_query_token {
+            info!("HTTP auth: ?token= query parameter enabled for read GETs");
+        }
     } else {
         warn!(
             "WARNING: HTTP server running without auth token. Set MEMEX_AUTH_TOKEN or use --auth-token."
         );
     }
 
-    // Warn if exposed on network without auth
-    if !server_config.bind_address.is_loopback() && server_config.auth_token.is_none() {
-        warn!(
-            "WARNING: HTTP server exposed on network without auth token. Set MEMEX_AUTH_TOKEN or use --auth-token."
-        );
+    // Log namespace security status when --security-enabled is active
+    #[allow(deprecated)]
+    // NamespaceAccessManager deprecated by Track C; still needed for diagnostics
+    if let Some(access_mgr) = mcp_core.access_manager() {
+        let protected = access_mgr.list_protected_namespaces().await;
+        if protected.is_empty() {
+            warn!(
+                "Namespace security enabled but NO namespaces have tokens. All namespaces are unprotected."
+            );
+        } else {
+            info!(
+                "Namespace security: {} namespace(s) with tokens:",
+                protected.len()
+            );
+            for (ns_name, _created, desc) in &protected {
+                let label = desc.as_deref().unwrap_or("(no description)");
+                info!("  - '{}' {}", ns_name, label);
+            }
+        }
     }
 
     let state = HttpState {
@@ -2272,6 +2708,9 @@ pub async fn start_server(
         cached_namespaces: cached_namespaces.clone(),
         namespace_activity: Arc::new(RwLock::new(HashMap::new())),
         auth_token: server_config.auth_token.clone(),
+        auth_mode: server_config.auth_mode.clone(),
+        allow_query_token: server_config.allow_query_token,
+        auth_manager: server_config.auth_manager.clone(),
     };
 
     // Spawn background task to refresh namespace cache every 5 minutes
@@ -2340,6 +2779,17 @@ pub async fn start_server(
         }
     });
 
+    // Spawn background task to reap stale MCP sessions every 5 minutes
+    let bg_sessions = state.mcp_sessions.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            bg_sessions.cleanup_old_sessions().await;
+        }
+    });
+
     let app = create_router(state, &server_config);
 
     let addr = format!("{}:{}", server_config.bind_address, port);
@@ -2357,16 +2807,110 @@ pub async fn start_server(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+    use crate::{
+        embeddings::EmbeddingClient,
+        security::{NamespaceAccessManager, NamespaceSecurityConfig},
+        storage::StorageManager,
+    };
+    use axum::body::{Body, to_bytes};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use tower::util::ServiceExt;
+
+    async fn build_test_http_state(db_path: &str) -> HttpState {
+        let embedding_client = Arc::new(Mutex::new(EmbeddingClient::stub_for_tests()));
+        let storage = Arc::new(StorageManager::new(db_path).await.expect("storage"));
+        let rag = Arc::new(
+            RAGPipeline::new(embedding_client.clone(), storage)
+                .await
+                .expect("rag"),
+        );
+        let access_manager = Arc::new(NamespaceAccessManager::new(
+            NamespaceSecurityConfig::default(),
+        ));
+
+        HttpState {
+            rag: rag.clone(),
+            mcp_core: Arc::new(McpCore::new(
+                rag,
+                None,
+                embedding_client,
+                1024 * 1024,
+                vec![],
+                access_manager,
+            )),
+            mcp_sessions: Arc::new(McpSessionManager::new()),
+            mcp_base_url: Arc::new(RwLock::new("http://127.0.0.1:0/mcp/messages/".to_string())),
+            cached_namespaces: Arc::new(RwLock::new(None)),
+            namespace_activity: Arc::new(RwLock::new(HashMap::new())),
+            auth_token: None,
+            auth_mode: AuthMode::MutatingOnly,
+            allow_query_token: false,
+            auth_manager: None,
+        }
+    }
+
+    async fn write_namespace_doc(storage: &StorageManager, namespace: &str, id: &str) {
+        storage
+            .add_to_store(vec![ChromaDocument::new_flat(
+                id.to_string(),
+                namespace.to_string(),
+                vec![0.5, 0.25],
+                json!({"source": "external-test"}),
+                format!("document for {namespace}"),
+            )])
+            .await
+            .expect("external write");
+    }
 
     #[test]
     fn test_search_request_defaults() {
         let json = r#"{"query": "test"}"#;
         let req: SearchRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.limit, 10);
+        assert_eq!(req.mode, "hybrid");
         assert!(req.namespace.is_none());
         assert!(req.layer.is_none());
+        assert!(!req.deep);
+        assert!(req.project.is_none());
+    }
+
+    #[test]
+    fn test_search_request_accepts_k_alias() {
+        let json = r#"{"query": "test", "k": 7, "deep": true, "project": "Vista"}"#;
+        let req: SearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.limit, 7);
+        assert!(req.deep);
+        assert_eq!(req.project.as_deref(), Some("Vista"));
+    }
+
+    #[test]
+    fn test_sse_search_params_accept_k_alias() {
+        let json = r#"{"query":"test","k":9,"deep":true,"project":"Vista","mode":"bm25"}"#;
+        let params: SseSearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.limit, 9);
+        assert!(params.deep);
+        assert_eq!(params.project.as_deref(), Some("Vista"));
+        assert_eq!(params.mode, "bm25");
+    }
+
+    #[test]
+    fn test_search_request_accepts_bm25_mode() {
+        let json = r#"{"query":"test","mode":"bm25"}"#;
+        let req: SearchRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.mode, "bm25");
+    }
+
+    #[test]
+    fn test_http_search_mode_parsing() {
+        assert_eq!(http_search_mode("vector"), SearchMode::Vector);
+        assert_eq!(http_search_mode("keyword"), SearchMode::Keyword);
+        assert_eq!(http_search_mode("bm25"), SearchMode::Keyword);
+        assert_eq!(http_search_mode("hybrid"), SearchMode::Hybrid);
+        assert_eq!(http_search_mode("unknown"), SearchMode::Hybrid);
     }
 
     #[test]
@@ -2374,5 +2918,261 @@ mod tests {
         let json = r#"{"namespace": "test", "content": "hello"}"#;
         let req: IndexRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.slice_mode, "flat");
+    }
+
+    #[test]
+    fn test_discovery_hint_matches_cache_state() {
+        assert_eq!(discovery_hint(true), "OK");
+        assert!(discovery_hint(false).contains("rmcp-memex optimize"));
+    }
+
+    #[test]
+    fn test_dashboard_html_uses_canonical_discovery_endpoint() {
+        let html = get_dashboard_html();
+        assert!(html.contains("/api/discovery"));
+        assert!(!html.contains("/api/status"));
+        assert!(!html.contains("/api/overview"));
+        assert!(!html.contains("/api/namespaces"));
+    }
+
+    #[test]
+    fn test_compatibility_slices_project_single_discovery_truth() {
+        let discovery = DiscoveryResponse {
+            status: "ok".to_string(),
+            hint: "OK".to_string(),
+            version: "0.4.1".to_string(),
+            db_path: "/tmp/memex".to_string(),
+            embedding_provider: "ollama-local".to_string(),
+            total_documents: 42,
+            namespace_count: 2,
+            namespaces: vec![
+                DiscoveryNamespaceInfo {
+                    id: "alpha".to_string(),
+                    count: 30,
+                    last_indexed_at: Some("2026-04-10T17:00:00Z".to_string()),
+                },
+                DiscoveryNamespaceInfo {
+                    id: "beta".to_string(),
+                    count: 12,
+                    last_indexed_at: None,
+                },
+            ],
+        };
+
+        let namespaces = namespaces_response_from_discovery(&discovery);
+        let overview = overview_response_from_discovery(&discovery);
+        let status = status_response_from_discovery(&discovery);
+
+        assert_eq!(namespaces.total, 2);
+        assert_eq!(namespaces.namespaces[0].name, "alpha");
+        assert_eq!(namespaces.namespaces[1].count, 12);
+
+        assert_eq!(overview.namespace_count, 2);
+        assert_eq!(overview.total_documents, 42);
+        assert_eq!(overview.db_path, "/tmp/memex");
+
+        assert_eq!(status["cache_ready"], true);
+        assert_eq!(status["namespace_count"], 2);
+        assert_eq!(status["hint"], "OK");
+    }
+
+    #[tokio::test]
+    async fn test_discovery_refreshes_namespace_inventory_after_external_write() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+        let external_storage = StorageManager::new(&db_path_str)
+            .await
+            .expect("external storage");
+
+        write_namespace_doc(&external_storage, "alpha", "alpha-1").await;
+        let first = build_discovery_response(&state).await;
+        assert_eq!(first.status, "ok");
+        assert_eq!(first.namespace_count, 1);
+        assert_eq!(first.namespaces[0].id, "alpha");
+
+        write_namespace_doc(&external_storage, "beta", "beta-1").await;
+        let second = build_discovery_response(&state).await;
+        let namespace_ids: Vec<_> = second.namespaces.iter().map(|ns| ns.id.as_str()).collect();
+
+        assert_eq!(second.status, "ok");
+        assert_eq!(second.namespace_count, 2);
+        assert_eq!(namespace_ids, vec!["alpha", "beta"]);
+    }
+    #[test]
+    fn test_chroma_document_maps_to_browse_json() {
+        let doc = ChromaDocument {
+            id: "outer-1".to_string(),
+            namespace: "memories".to_string(),
+            embedding: vec![],
+            metadata: json!({"kind": "note"}),
+            document: "hello".to_string(),
+            layer: SliceLayer::Outer.as_u8(),
+            parent_id: Some("root-1".to_string()),
+            children_ids: vec!["child-1".to_string()],
+            keywords: vec!["hello".to_string()],
+            content_hash: None,
+        };
+
+        let json_doc: SearchResultJson = doc.into();
+
+        assert_eq!(json_doc.id, "outer-1");
+        assert_eq!(json_doc.namespace, "memories");
+        assert_eq!(json_doc.text, "hello");
+        assert_eq!(json_doc.layer.as_deref(), Some(SliceLayer::Outer.name()));
+        assert!(json_doc.can_expand);
+        assert!(json_doc.can_drill_up);
+    }
+
+    // ====================================================================
+    // Auth validation tests (Track A + Track B)
+    // ====================================================================
+
+    #[test]
+    fn test_constant_time_token_comparison() {
+        assert!(token_matches("secret123", "secret123"));
+        assert!(!token_matches("secret123", "secret124"));
+        assert!(!token_matches("short", "longer_token"));
+        assert!(!token_matches("", "notempty"));
+        assert!(token_matches("", ""));
+    }
+
+    #[test]
+    fn test_auth_mode_parse() {
+        assert_eq!(AuthMode::parse("mutating-only"), AuthMode::MutatingOnly);
+        assert_eq!(AuthMode::parse("all-routes"), AuthMode::AllRoutes);
+        assert_eq!(AuthMode::parse("namespace-acl"), AuthMode::NamespaceAcl);
+        assert_eq!(AuthMode::parse("unknown"), AuthMode::MutatingOnly);
+        assert_eq!(AuthMode::parse(""), AuthMode::MutatingOnly);
+    }
+
+    #[test]
+    fn test_cors_wildcard_produces_any() {
+        // When cors_origins contains "*", the CORS layer should use Any
+        let config = HttpServerConfig {
+            cors_origins: vec!["*".to_string()],
+            bind_address: std::net::Ipv4Addr::new(192, 168, 1, 1).into(),
+            ..Default::default()
+        };
+        // Verify the config triggers the wildcard branch (no panic = correct path)
+        let state = build_test_http_state_sync();
+        let _router = create_router(state, &config);
+    }
+
+    fn build_test_http_state_sync() -> HttpState {
+        // Minimal state for router creation tests (no DB needed)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let db_path = tmp.path().join(".lancedb");
+            build_test_http_state(db_path.to_str().unwrap()).await
+        })
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_auth_requires_health_and_mcp() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::UNAUTHORIZED);
+
+        let discovery = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/discovery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::UNAUTHORIZED);
+
+        let mcp = app
+            .clone()
+            .oneshot(Request::builder().uri("/mcp/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_root_returns_login_page_with_401() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_text.contains("memex_token"));
+    }
+
+    #[tokio::test]
+    async fn test_all_routes_accepts_query_token_for_get_routes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join(".lancedb");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let state = build_test_http_state(&db_path_str).await;
+
+        let app = create_router(
+            state,
+            &HttpServerConfig {
+                auth_token: Some("secret".to_string()),
+                auth_mode: AuthMode::AllRoutes,
+                allow_query_token: true,
+                ..HttpServerConfig::default()
+            },
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/discovery?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }

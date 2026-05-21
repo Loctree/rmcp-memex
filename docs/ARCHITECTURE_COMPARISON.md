@@ -22,7 +22,7 @@
 |-----------|----------|--------|--------|
 | **Entry Points** |
 | MCP Tools | JSON-RPC over stdio | JSON-RPC over stdio | ✅ |
-| HTTP API | REST + SSE on 8987 | REST + SSE on 8987 | ✅ |
+| HTTP API | REST + SSE on 8997 | REST + SSE on 8997 | ✅ |
 | CLI | index/search/optimize | index/search/optimize | ✅ |
 | **Security** |
 | Path Validation | expand ~ / detect .. / canonicalize | expand ~ / detect .. / canonicalize | ✅ |
@@ -64,14 +64,14 @@
 | **LaunchD** |
 | memex-ramdisk | Create 50GB | Create 50GB | ✅ |
 | mlx-embedding | Port 8765 | Port 12345 | ❌ Mismatch |
-| rmcp-memex | Port 8987, uses RAM | Port 8987, uses RAM | ✅ |
+| rmcp-memex | Port 8997, uses RAM | Port 8997, uses RAM | ✅ |
 | memex-snapshot | Periodic sync | Periodic sync | ✅ |
 | **Config** |
 | Config File | `~/.ai-memories/config.toml` | **NONE** | ❌ Missing |
 | **Quality Assurance** |
 | TextIntegrityMetrics | >90% threshold | **✅ compute() + recommendation()** | ✅ FIXED |
-| Audit command | Per-namespace check | **✅ rust-memex audit** | ✅ FIXED |
-| Purge command | Remove low-quality | **✅ rust-memex purge-quality** | ✅ FIXED |
+| Audit command | Per-namespace check | **✅ rmcp-memex audit** | ✅ FIXED |
+| Purge command | Remove low-quality | **✅ rmcp-memex purge-quality** | ✅ FIXED |
 | **Testing** |
 | E2E: pipeline | Required | **✅ tests/e2e_pipeline.rs (5 tests)** | ✅ FIXED |
 | E2E: MCP tools | Required | **MISSING** | ❌ |
@@ -86,7 +86,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        ENTRY POINTS                             │
-│         MCP (stdio) │ HTTP (8987) │ CLI                         │
+│         MCP (stdio) │ HTTP (8997) │ CLI                         │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -137,7 +137,7 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        ENTRY POINTS                             │
-│         MCP (stdio) │ HTTP (8987) │ CLI (rust-memex)            │
+│         MCP (stdio) │ HTTP (8997) │ CLI (rmcp-memex)            │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -195,7 +195,7 @@
 2. ~~**E2E Tests**~~ → ✅ `tests/e2e_pipeline.rs` (5 tests)
 3. ~~**Quality Metrics**~~ → ✅ `TextIntegrityMetrics` with >90% threshold
 4. ~~**Cross-dim Search**~~ → ✅ `DimensionAdapter` (1024/2048/4096)
-5. ~~**Audit/Purge**~~ → ✅ `rust-memex audit` + `purge-quality` commands
+5. ~~**Audit/Purge**~~ → ✅ `rmcp-memex audit` + `purge-quality` commands
 
 ### 🟠 HIGH (Data Integrity Risk)
 1. **Atomic Batch Writes** - Implement transaction wrapper

@@ -42,7 +42,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::embeddings::{DEFAULT_REQUIRED_DIMENSION, EmbeddingClient, EmbeddingConfig};
-use crate::rag::{SearchResult, SliceLayer};
+use crate::rag::{SearchOptions, SearchResult, SliceLayer};
 use crate::search::{
     BM25Config, BM25Index, HybridConfig, HybridSearchResult, HybridSearcher, SearchMode,
 };
@@ -398,7 +398,7 @@ impl LayerStats {
 
         // Sort by frequency and take top 10
         let mut keywords: Vec<_> = keyword_counts.into_iter().collect();
-        keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        keywords.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top_keywords = keywords.into_iter().take(10).map(|(k, _)| k).collect();
 
         Self {
@@ -698,7 +698,13 @@ impl MemexEngine {
 
         // Perform hybrid search
         let results = hybrid
-            .search(query, query_embedding, Some(&self.namespace), limit, None)
+            .search(
+                query,
+                query_embedding,
+                Some(&self.namespace),
+                limit,
+                SearchOptions::default(),
+            )
             .await?;
 
         debug!("Hybrid search returned {} results", results.len());
@@ -847,7 +853,7 @@ impl MemexEngine {
         let mut docs = Vec::with_capacity(items.len());
         let mut bm25_docs = Vec::new();
 
-        for (item, embedding) in items.iter().zip(embeddings.into_iter()) {
+        for (item, embedding) in items.iter().zip(embeddings) {
             let doc = ChromaDocument::new_flat(
                 item.id.clone(),
                 self.namespace.clone(),
@@ -939,26 +945,40 @@ impl MemexEngine {
         // For now, we'll scan namespace documents and filter in memory.
         // TODO: Add native metadata filtering to LanceDB queries.
 
-        let mut deleted_count = 0;
         let mut deleted_ids = Vec::new();
 
-        // Search with empty query to get all documents (expensive!)
-        // We use a high limit and paginate if needed
+        // Search namespace documents page by page before mutating the table.
+        // Deleting while paginating would shift row offsets and risk skipping
+        // matches in later pages.
         const BATCH_SIZE: usize = 1000;
+        let mut offset = 0;
 
-        let candidates = self
-            .storage
-            .all_documents(Some(&self.namespace), BATCH_SIZE)
-            .await?;
+        loop {
+            let candidates = self
+                .storage
+                .all_documents_page(Some(&self.namespace), offset, BATCH_SIZE)
+                .await?;
 
-        for doc in candidates {
-            if filter.matches(&doc.metadata) {
-                self.storage
-                    .delete_document(&self.namespace, &doc.id)
-                    .await?;
-                deleted_ids.push(doc.id);
-                deleted_count += 1;
+            if candidates.is_empty() {
+                break;
             }
+
+            let page_len = candidates.len();
+            for doc in candidates {
+                if filter.matches(&doc.metadata) {
+                    deleted_ids.push(doc.id);
+                }
+            }
+
+            if page_len < BATCH_SIZE {
+                break;
+            }
+
+            offset += page_len;
+        }
+
+        for id in &deleted_ids {
+            self.storage.delete_document(&self.namespace, id).await?;
         }
 
         // Delete from BM25 if enabled
@@ -968,6 +988,7 @@ impl MemexEngine {
             bm25.delete_documents(&deleted_ids).await?;
         }
 
+        let deleted_count = deleted_ids.len();
         info!("Deleted {} documents by filter", deleted_count);
         Ok(deleted_count)
     }

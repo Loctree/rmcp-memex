@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use rmcp_memex::{
-    EmbeddingClient, EmbeddingConfig, HealthChecker, RAGPipeline, SliceLayer, StorageManager,
-    path_utils,
+    BM25Config, BM25Index, EmbeddingClient, EmbeddingConfig, HealthChecker, RAGPipeline,
+    SliceLayer, StorageManager, inspect_cross_store_recovery, path_utils,
 };
 
 #[allow(dead_code)]
@@ -154,7 +154,7 @@ pub async fn run_overview(
             }
         }
         let mut top_keywords: Vec<_> = keyword_counts.into_iter().collect();
-        top_keywords.sort_by(|a, b| b.1.cmp(&a.1));
+        top_keywords.sort_by_key(|b| std::cmp::Reverse(b.1));
         let top_keywords: Vec<(String, usize)> = top_keywords.into_iter().take(10).collect();
 
         // Check for timestamps in metadata (look for common timestamp patterns)
@@ -264,6 +264,7 @@ pub struct HealthReport {
     pub database: DatabaseHealth,
     pub embedder: Option<EmbedderHealth>,
     pub namespaces: Vec<NamespaceHealth>,
+    pub cross_store: Option<CrossStoreHealth>,
     pub recommendations: Vec<String>,
     pub overall_status: String,
 }
@@ -289,6 +290,18 @@ pub struct EmbedderHealth {
 pub struct NamespaceHealth {
     pub name: String,
     pub chunk_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CrossStoreHealth {
+    pub recovery_dir: String,
+    pub status: String,
+    pub pending_batches: usize,
+    pub divergent_batches: usize,
+    pub rolled_back_batches: usize,
+    pub stale_batches: usize,
+    pub missing_bm25_documents: usize,
+    pub missing_lance_documents: usize,
 }
 
 /// Run health check command
@@ -399,6 +412,63 @@ pub async fn run_health(
         vec![]
     };
 
+    let cross_store = match StorageManager::new_lance_only(&db_path).await {
+        Ok(storage) => match BM25Index::new(&BM25Config::default().with_read_only(true)) {
+            Ok(bm25) => {
+                let recovery = inspect_cross_store_recovery(&storage, &bm25, None).await?;
+                let status = if recovery.pending_batches == 0 {
+                    "OK".to_string()
+                } else if recovery.divergent_batches > 0 {
+                    overall_ok = false;
+                    recommendations.push(
+                        "Run 'rmcp-memex repair-writes --execute' to reconcile Lance/BM25 divergence"
+                            .to_string(),
+                    );
+                    "DIVERGENT".to_string()
+                } else if recovery.rolled_back_batches > 0 || recovery.stale_batches > 0 {
+                    overall_ok = false;
+                    recommendations.push(
+                        "Run 'rmcp-memex repair-writes --execute' to clear rolled-back/stale recovery ledgers"
+                            .to_string(),
+                    );
+                    "RECOVERY_PENDING".to_string()
+                } else {
+                    recommendations.push(
+                        "Run 'rmcp-memex repair-writes --execute' to clear completed recovery ledgers"
+                            .to_string(),
+                    );
+                    "LEDGER_PENDING".to_string()
+                };
+
+                Some(CrossStoreHealth {
+                    recovery_dir: recovery.recovery_dir,
+                    status,
+                    pending_batches: recovery.pending_batches,
+                    divergent_batches: recovery.divergent_batches,
+                    rolled_back_batches: recovery.rolled_back_batches,
+                    stale_batches: recovery.stale_batches,
+                    missing_bm25_documents: recovery.documents_missing_bm25,
+                    missing_lance_documents: recovery.documents_missing_lance,
+                })
+            }
+            Err(error) => {
+                overall_ok = false;
+                recommendations.push(format!("BM25 recovery inspection unavailable: {}", error));
+                Some(CrossStoreHealth {
+                    recovery_dir: storage.cross_store_recovery_dir().display().to_string(),
+                    status: format!("ERROR: {error}"),
+                    pending_batches: 0,
+                    divergent_batches: 0,
+                    rolled_back_batches: 0,
+                    stale_batches: 0,
+                    missing_bm25_documents: 0,
+                    missing_lance_documents: 0,
+                })
+            }
+        },
+        Err(_) => None,
+    };
+
     // Build report
     let overall_status = if overall_ok && recommendations.is_empty() {
         "HEALTHY".to_string()
@@ -412,6 +482,7 @@ pub async fn run_health(
         database: db_health,
         embedder: embedder_health,
         namespaces,
+        cross_store,
         recommendations: recommendations.clone(),
         overall_status: overall_status.clone(),
     };
@@ -464,6 +535,25 @@ pub async fn run_health(
             for ns in &report.namespaces {
                 eprintln!("  {}: {} chunks", ns.name, ns.chunk_count);
             }
+            eprintln!();
+        }
+
+        if let Some(ref cross_store) = report.cross_store {
+            eprintln!("Cross-store recovery:");
+            eprintln!("  Status:           {}", cross_store.status);
+            eprintln!("  Recovery dir:     {}", cross_store.recovery_dir);
+            eprintln!("  Pending batches:  {}", cross_store.pending_batches);
+            eprintln!("  Divergent batches: {}", cross_store.divergent_batches);
+            eprintln!("  Rolled back:      {}", cross_store.rolled_back_batches);
+            eprintln!("  Stale ledgers:    {}", cross_store.stale_batches);
+            eprintln!(
+                "  Missing BM25 docs: {}",
+                cross_store.missing_bm25_documents
+            );
+            eprintln!(
+                "  Missing Lance docs: {}",
+                cross_store.missing_lance_documents
+            );
             eprintln!();
         }
 

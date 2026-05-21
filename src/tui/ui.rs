@@ -5,13 +5,19 @@
 use crate::tui::app::{App, WizardStep};
 use crate::tui::detection::ProviderStatus;
 use crate::tui::health::CheckStatus;
-use crate::tui::indexer::{DataSetupOption, DataSetupSubStep, ImportMode};
+use crate::tui::indexer::{DataSetupOption, DataSetupSubStep, ImportMode, IndexTelemetrySnapshot};
+use crate::tui::monitor::{GpuStatus, MonitorSnapshot};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn render(frame: &mut Frame, app: &App) {
+pub fn render(
+    frame: &mut Frame,
+    app: &App,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -22,13 +28,13 @@ pub fn render(frame: &mut Frame, app: &App) {
         .split(frame.area());
 
     render_header(frame, chunks[0], app);
-    render_main(frame, chunks[1], app);
+    render_main(frame, chunks[1], app, telemetry, monitor);
     render_footer(frame, chunks[2], app);
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     let title = format!(
-        " rmcp_memex wizard v{} - Step {}/{}: {} ",
+        " rmcp-memex wizard v{} - Step {}/{}: {} ",
         VERSION,
         app.step.step_number(),
         WizardStep::total_steps(),
@@ -77,7 +83,20 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
                 DataSetupSubStep::SelectImportMode => {
                     " [Up/Down] Select | [Enter] Choose | [<-] Back "
                 }
-                DataSetupSubStep::Indexing => " Indexing in progress... ",
+                DataSetupSubStep::Indexing => {
+                    let telemetry = app.telemetry_rx.as_ref().map(|rx| rx.borrow().clone());
+                    if telemetry.as_ref().map(|s| s.complete).unwrap_or(false) {
+                        " [->] Next | [<-] Back | [q] Quit "
+                    } else if telemetry
+                        .as_ref()
+                        .map(|s| s.paused)
+                        .unwrap_or(app.index_paused)
+                    {
+                        " [Space] Resume | [+] Par+ | [-] Par- | [s] Stop | [q] Quit "
+                    } else {
+                        " [Space] Pause | [+] Par+ | [-] Par- | [s] Stop | [q] Quit "
+                    }
+                }
                 DataSetupSubStep::Complete => " [->] Next | [<-] Back | [q] Quit ",
             },
             WizardStep::Summary => " [Enter] Write Configs | [<-] Back | [q] Quit ",
@@ -96,7 +115,13 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(help, area);
 }
 
-fn render_main(frame: &mut Frame, area: Rect, app: &App) {
+fn render_main(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
     match app.step {
         WizardStep::Welcome => render_welcome(frame, area, app),
         WizardStep::EmbedderSetup => render_embedder_setup(frame, area, app),
@@ -104,7 +129,7 @@ fn render_main(frame: &mut Frame, area: Rect, app: &App) {
         WizardStep::HostSelection => render_host_selection(frame, area, app),
         WizardStep::SnippetPreview => render_snippet_preview(frame, area, app),
         WizardStep::HealthCheck => render_health_check(frame, area, app),
-        WizardStep::DataSetup => render_data_setup(frame, area, app),
+        WizardStep::DataSetup => render_data_setup(frame, area, app, telemetry, monitor),
         WizardStep::Summary => render_summary(frame, area, app),
     }
 }
@@ -113,13 +138,13 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App) {
     let text = vec![
         Line::from(""),
         Line::from(Span::styled(
-            "Welcome to rmcp_memex Configuration Wizard",
+            "Welcome to rmcp-memex Configuration Wizard",
             Style::default().fg(Color::Cyan).bold(),
         )),
         Line::from(""),
         Line::from("This wizard will help you:"),
         Line::from(""),
-        Line::from("  1. Configure rmcp_memex settings (database path, cache, etc.)"),
+        Line::from("  1. Configure rmcp-memex settings (database path, cache, etc.)"),
         Line::from("  2. Detect and configure MCP host integrations"),
         Line::from("  3. Generate configuration snippets for your hosts"),
         Line::from("  4. Verify your setup with a health check"),
@@ -158,31 +183,77 @@ fn render_welcome(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
-    let fields = [
+fn settings_fields(app: &App) -> Vec<(&'static str, String, &'static str)> {
+    let fields = vec![
         (
             "Database Path",
-            &app.memex_cfg.db_path,
+            app.memex_cfg.db_path.clone(),
             "LanceDB storage location",
         ),
         (
+            "Path Mode",
+            app.get_field_value(1),
+            "shared or hostname-suffixed",
+        ),
+        (
+            "HTTP/SSE Port",
+            app.get_field_value(2),
+            "disabled or a port number",
+        ),
+        (
             "Cache Size (MB)",
-            &app.memex_cfg.cache_mb.to_string(),
-            "In-memory cache size",
+            app.get_field_value(3),
+            "in-memory cache budget",
         ),
         (
             "Log Level",
-            &app.memex_cfg.log_level,
+            app.get_field_value(4),
             "trace/debug/info/warn/error",
         ),
         (
             "Max Request (bytes)",
-            &app.memex_cfg.max_request_bytes.to_string(),
+            app.get_field_value(5),
             "JSON-RPC size limit",
         ),
-        ("Mode", &app.memex_cfg.mode, "full or memory"),
+        (
+            "Deployment Mode",
+            app.get_field_value(6),
+            if app.mux_proxy_on_path() {
+                "direct stdio or shared mux"
+            } else {
+                "shared mux requires rmcp_mux_proxy on PATH"
+            },
+        ),
     ];
 
+    fields
+}
+
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(8)])
+        .split(area);
+
+    let info = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Config path: ", Style::default().bold()),
+            Span::raw(app.resolved_config_path()),
+        ]),
+        Line::from(vec![
+            Span::styled("Effective database: ", Style::default().bold()),
+            Span::raw(app.memex_cfg.resolved_db_path()),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Current Paths "),
+    );
+    frame.render_widget(info, chunks[0]);
+
+    let fields = settings_fields(app);
     let items: Vec<ListItem> = fields
         .iter()
         .enumerate()
@@ -222,7 +293,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
             .title(" Memex Configuration "),
     );
 
-    frame.render_widget(list, area);
+    frame.render_widget(list, chunks[1]);
 }
 
 fn render_host_selection(frame: &mut Frame, area: Rect, app: &App) {
@@ -437,6 +508,20 @@ fn render_health_check(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
+    let provider_label = if app.embedder_state.use_manual {
+        "Manual configuration".to_string()
+    } else if let Some(provider) = &app.embedder_state.selected_provider {
+        provider.kind.label().to_string()
+    } else {
+        "No provider selected yet".to_string()
+    };
+
+    let model_label = app
+        .embedder_state
+        .selected_model()
+        .unwrap_or_else(|| "<unset>".to_string());
+    let base_url = app.embedder_state.selected_base_url().unwrap_or("<unset>");
+
     let mut lines = vec![
         Line::from(Span::styled(
             "Embedding Provider Setup",
@@ -452,17 +537,12 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
         "Current Configuration:",
         Style::default().bold(),
     )));
-    lines.push(Line::from(format!(
-        "  Provider: {}",
-        app.embedding_config.provider_name()
-    )));
-    lines.push(Line::from(format!(
-        "  Model: {}",
-        app.embedding_config.model_name()
-    )));
+    lines.push(Line::from(format!("  Provider: {}", provider_label)));
+    lines.push(Line::from(format!("  Base URL: {}", base_url)));
+    lines.push(Line::from(format!("  Model: {}", model_label)));
     lines.push(Line::from(format!(
         "  Dimension: {}",
-        app.embedding_config.dimension()
+        app.embedder_state.dimension_display()
     )));
     lines.push(Line::from(Span::styled(
         format!("             {}", app.embedder_state.dimension_hint()),
@@ -470,48 +550,129 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
     )));
     lines.push(Line::from(""));
 
-    // Show detected providers if available
-    if !app.embedder_state.detected_providers.is_empty() {
+    if app.embedder_state.use_manual {
         lines.push(Line::from(Span::styled(
-            "Detected Providers:",
+            "Manual Fields:",
             Style::default().bold(),
         )));
 
-        for (i, provider) in app.embedder_state.detected_providers.iter().enumerate() {
+        let fields = [
+            ("Base URL", app.embedder_state.manual_url.clone()),
+            ("Model", app.embedder_state.manual_model.clone()),
+            ("Dimension", app.embedder_state.dimension_display()),
+        ];
+
+        for (i, (label, value)) in fields.iter().enumerate() {
             let is_focused = i == app.focus;
-            let prefix = if is_focused { "▶ " } else { "  " };
-            let style = if is_focused {
+            let is_editing = app.input_mode && app.editing_field == Some(i);
+            let display_value = if is_editing {
+                format!("{}▏", app.input_buffer)
+            } else {
+                value.clone()
+            };
+            let style = if is_editing {
+                Style::default().fg(Color::Yellow).bg(Color::DarkGray)
+            } else if is_focused {
                 Style::default().fg(Color::Cyan).bold()
             } else {
                 Style::default()
             };
-
-            let status_icon = match &provider.status {
-                ProviderStatus::Online(_) => "[OK]",
-                ProviderStatus::OnlineNoModel => "[--]",
-                ProviderStatus::Offline => "[XX]",
-            };
-
-            let status_color = match &provider.status {
-                ProviderStatus::Online(_) => Color::Green,
-                ProviderStatus::OnlineNoModel => Color::Yellow,
-                ProviderStatus::Offline => Color::DarkGray,
-            };
+            let prefix = if is_focused { "▶ " } else { "  " };
 
             lines.push(Line::from(vec![
                 Span::styled(prefix, style),
-                Span::styled(
-                    format!("{} ", status_icon),
-                    Style::default().fg(status_color),
-                ),
-                Span::styled(provider.summary(), style),
+                Span::styled(format!("{:<12}", label), style),
+                Span::styled(display_value, style),
             ]));
         }
-    } else {
+
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "No providers detected yet. Continue to proceed with default configuration.",
-            Style::default().fg(Color::Yellow),
+            "Press [Esc] to return to detected providers.",
+            Style::default().fg(Color::DarkGray),
         )));
+    } else {
+        // Show detected providers if available
+        if !app.embedder_state.detected_providers.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "Detected Providers:",
+                Style::default().bold(),
+            )));
+
+            for (i, provider) in app.embedder_state.detected_providers.iter().enumerate() {
+                let is_focused = i == app.focus;
+                let is_selected = app
+                    .embedder_state
+                    .selected_provider
+                    .as_ref()
+                    .map(|selected| {
+                        selected.base_url == provider.base_url
+                            && selected.model() == provider.model()
+                    })
+                    .unwrap_or(false);
+                let prefix = if is_focused { "▶ " } else { "  " };
+                let style = if is_focused {
+                    Style::default().fg(Color::Cyan).bold()
+                } else if is_selected {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default()
+                };
+
+                let status_icon = match &provider.status {
+                    ProviderStatus::Online(_) => "[OK]",
+                    ProviderStatus::OnlineNoModel => "[--]",
+                    ProviderStatus::Offline => "[XX]",
+                };
+
+                let status_color = match &provider.status {
+                    ProviderStatus::Online(_) => Color::Green,
+                    ProviderStatus::OnlineNoModel => Color::Yellow,
+                    ProviderStatus::Offline => Color::DarkGray,
+                };
+
+                let dimension_note = "probe required".to_string();
+
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::styled(
+                        format!("{} ", status_icon),
+                        Style::default().fg(status_color),
+                    ),
+                    Span::styled(provider.summary(), style),
+                    Span::styled(
+                        format!(" ({dimension_note})"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        } else {
+            lines.push(Line::from(Span::styled(
+                "No providers detected yet. Continue to proceed with default configuration.",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+
+        let manual_index = app.embedder_state.detected_providers.len();
+        let manual_style = if app.focus == manual_index {
+            Style::default().fg(Color::Cyan).bold()
+        } else {
+            Style::default()
+        };
+        let manual_prefix = if app.focus == manual_index {
+            "▶ "
+        } else {
+            "  "
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(manual_prefix, manual_style),
+            Span::styled("Configure manually", manual_style),
+            Span::styled(
+                " (edit URL, model, and dimension directly)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
     }
 
     let paragraph = Paragraph::new(lines)
@@ -526,7 +687,18 @@ fn render_embedder_setup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
+fn render_data_setup(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
+    if app.data_setup.sub_step == DataSetupSubStep::Indexing {
+        render_indexing_dashboard(frame, area, telemetry, monitor);
+        return;
+    }
+
     let mut lines = vec![
         Line::from(Span::styled(
             "Data Setup",
@@ -569,6 +741,13 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                 format!("> {}|", app.data_setup.input_buffer),
                 Style::default().fg(Color::Yellow),
             )));
+            if let Some(error) = &app.data_setup.validation_error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    error.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
         }
         DataSetupSubStep::EnterNamespace => {
             lines.push(Line::from("Enter namespace for indexed documents:"));
@@ -582,6 +761,13 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                 "(Leave empty for default 'rag' namespace)",
                 Style::default().fg(Color::DarkGray),
             )));
+            if let Some(error) = &app.data_setup.validation_error {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    error.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
         }
         DataSetupSubStep::SelectImportMode => {
             lines.push(Line::from("Select import mode:"));
@@ -602,33 +788,7 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                 ]));
             }
         }
-        DataSetupSubStep::Indexing => {
-            lines.push(Line::from(Span::styled(
-                "Indexing in progress...",
-                Style::default().fg(Color::Yellow),
-            )));
-            lines.push(Line::from(""));
-
-            if let Some(ref progress) = app.data_setup.progress {
-                let percentage = if progress.total > 0 {
-                    (progress.processed as f64 / progress.total as f64 * 100.0) as u16
-                } else {
-                    0
-                };
-
-                lines.push(Line::from(format!(
-                    "Progress: {}/{} files ({:.1}%)",
-                    progress.processed, progress.total, percentage as f64
-                )));
-
-                if !progress.current_file.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("Current: {}", progress.current_file),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-        }
+        DataSetupSubStep::Indexing => {}
         DataSetupSubStep::Complete => {
             lines.push(Line::from(Span::styled(
                 "Data setup complete!",
@@ -641,6 +801,8 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Green)
                 } else if msg.starts_with("[ERR]") {
                     Style::default().fg(Color::Red)
+                } else if msg.starts_with("[WARN]") {
+                    Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
                 };
@@ -661,6 +823,334 @@ fn render_data_setup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
+fn render_indexing_dashboard(
+    frame: &mut Frame,
+    area: Rect,
+    telemetry: Option<&IndexTelemetrySnapshot>,
+    monitor: Option<&MonitorSnapshot>,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Progress Gauge
+            Constraint::Min(10),   // Main Stats
+            Constraint::Length(5), // Recent Warnings
+        ])
+        .split(area);
+
+    // 1. Top Progress Gauge
+    let ratio = telemetry
+        .map(|snapshot| {
+            if snapshot.total == 0 {
+                0.0
+            } else {
+                snapshot.processed as f64 / snapshot.total as f64
+            }
+        })
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0);
+
+    let progress_label = telemetry
+        .map(|snapshot| {
+            format!(
+                "{}% ({}/{})",
+                (ratio * 100.0) as u64,
+                snapshot.processed,
+                snapshot.total
+            )
+        })
+        .unwrap_or_else(|| "0% (waiting)".to_string());
+
+    let progress_gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .padding(Padding::new(1, 1, 0, 0)),
+        )
+        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::DarkGray))
+        .ratio(ratio)
+        .label(progress_label);
+    frame.render_widget(progress_gauge, chunks[0]);
+
+    // 2. Middle section: Left (Operator Stats) | Right (System Telemetry)
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    // Left: Operator Stats
+    let left_lines = if let Some(snapshot) = telemetry {
+        let status_style = if snapshot.complete {
+            Style::default().fg(Color::Green).bold()
+        } else if snapshot.stopping {
+            Style::default().fg(Color::Red).bold()
+        } else if snapshot.paused {
+            Style::default().fg(Color::Yellow).bold()
+        } else {
+            Style::default().fg(Color::Cyan).bold()
+        };
+
+        let status = if snapshot.complete {
+            "COMPLETE"
+        } else if snapshot.stopping {
+            "STOPPING"
+        } else if snapshot.paused {
+            "PAUSED"
+        } else {
+            "RUNNING"
+        };
+
+        vec![
+            Line::from(vec![
+                Span::raw("Status:      "),
+                Span::styled(status, status_style),
+            ]),
+            Line::from(vec![
+                Span::raw("Rate:        "),
+                Span::styled(
+                    format!("{:.2} files/sec", snapshot.files_per_sec),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("ETA:         "),
+                Span::styled(
+                    format_eta(snapshot.eta_secs),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("Parallelism: "),
+                Span::styled(
+                    snapshot.parallelism.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(" (inflight: "),
+                Span::styled(
+                    snapshot.in_flight.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(")"),
+            ]),
+            Line::from(vec![
+                Span::raw("Processed:   "),
+                Span::styled(
+                    snapshot.indexed.to_string(),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" indexed, "),
+                Span::styled(
+                    snapshot.skipped.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(" skipped, "),
+                Span::styled(snapshot.failed.to_string(), Style::default().fg(Color::Red)),
+                Span::raw(" failed"),
+            ]),
+            Line::from(vec![
+                Span::raw("Chunks:      "),
+                Span::styled(
+                    snapshot.total_chunks.to_string(),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::raw(" produced"),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Current File: ", Style::default().bold()),
+                Span::styled(
+                    current_file_label(snapshot),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+        ]
+    } else {
+        vec![Line::from("Waiting for indexing telemetry...")]
+    };
+
+    let operator_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Operator Dashboard ");
+    frame.render_widget(
+        Paragraph::new(left_lines).block(operator_block),
+        main_chunks[0],
+    );
+
+    // Right: System Telemetry with Gauges
+    let system_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" System Telemetry ");
+
+    let sys_area = system_block.inner(main_chunks[1]);
+    frame.render_widget(system_block, main_chunks[1]);
+
+    if let Some(snapshot) = monitor {
+        let sys_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // CPU Gauge
+                Constraint::Length(2), // RAM Gauge
+                Constraint::Length(2), // GPU Gauge (if available)
+                Constraint::Min(4),    // Process stats
+            ])
+            .margin(1)
+            .split(sys_area);
+
+        // CPU Gauge
+        let cpu_gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+            .ratio((snapshot.system_cpu_percent / 100.0).clamp(0.0, 1.0) as f64)
+            .label(format!("CPU: {:.1}%", snapshot.system_cpu_percent));
+        frame.render_widget(cpu_gauge, sys_rows[0]);
+
+        // RAM Gauge
+        let ram_ratio = if snapshot.system_ram_total > 0 {
+            snapshot.system_ram_used as f64 / snapshot.system_ram_total as f64
+        } else {
+            0.0
+        };
+        let ram_gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Blue).bg(Color::DarkGray))
+            .ratio(ram_ratio.clamp(0.0, 1.0))
+            .label(format!(
+                "RAM: {} / {}",
+                MonitorSnapshot::format_bytes(snapshot.system_ram_used),
+                MonitorSnapshot::format_bytes(snapshot.system_ram_total)
+            ));
+        frame.render_widget(ram_gauge, sys_rows[1]);
+
+        // GPU Gauge (if available)
+        if let Some(gpu_util) = snapshot.gpu_util_percent {
+            let gpu_gauge = Gauge::default()
+                .gauge_style(Style::default().fg(Color::Magenta).bg(Color::DarkGray))
+                .ratio((gpu_util / 100.0).clamp(0.0, 1.0) as f64)
+                .label(format!("GPU: {:.1}%", gpu_util));
+            frame.render_widget(gpu_gauge, sys_rows[2]);
+        } else {
+            let gpu_note = match &snapshot.gpu_status {
+                GpuStatus::Unavailable { reason } => format!("GPU Unavailable: {}", reason),
+                _ => "GPU: --".to_string(),
+            };
+            frame.render_widget(
+                Paragraph::new(gpu_note).style(Style::default().fg(Color::DarkGray)),
+                sys_rows[2],
+            );
+        }
+
+        // Process stats
+        let process_lines = vec![
+            Line::from(vec![
+                Span::styled("rmcp-memex:  ", Style::default().bold()),
+                Span::styled(
+                    format!("{:.1}% CPU", snapshot.rmcp_memex_cpu),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    MonitorSnapshot::format_bytes(snapshot.rmcp_memex_rss),
+                    Style::default().fg(Color::Blue),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Embedder:    ", Style::default().bold()),
+                Span::styled(
+                    format!("{:.1}% CPU", snapshot.embedder_cpu_aggregate),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    MonitorSnapshot::format_bytes(snapshot.embedder_rss_aggregate),
+                    Style::default().fg(Color::Blue),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("GPU VRAM:    ", Style::default().bold()),
+                Span::raw(format!(
+                    "{} / {}",
+                    snapshot
+                        .gpu_memory_used
+                        .map(MonitorSnapshot::format_bytes)
+                        .unwrap_or_else(|| "--".to_string()),
+                    snapshot
+                        .gpu_memory_total
+                        .map(MonitorSnapshot::format_bytes)
+                        .unwrap_or_else(|| "--".to_string())
+                )),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(process_lines), sys_rows[3]);
+    } else {
+        frame.render_widget(Paragraph::new("Waiting for system monitor..."), sys_area);
+    }
+
+    // 3. Bottom: Warnings/Log
+    let warning_lines = if let Some(snapshot) = telemetry {
+        let lines: Vec<Line> = snapshot
+            .recent_warnings
+            .iter()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|warning| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("[{}] ", warning.code),
+                        Style::default().fg(Color::Red).bold(),
+                    ),
+                    Span::styled(&warning.message, Style::default().fg(Color::Yellow)),
+                ])
+            })
+            .collect();
+        if lines.is_empty() {
+            vec![Line::from(Span::styled(
+                "No warnings encountered.",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            lines
+        }
+    } else {
+        vec![Line::from("Waiting for telemetry...")]
+    };
+
+    let warnings_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(" Recent Warnings ");
+    frame.render_widget(
+        Paragraph::new(warning_lines)
+            .block(warnings_block)
+            .wrap(Wrap { trim: true }),
+        chunks[2],
+    );
+}
+
+fn current_file_label(snapshot: &IndexTelemetrySnapshot) -> String {
+    snapshot
+        .current_file
+        .clone()
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn format_eta(eta_secs: Option<f64>) -> String {
+    let Some(eta_secs) = eta_secs else {
+        return "--".to_string();
+    };
+
+    let eta_secs = eta_secs.max(0.0).round() as u64;
+    let minutes = eta_secs / 60;
+    let seconds = eta_secs % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(Span::styled(
@@ -669,10 +1159,10 @@ fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
         Line::from(Span::styled("Memex Settings:", Style::default().bold())),
-        Line::from(format!("  Database: {}", app.memex_cfg.db_path)),
+        Line::from(format!("  Config: {}", app.config_path)),
+        Line::from(format!("  Database: {}", app.memex_cfg.resolved_db_path())),
         Line::from(format!("  Cache: {} MB", app.memex_cfg.cache_mb)),
         Line::from(format!("  Log Level: {}", app.memex_cfg.log_level)),
-        Line::from(format!("  Mode: {}", app.memex_cfg.mode)),
         Line::from(""),
         Line::from(Span::styled("Selected Hosts:", Style::default().bold())),
     ];
@@ -729,4 +1219,27 @@ fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::settings_fields;
+    use crate::tui::app::{App, WizardConfig};
+
+    #[test]
+    fn settings_fields_track_live_app_field_count() {
+        let app = App::new(WizardConfig::default());
+        assert_eq!(settings_fields(&app).len(), app.settings_field_count());
+    }
+
+    #[test]
+    fn settings_fields_keep_deployment_mode_visible_without_mux_proxy() {
+        let mut app = App::new(WizardConfig::default());
+        app.mux_proxy_command = None;
+
+        let fields = settings_fields(&app);
+        assert_eq!(fields.len(), 7);
+        assert_eq!(fields[6].0, "Deployment Mode");
+        assert_eq!(fields[6].1, "Per-host (shared unavailable)".to_string());
+    }
 }

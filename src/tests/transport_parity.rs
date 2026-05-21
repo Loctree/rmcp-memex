@@ -15,12 +15,16 @@
 //! | tools/call (list_protected)    |        | ✓             |                     |
 //! | tools/call (dive validation)   |        | ✓             |                     |
 //! | tools/call (unknown)           |        | ✓             | ✓                   |
-//! | unknown method                 |        |               | ✓                   |
+//! | resources/list rejected        |        |               | ✓                   |
 //! | missing id                     |        |               | ✓                   |
 //! | notifications                  |        | ✓             | ✓                   |
 //! | JSON-RPC framing               | ✓      |               |                     |
 //! | payload parse error            |        | ✓             |                     |
 //! | payload too large              |        | ✓             |                     |
+//! | tools/call (create_token)      |        | ✓             |                     |
+//! | tools/call (revoke_token val)  |        | ✓             |                     |
+//! | tools/call via handle_payload  |        | ✓             |                     |
+//! | malformed JSON-RPC structure   |        | ✓             |                     |
 //!
 //! ## Known transport differences
 //!
@@ -28,11 +32,15 @@
 //! via `McpTransport::HttpSse`. This is intentional — clients use it for
 //! diagnostics. All other tool responses are transport-independent.
 
-use crate::mcp_protocol::{
-    McpCore, McpTransport, PROTOCOL_VERSION, SERVER_NAME, jsonrpc_error, jsonrpc_success,
-    shared_initialize_result, shared_tools_list_result,
+use crate::{
+    MCPServer, McpDispatch, dispatch_mcp_jsonrpc_request, dispatch_mcp_request,
+    mcp_protocol::{
+        McpCore, McpTransport, PROTOCOL_VERSION, SERVER_NAME, jsonrpc_error, jsonrpc_success,
+        shared_initialize_result, shared_tools_list_result,
+    },
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -86,10 +94,9 @@ fn initialize_result_has_server_info() {
 }
 
 #[test]
-fn initialize_result_has_tools_and_resources_capabilities() {
+fn initialize_result_advertises_only_tools_capability() {
     let result = shared_initialize_result();
-    assert!(result["capabilities"]["tools"].is_object());
-    assert!(result["capabilities"]["resources"].is_object());
+    assert_eq!(result["capabilities"], json!({ "tools": {} }));
 }
 
 #[test]
@@ -264,6 +271,7 @@ fn jsonrpc_error_omits_id_when_none() {
 
 /// Build a McpCore backed by a temporary LanceDB + the configured embedding server.
 /// Returns None if the embedding server is unreachable (test should skip).
+#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 async fn try_build_mcp_core() -> Option<McpCore> {
     use crate::{
         EmbeddingClient, EmbeddingConfig, ProviderConfig,
@@ -601,6 +609,7 @@ async fn health_tool_transport_field_difference_is_intentional() {
 
 /// Build an McpCore with a stub embedding client.
 /// These tests cover protocol dispatch paths that don't touch embeddings.
+#[allow(deprecated)] // NamespaceAccessManager deprecated by Track C; kept for transition
 async fn build_mcp_core_stub() -> McpCore {
     use crate::{
         EmbeddingClient,
@@ -952,6 +961,120 @@ async fn handle_payload_parse_error_parity_stub() {
     );
 }
 
+/// Valid JSON payload through `handle_payload` produces identical responses.
+/// This tests the full wire path: raw string → parse → dispatch → response.
+#[tokio::test]
+async fn handle_payload_valid_roundtrip_parity_stub() {
+    let core = build_mcp_core_stub().await;
+    let payload = r#"{"jsonrpc":"2.0","id":"pl-1","method":"initialize","params":{}}"#;
+
+    let stdio = core.handle_payload(payload, McpTransport::Stdio).await;
+    let http = core.handle_payload(payload, McpTransport::HttpSse).await;
+
+    assert_eq!(
+        stdio, http,
+        "valid payload roundtrip must be identical across transports"
+    );
+
+    let response = stdio.expect("valid payload must produce a response");
+    assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+    assert_eq!(response["id"], "pl-1");
+}
+
+/// The shared request-dispatch facade preserves transport parity.
+#[tokio::test]
+async fn dispatch_request_wrapper_roundtrip_parity_stub() {
+    let core = build_mcp_core_stub().await;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "wrapper-1",
+        "method": "initialize",
+        "params": {}
+    });
+
+    let stdio = dispatch_mcp_request(&core, request.clone(), McpTransport::Stdio).await;
+    let http = dispatch_mcp_request(&core, request, McpTransport::HttpSse).await;
+
+    assert_eq!(stdio, http);
+
+    let response = stdio.expect("initialize through facade must produce a response");
+    assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+    assert_eq!(response["id"], "wrapper-1");
+}
+
+/// The JSON-RPC facade preserves notification semantics instead of coercing them
+/// into synthetic responses.
+#[tokio::test]
+async fn dispatch_jsonrpc_wrapper_preserves_notification_semantics_stub() {
+    let core = build_mcp_core_stub().await;
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+
+    let stdio = dispatch_mcp_jsonrpc_request(&core, request.clone(), McpTransport::Stdio).await;
+    let http = dispatch_mcp_jsonrpc_request(&core, request, McpTransport::HttpSse).await;
+
+    assert!(matches!(stdio, McpDispatch::Notification));
+    assert!(matches!(http, McpDispatch::Notification));
+}
+
+/// The `MCPServer` convenience wrapper must preserve stdio notification
+/// semantics instead of fabricating a JSON-RPC success response.
+#[tokio::test]
+async fn server_dispatch_request_preserves_notification_semantics_stub() {
+    let server = MCPServer::from_mcp_core(Arc::new(build_mcp_core_stub().await));
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+        "params": {}
+    });
+
+    let response = server.dispatch_request(request).await;
+
+    assert!(
+        response.is_none(),
+        "notification dispatch must remain silent for stdio callers too"
+    );
+}
+
+/// The `MCPServer` helper should be a thin wrapper over the shared core, not a
+/// second JSON-RPC implementation.
+#[tokio::test]
+async fn server_dispatch_request_matches_shared_facade_stub() {
+    let core = Arc::new(build_mcp_core_stub().await);
+    let server = MCPServer::from_mcp_core(core.clone());
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "server-wrapper-1",
+        "method": "initialize",
+        "params": {}
+    });
+
+    let server_response = server.dispatch_request(request.clone()).await;
+    let shared_response = dispatch_mcp_request(core.as_ref(), request, McpTransport::Stdio).await;
+
+    assert_eq!(server_response, shared_response);
+}
+
+/// Valid tools/list through raw payload path — confirms wire-level parity.
+#[tokio::test]
+async fn handle_payload_tools_list_roundtrip_parity_stub() {
+    let core = build_mcp_core_stub().await;
+    let payload = r#"{"jsonrpc":"2.0","id":42,"method":"tools/list","params":{}}"#;
+
+    let stdio = core.handle_payload(payload, McpTransport::Stdio).await;
+    let http = core.handle_payload(payload, McpTransport::HttpSse).await;
+
+    assert_eq!(stdio, http);
+
+    let response = stdio.expect("tools/list payload must produce a response");
+    assert_eq!(
+        response["result"]["tools"].as_array().unwrap().len(),
+        EXPECTED_TOOLS.len()
+    );
+}
 /// Oversized payloads are rejected before transport-specific delivery.
 #[tokio::test]
 async fn handle_payload_request_too_large_parity_stub() {
@@ -975,4 +1098,159 @@ async fn handle_payload_request_too_large_parity_stub() {
             .unwrap_or("")
             .contains("Request too large")
     );
+}
+
+/// `namespace_create_token` success path — exercises a different tool category than health/security_status.
+#[tokio::test]
+async fn dispatch_tools_call_create_token_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "ct-1",
+        "method": "tools/call",
+        "params": {
+            "name": "namespace_create_token",
+            "arguments": {
+                "namespace": "parity-test-ns",
+                "description": "transport parity test"
+            }
+        }
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("namespace_create_token must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("namespace_create_token must return a response");
+
+    // Both must succeed with content array containing token text
+    let stdio_text = stdio_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("stdio should have text content");
+    let http_text = http_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("http should have text content");
+
+    assert!(
+        stdio_text.contains("Token created"),
+        "stdio response should confirm token creation"
+    );
+    assert!(
+        http_text.contains("Token created"),
+        "http response should confirm token creation"
+    );
+
+    // Structure must match (actual token values will differ, so compare shape only)
+    assert_eq!(
+        stdio_resp["result"]["content"][0]["type"], http_resp["result"]["content"][0]["type"],
+        "content type must be identical across transports"
+    );
+}
+
+/// `namespace_revoke_token` with empty namespace — tool-level validation parity.
+#[tokio::test]
+async fn dispatch_tools_call_revoke_token_empty_ns_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "rt-1",
+        "method": "tools/call",
+        "params": {
+            "name": "namespace_revoke_token",
+            "arguments": {
+                "namespace": ""
+            }
+        }
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("revoke_token must return a response");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("revoke_token must return a response");
+
+    assert_eq!(
+        stdio_resp, http_resp,
+        "revoke_token validation error must be identical across transports"
+    );
+
+    // tool_error_message returns { error: { message: "..." } } inside jsonrpc_success result
+    let msg = stdio_resp["result"]["error"]["message"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        msg.contains("required") || msg.contains("Namespace"),
+        "response should indicate namespace is required, got: {}",
+        msg
+    );
+}
+
+/// Wire-path parity for tools/call — proves the full raw string → parse → dispatch → response
+/// path works identically for tool calls, not just initialize/tools_list.
+#[tokio::test]
+async fn handle_payload_tools_call_roundtrip_parity_stub() {
+    let core = build_mcp_core_stub().await;
+    let payload = r#"{"jsonrpc":"2.0","id":"wire-tc","method":"tools/call","params":{"name":"namespace_security_status","arguments":{}}}"#;
+
+    let stdio = core.handle_payload(payload, McpTransport::Stdio).await;
+    let http = core.handle_payload(payload, McpTransport::HttpSse).await;
+
+    assert_eq!(
+        stdio, http,
+        "tools/call wire-path roundtrip must be identical across transports"
+    );
+
+    let response = stdio.expect("tools/call payload must produce a response");
+    assert!(
+        response["result"]["content"][0]["text"].is_string(),
+        "response should have text content"
+    );
+    assert_eq!(response["id"], "wire-tc");
+}
+
+/// Malformed JSON-RPC structure (valid JSON, but missing "method" field).
+/// Different from parse error — this tests structural validation parity.
+#[tokio::test]
+async fn dispatch_missing_method_parity_stub() {
+    let core = build_mcp_core_stub().await;
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": "no-method",
+        "params": {}
+    });
+
+    let stdio_resp = core
+        .handle_jsonrpc_request(request.clone(), McpTransport::Stdio)
+        .await
+        .into_option()
+        .expect("missing method must return error");
+
+    let http_resp = core
+        .handle_jsonrpc_request(request, McpTransport::HttpSse)
+        .await
+        .into_option()
+        .expect("missing method must return error");
+
+    assert_eq!(
+        stdio_resp, http_resp,
+        "missing method error must be identical across transports"
+    );
+
+    // Missing method results in empty string → "Unknown method: "
+    assert_eq!(stdio_resp["error"]["code"], -32601);
 }

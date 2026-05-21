@@ -23,6 +23,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 const REQUIRED_DIMENSION: usize = 4096;
 const TEST_NAMESPACE: &str = "e2e-cli-folder";
+const TEST_NAMESPACE_PIPELINE: &str = "e2e-cli-pipeline";
 const SEARCH_QUERY: &str = "Apple Silicon local AI inference batch processing";
 const FALLBACK_README: &str = r#"
 # MLX Batch Server
@@ -125,7 +126,7 @@ async fn test_cli_indexes_folder_samples_with_chunking_and_rag_search() {
     let config_path = write_config(&server.base_url).expect("failed to write config");
 
     let index_output = run_cli(
-        env!("CARGO_BIN_EXE_rmmx"),
+        env!("CARGO_BIN_EXE_rmcp-memex"),
         [
             "--config",
             config_path.to_str().unwrap(),
@@ -216,7 +217,7 @@ async fn test_cli_indexes_folder_samples_with_chunking_and_rag_search() {
     );
 
     let search_output = run_cli(
-        env!("CARGO_BIN_EXE_rmmx"),
+        env!("CARGO_BIN_EXE_rmcp-memex"),
         [
             "--config",
             config_path.to_str().unwrap(),
@@ -263,6 +264,148 @@ async fn test_cli_indexes_folder_samples_with_chunking_and_rag_search() {
         }),
         "expected search hits anchored in the README sample\nstdout:\n{}",
         String::from_utf8_lossy(&search_output.stdout)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_cli_pipeline_mode_supports_progress_and_resume() {
+    let server = start_mock_embedding_server().await;
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let corpus = seed_corpus(tmp.path()).expect("failed to create sample corpus");
+    let db_path = tmp.path().join("lancedb");
+    let config_path = write_config(&server.base_url).expect("failed to write config");
+    let mut corpus_files = collect_files_recursive(&corpus.root).expect("collect corpus files");
+    corpus_files.sort();
+    let first_file = corpus_files
+        .first()
+        .expect("seeded corpus should contain files")
+        .clone();
+
+    let first_output = run_cli(
+        env!("CARGO_BIN_EXE_rmcp-memex"),
+        [
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--allowed-paths",
+            corpus.root.to_str().unwrap(),
+            "--allowed-paths",
+            tmp.path().to_str().unwrap(),
+            "index",
+            first_file.to_str().unwrap(),
+            "--namespace",
+            TEST_NAMESPACE_PIPELINE,
+            "--slice-mode",
+            "flat",
+            "--pipeline",
+        ],
+    );
+    assert!(
+        first_output.status.success(),
+        "initial pipeline index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first_output.stdout),
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+
+    let checkpoint_path = tmp.path().join(format!(
+        ".index-checkpoint-{}.json",
+        TEST_NAMESPACE_PIPELINE
+    ));
+    fs::write(
+        &checkpoint_path,
+        serde_json::to_string_pretty(&json!({
+            "namespace": TEST_NAMESPACE_PIPELINE,
+            "db_path": db_path.to_str().unwrap(),
+            "indexed_files": [first_file.to_string_lossy().to_string()],
+            "indexed_hashes": [],
+            "updated_at": "2026-04-11T00:00:00Z",
+            "stats": null
+        }))
+        .expect("serialize checkpoint"),
+    )
+    .expect("write checkpoint");
+
+    let resume_output = run_cli(
+        env!("CARGO_BIN_EXE_rmcp-memex"),
+        [
+            "--config",
+            config_path.to_str().unwrap(),
+            "--db-path",
+            db_path.to_str().unwrap(),
+            "--allowed-paths",
+            corpus.root.to_str().unwrap(),
+            "--allowed-paths",
+            tmp.path().to_str().unwrap(),
+            "index",
+            corpus.root.to_str().unwrap(),
+            "--namespace",
+            TEST_NAMESPACE_PIPELINE,
+            "--recursive",
+            "--slice-mode",
+            "flat",
+            "--pipeline",
+            "--pipeline-governor",
+            "--pipeline-embed-concurrency",
+            "2",
+            "--resume",
+            "--progress",
+        ],
+    );
+    assert!(
+        resume_output.status.success(),
+        "pipeline resume failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&resume_output.stdout),
+        String::from_utf8_lossy(&resume_output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&resume_output.stderr);
+    assert!(
+        stderr.contains("Resuming from checkpoint: 1 files already committed"),
+        "expected resume message, got:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[pipeline]"),
+        "expected non-interactive pipeline progress output, got:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("governor: adaptive"),
+        "expected adaptive governor startup in stderr, got:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Skipped (resumed): 1"),
+        "expected resumed summary, got:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("not supported"),
+        "pipeline mode should no longer reject --progress/--resume, got:\n{}",
+        stderr
+    );
+
+    let storage = StorageManager::new_lance_only(db_path.to_str().unwrap())
+        .await
+        .expect("failed to open LanceDB");
+    let docs = storage
+        .search_store(
+            Some(TEST_NAMESPACE_PIPELINE),
+            vec![0.0_f32; REQUIRED_DIMENSION],
+            10_000,
+        )
+        .await
+        .expect("failed to read pipeline indexed documents");
+
+    let indexed_paths: HashSet<&str> = docs
+        .iter()
+        .filter_map(|doc| doc.metadata.get("path").and_then(|value| value.as_str()))
+        .collect();
+    assert_eq!(
+        indexed_paths.len(),
+        corpus.file_count,
+        "expected pipeline resume run to cover the full corpus exactly once at file level"
     );
 }
 
@@ -442,6 +585,24 @@ fn write_config(base_url: &str) -> std::io::Result<PathBuf> {
     );
     fs::write(&config_path, config)?;
     Ok(config_path)
+}
+
+fn collect_files_recursive(root: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(path) = stack.pop() {
+        let metadata = fs::metadata(&path)?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path)? {
+                stack.push(entry?.path());
+            }
+        } else {
+            files.push(path);
+        }
+    }
+
+    Ok(files)
 }
 
 fn run_cli<const N: usize>(binary: &str, args: [&str; N]) -> Output {

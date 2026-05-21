@@ -38,8 +38,28 @@ rules:
     languages: [rust]
     message: Avoid unwrap(); use ? or expect with context
     severity: WARNING
+    paths:
+      exclude:
+        - "**/tests/**"
+        - "**/tests.rs"
     patterns:
       - pattern: $X.unwrap()
+      - pattern-not-inside: |
+          mod tests {
+            ...
+          }
+      - pattern-not-inside: |
+          mod lib_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          mod integrity_tests {
+            ...
+          }
+      - pattern-not-inside: |
+          mod dimension_adapter_tests {
+            ...
+          }
 
   # Bash: disallow curl|bash style installers
   - id: local.bash.no-curl-pipe-sh

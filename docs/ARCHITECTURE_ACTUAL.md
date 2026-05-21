@@ -59,7 +59,7 @@ flowchart TB
     subgraph LAUNCHD["LaunchD Services"]
         LD_RAMDISK["ai.libraxis.memex-ramdisk<br/>Create 50GB RAM disk"]
         LD_MLX_ACTUAL["ai.libraxis.mlx-embedding<br/>❌ Port 12345 (not 8765)<br/>WorkDir: vista-brain/scripts"]
-        LD_MEMEX["ai.libraxis.rmcp-memex<br/>Port 8987 server<br/>Uses RAM disk"]
+        LD_MEMEX["ai.libraxis.rmcp-memex<br/>Port 8997 server<br/>Uses RAM disk"]
         LD_SNAPSHOT["ai.libraxis.memex-snapshot<br/>Periodic sync"]
     end
 
@@ -143,7 +143,7 @@ flowchart TB
 | **E2E Tests** | ✅ DODANE | `tests/e2e_pipeline.rs` - 5 testów |
 | **TextIntegrityMetrics** | ✅ DODANE | >90% threshold, audit command |
 | **DimensionAdapter** | ✅ DODANE | Cross-dim search 1024/2048/4096 |
-| **Audit/Purge commands** | ✅ DODANE | `rust-memex audit`, `purge-quality` |
+| **Audit/Purge commands** | ✅ DODANE | `rmcp-memex audit`, `purge-quality` |
 
 ### ⚠️ CZĘŚCIOWE (żółte)
 | Komponent | Status | Uwagi |
@@ -166,7 +166,7 @@ flowchart TB
 ### Aktualny stan usług:
 ```
 PID     STATUS  SERVICE
-10721   -15     ai.libraxis.rmcp-memex      ← działa, port 8987
+10721   -15     ai.libraxis.rmcp-memex      ← działa, port 8997
 46656   137     ai.libraxis.mlx-embedding   ← działa, port 12345 (!)
 46670   137     ai.libraxis.mlx-reranker    ← działa
 46743   1       ai.libraxis.mlx-batch-server
@@ -185,7 +185,7 @@ Dims:       4096 ✅
 
 ### ai.libraxis.rmcp-memex
 ```
-Port:       8987 ✅
+Port:       8997 ✅
 DB Path:    /Volumes/MemexRAM/lancedb ✅
 Mode:       --http-only ✅
 PathState:  /Volumes/MemexRAM/lancedb (czeka na RAM disk) ✅

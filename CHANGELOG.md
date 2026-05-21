@@ -2,6 +2,50 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `rmcp-memex reindex` subcommand for rebuilding namespace contents with paginated source reads, preflight embedding checks, and target-namespace safety guards
+- Paginated `all_documents_page(offset, limit)` on `StorageManager` for bounded full-table scans
+- Regression coverage for BM25 rollback so a failed keyword-index write does not leave ghost LanceDB rows behind
+- Regression coverage for the SSE search `k` alias so transport-level top-k requests stay aligned with HTTP and MCP
+
+### Changed
+- `MemexEngine::delete_by_filter` now paginates the full namespace before deleting, preventing missed records in large datasets
+- `run_export` now paginates with 5000-doc pages instead of a hard 100K limit, preventing silent truncation on large namespaces
+- `collapse_export_records` now prefers longest text over highest layer rank when deduplicating, preventing loss of content from historical multi-slicer namespaces
+- Invalid `--search-mode` values now return an error instead of silently falling back to the default mode
+- Import with missing `content_hash` now computes the hash from text instead of using an empty string that would cause false-positive dedup matches
+- Reprocess progress now reports total progress including skipped documents, and logs failed document IDs instead of aborting on the first embedding error
+
+### Breaking
+- Tool names renamed: `memory_search` → `search_documents`, `memory_upsert` → `upsert_document`, and other `memory_*` → `*_document` renames. See `src/handlers/mod.rs` for the full mapping
+- `mcp_protocol::*` types moved under `mcp_core::*`
+- `ServerConfig::features` field removed
+- `maintenance::new` signature changed to `new(namespace, db_path)`
+
+## [0.5.0] - 2026-04-10
+
+### Added
+- Regression coverage for BM25 rollback so a failed keyword-index write does not leave ghost LanceDB rows behind
+- Regression coverage for the SSE search `k` alias so transport-level top-k requests stay aligned with HTTP and MCP
+
+## [0.5.0] - 2026-04-10
+
+### Added
+- Release-facing landing page source under `docs/` with a GitHub Pages workflow and social preview asset
+- Release runbook documenting preflight checks, tagging flow, smoke tests, and post-publish verification
+- SHA256 checksum generation for GitHub release artifacts and installer-side checksum verification
+- Host-local `scripts/build-release-bundle.sh` helper for producing the signed prebuilt tarballs shipped in GitHub Releases
+- Local `scripts/release-local.sh` operator flow for build, macOS signing, and optional `gh release` upload
+
+### Changed
+- Resolved the shared MCP transport merge so `mcp_core` remains the single public dispatch surface
+- Hardened CI with library-only and `cargo package` smoke checks in addition to the existing lint/test gates
+- Aligned release automation, install scripts, and docs around the canonical `rmcp-memex` binary name and documented aliases
+- Switched the direct `reqwest` client to Rustls so release binaries are more self-contained and do not pull `native-tls` from the top-level crate
+- Clarified that GitHub Release bundles are the canonical install path, but they are built and signed locally before upload rather than compiled inside GitHub Actions
+
 ## [0.4.0] - 2026-03-09
 
 ### Changed

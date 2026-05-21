@@ -4,12 +4,14 @@
 //! to merge results from both search methods.
 
 use anyhow::Result;
+use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::bm25::{BM25Config, BM25Index};
-use crate::rag::SliceLayer;
+use crate::rag::{SearchOptions, SliceLayer};
 use crate::storage::{ChromaDocument, StorageManager};
 
 /// Search mode configuration
@@ -186,16 +188,19 @@ impl HybridSearcher {
         query_embedding: Vec<f32>,
         namespace: Option<&str>,
         limit: usize,
-        layer_filter: Option<SliceLayer>,
+        options: SearchOptions,
     ) -> Result<Vec<HybridSearchResult>> {
         match self.config.mode {
             SearchMode::Vector => {
-                self.vector_only_search(query_embedding, namespace, limit, layer_filter)
+                self.vector_only_search(query, query_embedding, namespace, limit, options)
                     .await
             }
-            SearchMode::Keyword => self.keyword_only_search(query, namespace, limit).await,
+            SearchMode::Keyword => {
+                self.keyword_only_search(query, namespace, limit, options)
+                    .await
+            }
             SearchMode::Hybrid => {
-                self.hybrid_search(query, query_embedding, namespace, limit, layer_filter)
+                self.hybrid_search(query, query_embedding, namespace, limit, options)
                     .await
             }
         }
@@ -204,14 +209,21 @@ impl HybridSearcher {
     /// Vector-only search (legacy behavior)
     async fn vector_only_search(
         &self,
+        query: &str,
         query_embedding: Vec<f32>,
         namespace: Option<&str>,
         limit: usize,
-        layer_filter: Option<SliceLayer>,
+        options: SearchOptions,
     ) -> Result<Vec<HybridSearchResult>> {
+        let candidate_limit = candidate_limit(limit, &options);
         let candidates = self
             .storage
-            .search_store_with_layer(namespace, query_embedding, limit, layer_filter)
+            .search_store_with_layer(
+                namespace,
+                query_embedding,
+                candidate_limit,
+                options.layer_filter,
+            )
             .await?;
 
         let mut results: Vec<HybridSearchResult> = candidates
@@ -233,9 +245,11 @@ impl HybridSearcher {
                 }
             })
             .collect();
+        Self::apply_post_search_processing(query, &mut results, &options);
         Self::dedup_by_content_hash(&mut results);
         Self::dedup_by_source_path(&mut results);
         Self::enforce_source_diversity(&mut results, self.config.max_per_source);
+        results.truncate(limit);
         Ok(results)
     }
 
@@ -245,13 +259,14 @@ impl HybridSearcher {
         query: &str,
         namespace: Option<&str>,
         limit: usize,
+        options: SearchOptions,
     ) -> Result<Vec<HybridSearchResult>> {
         let bm25 = self
             .bm25_index
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("BM25 index not initialized for keyword search"))?;
 
-        let bm25_results = bm25.search(query, namespace, limit)?;
+        let bm25_results = bm25.search(query, namespace, candidate_limit(limit, &options))?;
 
         // Fetch full documents from storage
         let mut results = Vec::with_capacity(bm25_results.len());
@@ -274,9 +289,11 @@ impl HybridSearcher {
             }
         }
 
+        Self::apply_post_search_processing(query, &mut results, &options);
         Self::dedup_by_content_hash(&mut results);
         Self::dedup_by_source_path(&mut results);
         Self::enforce_source_diversity(&mut results, self.config.max_per_source);
+        results.truncate(limit);
         Ok(results)
     }
 
@@ -287,19 +304,24 @@ impl HybridSearcher {
         query_embedding: Vec<f32>,
         namespace: Option<&str>,
         limit: usize,
-        layer_filter: Option<SliceLayer>,
+        options: SearchOptions,
     ) -> Result<Vec<HybridSearchResult>> {
-        let expanded_limit = limit * 3; // Get more candidates for fusion
+        let expanded_limit = candidate_limit(limit, &options); // Get more candidates for fusion
 
         // Run vector search
         let vector_results = self
             .storage
-            .search_store_with_layer(namespace, query_embedding, expanded_limit, layer_filter)
+            .search_store_with_layer(
+                namespace,
+                query_embedding,
+                expanded_limit,
+                options.layer_filter,
+            )
             .await?;
 
         // Run BM25 search if available
         let bm25_results = if let Some(ref bm25) = self.bm25_index {
-            bm25.search(query, namespace, expanded_limit)?
+            bm25.search(query, namespace, expanded_limit * 2)?
         } else {
             vec![]
         };
@@ -314,7 +336,7 @@ impl HybridSearcher {
         // Sort by combined score and take top-k
         let mut results: Vec<_> = fused.into_iter().collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit);
+        results.truncate(expanded_limit * 2);
 
         // Fetch full documents for final results
         let mut final_results = Vec::with_capacity(results.len());
@@ -341,7 +363,7 @@ impl HybridSearcher {
             } else if let Some(doc) = self.storage.get_document(&result_namespace, &id).await? {
                 // BM25-only result, fetch from storage
                 let layer = doc.slice_layer(); // Call before moving fields
-                if layer_filter.is_some() && layer != layer_filter {
+                if options.layer_filter.is_some() && layer != options.layer_filter {
                     continue;
                 }
                 final_results.push(HybridSearchResult {
@@ -360,9 +382,11 @@ impl HybridSearcher {
             }
         }
 
+        Self::apply_post_search_processing(query, &mut final_results, &options);
         Self::dedup_by_content_hash(&mut final_results);
         Self::dedup_by_source_path(&mut final_results);
         Self::enforce_source_diversity(&mut final_results, self.config.max_per_source);
+        final_results.truncate(limit);
 
         tracing::debug!(
             "Hybrid search: {} vector + {} BM25 -> {} fused (deduped) results",
@@ -372,6 +396,28 @@ impl HybridSearcher {
         );
 
         Ok(final_results)
+    }
+
+    fn apply_post_search_processing(
+        query: &str,
+        results: &mut Vec<HybridSearchResult>,
+        options: &SearchOptions,
+    ) {
+        if let Some(project) = options.project_filter.as_deref() {
+            results.retain(|result| matches_project_filter(&result.metadata, project));
+        }
+
+        for result in results.iter_mut() {
+            result.combined_score =
+                boosted_score(query, result.combined_score, &result.metadata, result.layer);
+        }
+
+        results.sort_by(|left, right| {
+            right
+                .combined_score
+                .partial_cmp(&left.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     /// Deduplicate results by content_hash (chunk-level) from metadata.
@@ -553,6 +599,119 @@ impl HybridSearcher {
     }
 }
 
+fn candidate_limit(limit: usize, options: &SearchOptions) -> usize {
+    let multiplier = if options.project_filter.is_some() {
+        8
+    } else {
+        3
+    };
+    limit.max(1) * multiplier
+}
+
+fn matches_project_filter(metadata: &Value, project: &str) -> bool {
+    let needle = project.trim();
+    if needle.is_empty() {
+        return true;
+    }
+
+    metadata.as_object().is_some_and(|object| {
+        ["project", "project_id", "source_project"]
+            .iter()
+            .filter_map(|key| object.get(*key))
+            .filter_map(|value| value.as_str())
+            .any(|value| value.eq_ignore_ascii_case(needle))
+    })
+}
+
+fn boosted_score(query: &str, base_score: f32, metadata: &Value, layer: Option<SliceLayer>) -> f32 {
+    (base_score * layer_multiplier(query, layer)) + recency_bonus(metadata)
+}
+
+fn layer_multiplier(query: &str, layer: Option<SliceLayer>) -> f32 {
+    let Some(layer) = layer else {
+        return 1.0;
+    };
+
+    if is_detailed_query(query) {
+        match layer {
+            SliceLayer::Outer => 0.96,
+            SliceLayer::Middle => 1.03,
+            SliceLayer::Inner => 1.08,
+            SliceLayer::Core => 1.12,
+        }
+    } else {
+        match layer {
+            SliceLayer::Outer => 1.08,
+            SliceLayer::Middle => 1.04,
+            SliceLayer::Inner => 1.0,
+            SliceLayer::Core => 0.96,
+        }
+    }
+}
+
+fn is_detailed_query(query: &str) -> bool {
+    let lowered = query.to_ascii_lowercase();
+    let word_count = lowered.split_whitespace().count();
+    word_count >= 8
+        || [
+            "why",
+            "how",
+            "details",
+            "detailed",
+            "implementation",
+            "stacktrace",
+            "exact",
+            "quote",
+            "full",
+            "error",
+            "trace",
+        ]
+        .iter()
+        .any(|needle| lowered.contains(needle))
+}
+
+fn recency_bonus(metadata: &Value) -> f32 {
+    let Some(object) = metadata.as_object() else {
+        return 0.0;
+    };
+
+    let timestamp = ["timestamp", "created_at", "indexed_at", "date", "time"]
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .filter_map(|value| value.as_str())
+        .find_map(parse_timestamp);
+
+    let Some(timestamp) = timestamp else {
+        return 0.0;
+    };
+
+    let age = Utc::now().signed_duration_since(timestamp);
+    if age < Duration::zero() || age > Duration::days(14) {
+        return 0.0;
+    }
+
+    let remaining = (Duration::days(14) - age).num_seconds().max(0) as f32;
+    let window = Duration::days(14).num_seconds().max(1) as f32;
+    0.12 * (remaining / window)
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+
+    if let Ok(parsed) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S") {
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(parsed, Utc));
+    }
+
+    if let Ok(parsed) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let at_midnight = parsed.and_hms_opt(0, 0, 0)?;
+        return Some(DateTime::<Utc>::from_naive_utc_and_offset(at_midnight, Utc));
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,7 +780,7 @@ mod tests {
         searcher.index_documents(&docs).await.unwrap();
 
         let results = searcher
-            .search("shared", vec![], None, 10, None)
+            .search("shared", vec![], None, 10, SearchOptions::default())
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -678,7 +837,7 @@ mod tests {
         searcher.index_documents(&docs).await.unwrap();
 
         let results = searcher
-            .search("shared", embedding, None, 10, None)
+            .search("shared", embedding, None, 10, SearchOptions::default())
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
@@ -743,5 +902,37 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, "doc-outer");
         assert_eq!(results[1].id, "doc-other");
+    }
+
+    #[test]
+    fn project_filter_matches_project_and_project_id() {
+        assert!(matches_project_filter(
+            &json!({"project": "Vista"}),
+            "vista"
+        ));
+        assert!(matches_project_filter(
+            &json!({"project_id": "VetCoders"}),
+            "vetcoders"
+        ));
+        assert!(!matches_project_filter(
+            &json!({"project": "rmcp-memex"}),
+            "vista"
+        ));
+    }
+
+    #[test]
+    fn recency_bonus_rewards_recent_documents() {
+        let fresh = json!({"indexed_at": Utc::now().to_rfc3339()});
+        let stale = json!({"indexed_at": (Utc::now() - Duration::days(30)).to_rfc3339()});
+
+        assert!(recency_bonus(&fresh) > 0.0);
+        assert_eq!(recency_bonus(&stale), 0.0);
+    }
+
+    #[test]
+    fn detailed_queries_prefer_core_over_outer() {
+        let query = "how exactly did the indexing pipeline fail with this stacktrace";
+        assert!(layer_multiplier(query, Some(SliceLayer::Core)) > 1.0);
+        assert!(layer_multiplier(query, Some(SliceLayer::Outer)) < 1.0);
     }
 }

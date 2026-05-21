@@ -18,7 +18,7 @@ Zaimplementowano dwupoziomowy system bezpieczeństwa:
 Zamiast hardcoded ograniczenia do `$HOME` i `cwd`, wprowadzono konfigurowalną listę dozwolonych ścieżek.
 
 ```toml
-# ~/.rmcp-servers/config/rmcp-memex.toml
+# ~/.rmcp-servers/rmcp-memex/config.toml
 allowed_paths = [
     "~",                              # Home directory
     "/Volumes/LibraxisShare/data",    # External volume

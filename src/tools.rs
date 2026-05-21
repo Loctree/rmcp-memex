@@ -1,21 +1,23 @@
-//! Agent tools for MCP-compatible memory operations.
+//! In-process helper functions for memory-oriented operations.
 //!
-//! These functions provide a tool-oriented interface to MemexEngine,
-//! suitable for use with AI agents via MCP or similar protocols.
+//! These helpers are convenient for Rust callers embedding `rmcp-memex`
+//! directly. The authoritative MCP tool contract exposed over stdio and
+//! HTTP/SSE comes from `tool_definitions()`, which mirrors the shared runtime
+//! surface instead of maintaining a second, drifting schema list here.
 //!
 //! # Example
 //!
 //! ```rust,ignore
 //! use rmcp_memex::{MemexEngine, MemexConfig};
-//! use rmcp_memex::tools::{memory_store, memory_search, tool_definitions, ToolResult};
+//! use rmcp_memex::tools::{store_document, search_documents, tool_definitions, ToolResult};
 //! use serde_json::json;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     let engine = MemexEngine::for_app("my-app", "documents").await?;
 //!
-//!     // Store a document using the tool API
-//!     let result = memory_store(
+//!     // Store a document using the local helper API
+//!     let result = store_document(
 //!         &engine,
 //!         "doc-1".to_string(),
 //!         "Important patient notes about feline diabetes".to_string(),
@@ -24,10 +26,10 @@
 //!     assert!(result.success);
 //!
 //!     // Search for documents
-//!     let results = memory_search(&engine, "diabetes".to_string(), 5, None).await?;
+//!     let results = search_documents(&engine, "diabetes".to_string(), 5, None).await?;
 //!     println!("Found {} documents", results.len());
 //!
-//!     // Get tool definitions for MCP registration
+//!     // Get the canonical MCP tool definitions exposed by rmcp-memex
 //!     let tools = tool_definitions();
 //!     println!("Available tools: {:?}", tools.iter().map(|t| &t.name).collect::<Vec<_>>());
 //!
@@ -107,14 +109,14 @@ impl ToolResult {
 /// # Example
 ///
 /// ```rust,ignore
-/// let result = memory_store(
+/// let result = store_document(
 ///     &engine,
 ///     "visit-123".to_string(),
 ///     "Patient presented with lethargy...".to_string(),
 ///     json!({"patient_id": "P-456", "visit_type": "checkup"}),
 /// ).await?;
 /// ```
-pub async fn memory_store(
+pub async fn store_document(
     engine: &MemexEngine,
     id: String,
     text: String,
@@ -147,13 +149,13 @@ pub async fn memory_store(
 ///
 /// ```rust,ignore
 /// // Simple search
-/// let results = memory_search(&engine, "diabetes symptoms".to_string(), 10, None).await?;
+/// let results = search_documents(&engine, "diabetes symptoms".to_string(), 10, None).await?;
 ///
 /// // Filtered search
 /// let filter = MetaFilter::for_patient("P-456");
-/// let results = memory_search(&engine, "diabetes".to_string(), 10, Some(filter)).await?;
+/// let results = search_documents(&engine, "diabetes".to_string(), 10, Some(filter)).await?;
 /// ```
-pub async fn memory_search(
+pub async fn search_documents(
     engine: &MemexEngine,
     query: String,
     limit: usize,
@@ -177,11 +179,11 @@ pub async fn memory_search(
 /// # Example
 ///
 /// ```rust,ignore
-/// if let Some(doc) = memory_get(&engine, "visit-123".to_string()).await? {
+/// if let Some(doc) = get_document(&engine, "visit-123".to_string()).await? {
 ///     println!("Found: {}", doc.text);
 /// }
 /// ```
-pub async fn memory_get(engine: &MemexEngine, id: String) -> Result<Option<SearchResult>> {
+pub async fn get_document(engine: &MemexEngine, id: String) -> Result<Option<SearchResult>> {
     engine.get(&id).await
 }
 
@@ -197,12 +199,12 @@ pub async fn memory_get(engine: &MemexEngine, id: String) -> Result<Option<Searc
 /// # Example
 ///
 /// ```rust,ignore
-/// let result = memory_delete(&engine, "visit-123".to_string()).await?;
+/// let result = delete_document(&engine, "visit-123".to_string()).await?;
 /// if result.success {
 ///     println!("Document deleted");
 /// }
 /// ```
-pub async fn memory_delete(engine: &MemexEngine, id: String) -> Result<ToolResult> {
+pub async fn delete_document(engine: &MemexEngine, id: String) -> Result<ToolResult> {
     match engine.delete(&id).await {
         Ok(true) => Ok(ToolResult::ok(format!(
             "Document '{}' deleted successfully",
@@ -221,7 +223,7 @@ pub async fn memory_delete(engine: &MemexEngine, id: String) -> Result<ToolResul
 
 /// Batch store multiple documents efficiently.
 ///
-/// More efficient than calling `memory_store()` multiple times as embeddings
+/// More efficient than calling `store_document()` multiple times as embeddings
 /// are generated in batches.
 ///
 /// # Arguments
@@ -238,10 +240,10 @@ pub async fn memory_delete(engine: &MemexEngine, id: String) -> Result<ToolResul
 ///     StoreItem::new("doc-1", "First document").with_metadata(json!({"type": "note"})),
 ///     StoreItem::new("doc-2", "Second document").with_metadata(json!({"type": "note"})),
 /// ];
-/// let result = memory_store_batch(&engine, items).await?;
+/// let result = store_documents_batch(&engine, items).await?;
 /// println!("Stored {} documents", result.success_count);
 /// ```
-pub async fn memory_store_batch(
+pub async fn store_documents_batch(
     engine: &MemexEngine,
     items: Vec<StoreItem>,
 ) -> Result<BatchResult> {
@@ -264,10 +266,12 @@ pub async fn memory_store_batch(
 /// ```rust,ignore
 /// // GDPR request - delete all patient data
 /// let filter = MetaFilter::for_patient("P-456");
-/// let result = memory_delete_by_filter(&engine, filter).await?;
-/// println!("Deleted {} documents", result.data.unwrap()["deleted_count"]);
+/// let result = delete_documents_by_filter(&engine, filter).await?;
+/// if let Some(data) = result.data {
+///     println!("Deleted {} documents", data["deleted_count"]);
+/// }
 /// ```
-pub async fn memory_delete_by_filter(
+pub async fn delete_documents_by_filter(
     engine: &MemexEngine,
     filter: MetaFilter,
 ) -> Result<ToolResult> {
@@ -292,8 +296,8 @@ pub async fn memory_delete_by_filter(
 
 /// MCP tool definition schema.
 ///
-/// This structure matches the MCP (Model Context Protocol) tool definition format,
-/// allowing these tools to be registered with MCP-compatible AI agents.
+/// This structure mirrors the canonical MCP tool metadata emitted by the shared
+/// rmcp-memex transport layer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     /// Tool name (used for invocation)
@@ -301,6 +305,7 @@ pub struct ToolDefinition {
     /// Human-readable description of what the tool does
     pub description: String,
     /// JSON Schema for the tool's input parameters
+    #[serde(rename = "inputSchema", alias = "input_schema")]
     pub input_schema: Value,
 }
 
@@ -319,10 +324,10 @@ impl ToolDefinition {
     }
 }
 
-/// Get all tool definitions for MCP registration.
+/// Get the canonical MCP tool definitions exposed by rmcp-memex transports.
 ///
-/// Returns a vector of `ToolDefinition` that can be used to register these
-/// tools with an MCP server or any compatible AI agent framework.
+/// This is derived from the shared transport contract so stdio, HTTP/SSE, and
+/// library consumers all see the same tool metadata.
 ///
 /// # Example
 ///
@@ -333,175 +338,24 @@ impl ToolDefinition {
 /// }
 /// ```
 pub fn tool_definitions() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition::new(
-            "memory_store",
-            "Store text in memory with automatic embedding generation. Use for saving documents, notes, or any text that should be searchable later.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "Unique document identifier"
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Text content to embed and store"
-                    },
-                    "metadata": {
-                        "type": "object",
-                        "description": "Additional metadata (patient_id, visit_id, doc_type, etc.)",
-                        "additionalProperties": true
-                    }
-                },
-                "required": ["id", "text"]
-            }),
-        ),
-        ToolDefinition::new(
-            "memory_search",
-            "Search memory semantically using natural language. Returns documents ranked by relevance to the query.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language search query"
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of results to return",
-                        "default": 10,
-                        "minimum": 1,
-                        "maximum": 100
-                    },
-                    "filter": {
-                        "type": "object",
-                        "description": "Optional metadata filter",
-                        "properties": {
-                            "patient_id": {
-                                "type": "string",
-                                "description": "Filter by patient ID"
-                            },
-                            "visit_id": {
-                                "type": "string",
-                                "description": "Filter by visit ID"
-                            },
-                            "doc_type": {
-                                "type": "string",
-                                "description": "Filter by document type"
-                            },
-                            "date_from": {
-                                "type": "string",
-                                "description": "Filter by date range start (ISO 8601)"
-                            },
-                            "date_to": {
-                                "type": "string",
-                                "description": "Filter by date range end (ISO 8601)"
-                            }
-                        }
-                    }
-                },
-                "required": ["query"]
-            }),
-        ),
-        ToolDefinition::new(
-            "memory_get",
-            "Retrieve a specific document by its ID. Returns the full document with text, metadata, and similarity score.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "Document identifier to retrieve"
-                    }
-                },
-                "required": ["id"]
-            }),
-        ),
-        ToolDefinition::new(
-            "memory_delete",
-            "Delete a specific document by its ID. Returns confirmation of deletion.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": {
-                        "type": "string",
-                        "description": "Document identifier to delete"
-                    }
-                },
-                "required": ["id"]
-            }),
-        ),
-        ToolDefinition::new(
-            "memory_store_batch",
-            "Store multiple documents in a single batch operation. More efficient than storing documents individually.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "items": {
-                        "type": "array",
-                        "description": "Array of documents to store",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Unique document identifier"
-                                },
-                                "text": {
-                                    "type": "string",
-                                    "description": "Text content to embed and store"
-                                },
-                                "metadata": {
-                                    "type": "object",
-                                    "description": "Additional metadata",
-                                    "additionalProperties": true
-                                }
-                            },
-                            "required": ["id", "text"]
-                        }
-                    }
-                },
-                "required": ["items"]
-            }),
-        ),
-        ToolDefinition::new(
-            "memory_delete_by_filter",
-            "Delete all documents matching a metadata filter. Primary method for GDPR-compliant data deletion (e.g., delete all patient data).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "filter": {
-                        "type": "object",
-                        "description": "Metadata filter specifying which documents to delete",
-                        "properties": {
-                            "patient_id": {
-                                "type": "string",
-                                "description": "Delete all documents for this patient (GDPR)"
-                            },
-                            "visit_id": {
-                                "type": "string",
-                                "description": "Delete all documents for this visit"
-                            },
-                            "doc_type": {
-                                "type": "string",
-                                "description": "Delete all documents of this type"
-                            },
-                            "date_from": {
-                                "type": "string",
-                                "description": "Delete documents from this date onwards"
-                            },
-                            "date_to": {
-                                "type": "string",
-                                "description": "Delete documents up to this date"
-                            }
-                        }
-                    }
-                },
-                "required": ["filter"]
-            }),
-        ),
-    ]
+    crate::mcp_protocol::shared_tools_list_result()["tools"]
+        .as_array()
+        .expect("shared_tools_list_result().tools must be an array")
+        .iter()
+        .map(|tool| {
+            ToolDefinition::new(
+                tool["name"]
+                    .as_str()
+                    .expect("shared MCP tool definition missing name"),
+                tool["description"]
+                    .as_str()
+                    .expect("shared MCP tool definition missing description"),
+                tool.get("inputSchema")
+                    .cloned()
+                    .expect("shared MCP tool definition missing inputSchema"),
+            )
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -539,7 +393,7 @@ mod tests {
     #[test]
     fn test_tool_definitions_count() {
         let tools = tool_definitions();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -547,12 +401,20 @@ mod tests {
         let tools = tool_definitions();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(names.contains(&"memory_store"));
+        assert!(names.contains(&"health"));
+        assert!(names.contains(&"rag_index"));
+        assert!(names.contains(&"rag_index_text"));
+        assert!(names.contains(&"rag_search"));
+        assert!(names.contains(&"memory_upsert"));
         assert!(names.contains(&"memory_search"));
         assert!(names.contains(&"memory_get"));
         assert!(names.contains(&"memory_delete"));
-        assert!(names.contains(&"memory_store_batch"));
-        assert!(names.contains(&"memory_delete_by_filter"));
+        assert!(names.contains(&"memory_purge_namespace"));
+        assert!(names.contains(&"namespace_create_token"));
+        assert!(names.contains(&"namespace_revoke_token"));
+        assert!(names.contains(&"namespace_list_protected"));
+        assert!(names.contains(&"namespace_security_status"));
+        assert!(names.contains(&"dive"));
     }
 
     #[test]
@@ -581,6 +443,15 @@ mod tests {
     }
 
     #[test]
+    fn test_tool_definitions_match_shared_mcp_contract() {
+        let serialized = serde_json::to_value(tool_definitions()).unwrap();
+        assert_eq!(
+            serialized,
+            crate::mcp_protocol::shared_tools_list_result()["tools"]
+        );
+    }
+
+    #[test]
     fn test_tool_result_serialization() {
         let result = ToolResult::ok_with_data("Success", json!({"id": "doc-1"}));
         let json_str = serde_json::to_string(&result).unwrap();
@@ -606,5 +477,21 @@ mod tests {
         assert_eq!(tool.name, "test_tool");
         assert_eq!(tool.description, "A test tool");
         assert!(tool.input_schema["properties"]["input"].is_object());
+    }
+
+    #[test]
+    fn test_tool_definition_serializes_with_mcp_field_name() {
+        let tool = ToolDefinition::new(
+            "test_tool",
+            "A test tool",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        );
+
+        let value = serde_json::to_value(tool).unwrap();
+        assert!(value.get("inputSchema").is_some());
+        assert!(value.get("input_schema").is_none());
     }
 }

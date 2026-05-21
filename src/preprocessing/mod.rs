@@ -97,72 +97,98 @@ struct PreprocessingRegexes {
     multiple_spaces: Regex,
 }
 
+fn compile_static_regex(pattern: &str, label: &str) -> Regex {
+    Regex::new(pattern).unwrap_or_else(|err| panic!("invalid preprocessing regex '{label}': {err}"))
+}
+
 fn preprocessing_regexes() -> &'static PreprocessingRegexes {
     static REGEXES: OnceLock<PreprocessingRegexes> = OnceLock::new();
     REGEXES.get_or_init(|| PreprocessingRegexes {
-        function_calls_block: Regex::new(&format!(
+        function_calls_block: compile_static_regex(
+            &format!(
             r"(?s)<{}>{}</{}>",
             "function_calls", r".*?", "function_calls"
-        ))
-        .unwrap(),
-        antml_invoke_block: Regex::new(&format!(
+        ),
+            "function_calls_block",
+        ),
+        antml_invoke_block: compile_static_regex(
+            &format!(
             r"(?s)<{}:{}[^>]*>.*?</{}:{}>",
             "antml", "invoke", "antml", "invoke"
-        ))
-        .unwrap(),
-        antml_parameter_block: Regex::new(&format!(
+        ),
+            "antml_invoke_block",
+        ),
+        antml_parameter_block: compile_static_regex(
+            &format!(
             r"(?s)<{}:{}[^>]*>.*?</{}:{}>",
             "antml", "parameter", "antml", "parameter"
-        ))
-        .unwrap(),
-        function_results_block: Regex::new(&format!(
+        ),
+            "antml_parameter_block",
+        ),
+        function_results_block: compile_static_regex(
+            &format!(
             r"(?s)<{}>{}</{}>",
             "function_results", r".*?", "function_results"
-        ))
-        .unwrap(),
-        result_block: Regex::new(&format!(r"(?s)<{}>{}</{}>", "result", r".*?", "result"))
-            .unwrap(),
-        tool_output_tags: Regex::new(r"(?s)<(output|name|value)>.*?</(output|name|value)>")
-            .unwrap(),
-        git_status_output: Regex::new(
+        ),
+            "function_results_block",
+        ),
+        result_block: compile_static_regex(
+            &format!(r"(?s)<{}>{}</{}>", "result", r".*?", "result"),
+            "result_block",
+        ),
+        tool_output_tags: compile_static_regex(
+            r"(?s)<(output|name|value)>.*?</(output|name|value)>",
+            "tool_output_tags",
+        ),
+        git_status_output: compile_static_regex(
             r"(?m)^\s*(On branch|Your branch|Changes (?:not staged|to be committed)|Untracked files|nothing to commit|modified:|new file:|deleted:).*$",
-        )
-        .unwrap(),
-        git_diff_output: Regex::new(
+            "git_status_output",
+        ),
+        git_diff_output: compile_static_regex(
             r"(?m)^(diff --git|index [0-9a-f]+\.\.[0-9a-f]+|--- a/|--- /|\+\+\+ a/|\+\+\+ b/|@@\s*-\d+.*@@|Binary files).*$",
-        )
-        .unwrap(),
-        cargo_output: Regex::new(
+            "git_diff_output",
+        ),
+        cargo_output: compile_static_regex(
             r"(?m)^(\s*(Compiling|Finished|Running|warning:|error\[E|-->|note:|help:)).*$",
-        )
-        .unwrap(),
-        npm_output: Regex::new(
+            "cargo_output",
+        ),
+        npm_output: compile_static_regex(
             r"(?m)^(npm (WARN|ERR!|notice)|added \d+ packages|up to date|audited \d+ packages).*$",
-        )
-        .unwrap(),
-        file_listing: Regex::new(r"(?m)^(total \d+|[drwx-]{10}\s+\d+|[-lrwx]{10}\s+\d+).*$")
-            .unwrap(),
-        tree_output: Regex::new(r"(?m)^[│├└─\s]+[\w.-]+/?$").unwrap(),
-        uuid_pattern: Regex::new(
+            "npm_output",
+        ),
+        file_listing: compile_static_regex(
+            r"(?m)^(total \d+|[drwx-]{10}\s+\d+|[-lrwx]{10}\s+\d+).*$",
+            "file_listing",
+        ),
+        tree_output: compile_static_regex(r"(?m)^[│├└─\s]+[\w.-]+/?$", "tree_output"),
+        uuid_pattern: compile_static_regex(
             r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-        )
-        .unwrap(),
-        timestamp_iso: Regex::new(
+            "uuid_pattern",
+        ),
+        timestamp_iso: compile_static_regex(
             r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?",
-        )
-        .unwrap(),
-        unix_timestamp: Regex::new(r"\b1[6-7]\d{8}\b").unwrap(),
-        session_id_pattern: Regex::new(
+            "timestamp_iso",
+        ),
+        unix_timestamp: compile_static_regex(r"\b1[6-7]\d{8}\b", "unix_timestamp"),
+        session_id_pattern: compile_static_regex(
             r#"(session_id|sessionId|session-id|conv_id|conversation_id)["']?\s*[:=]\s*["']?[\w-]+"#,
-        )
-        .unwrap(),
-        file_path_metadata: Regex::new(r#""(path|file_path|filepath)"\s*:\s*"[^"]+""#).unwrap(),
-        empty_content_json: Regex::new(r#""content"\s*:\s*\[\s*\]"#).unwrap(),
-        empty_text_json: Regex::new(r#""text"\s*:\s*"""#).unwrap(),
-        placeholder_message: Regex::new(r"(?i)(placeholder|lorem ipsum|TODO:|FIXME:|XXX:)")
-            .unwrap(),
-        multiple_newlines: Regex::new(r"\n{3,}").unwrap(),
-        multiple_spaces: Regex::new(r" {2,}").unwrap(),
+            "session_id_pattern",
+        ),
+        file_path_metadata: compile_static_regex(
+            r#""(path|file_path|filepath)"\s*:\s*"[^"]+""#,
+            "file_path_metadata",
+        ),
+        empty_content_json: compile_static_regex(
+            r#""content"\s*:\s*\[\s*\]"#,
+            "empty_content_json",
+        ),
+        empty_text_json: compile_static_regex(r#""text"\s*:\s*"""#, "empty_text_json"),
+        placeholder_message: compile_static_regex(
+            r"(?i)(placeholder|lorem ipsum|TODO:|FIXME:|XXX:)",
+            "placeholder_message",
+        ),
+        multiple_newlines: compile_static_regex(r"\n{3,}", "multiple_newlines"),
+        multiple_spaces: compile_static_regex(r" {2,}", "multiple_spaces"),
     })
 }
 

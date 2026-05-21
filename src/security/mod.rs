@@ -181,7 +181,13 @@ impl TokenStore {
     }
 }
 
-/// Namespace access manager that combines token verification with access control
+/// Namespace access manager that combines token verification with access control.
+///
+/// Deprecated: Use `crate::auth::AuthManager` instead, which provides per-token
+/// scopes, namespace ACL, argon2id hashing, and token rotation.
+#[deprecated(
+    note = "Use crate::auth::AuthManager for multi-token auth with scopes and namespace ACL"
+)]
 #[derive(Debug)]
 pub struct NamespaceAccessManager {
     /// Token store for managing tokens
@@ -190,6 +196,7 @@ pub struct NamespaceAccessManager {
     enabled: bool,
 }
 
+#[allow(deprecated)]
 impl NamespaceAccessManager {
     /// Create a new namespace access manager
     pub fn new(config: NamespaceSecurityConfig) -> Self {
@@ -282,6 +289,7 @@ impl NamespaceAccessManager {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

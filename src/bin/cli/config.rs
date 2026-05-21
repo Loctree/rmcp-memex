@@ -5,15 +5,6 @@ use rmcp_memex::{
     path_utils,
 };
 
-#[allow(dead_code)]
-fn parse_features(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
 /// Standard config discovery locations (in priority order)
 #[allow(dead_code)]
 const CONFIG_SEARCH_PATHS: &[&str] = &[
@@ -72,7 +63,9 @@ pub fn load_or_discover_config(
 
 #[derive(serde::Deserialize, Default, Clone)]
 pub struct FileConfig {
+    /// Legacy compatibility field. Parsed but ignored when building ServerConfig.
     pub mode: Option<String>,
+    /// Legacy compatibility field. Parsed but ignored when building ServerConfig.
     pub features: Option<String>,
     pub cache_mb: Option<usize>,
     pub db_path: Option<String>,
@@ -100,6 +93,10 @@ pub struct FileConfig {
     pub bind_address: Option<String>,
     /// Allowed CORS origins (comma-separated list)
     pub cors_origins: Option<String>,
+    /// Auth mode: "mutating-only", "all-routes", or "namespace-acl"
+    pub auth_mode: Option<String>,
+    /// Allow ?token= query parameter on read GETs
+    pub allow_query_token: Option<bool>,
 }
 
 /// New embedding configuration from TOML
