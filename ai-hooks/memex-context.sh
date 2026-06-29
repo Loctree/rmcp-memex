@@ -24,7 +24,7 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PA
 #
 # CONFIGURATION (via environment):
 #   MEMEX_AUGMENT=0        - Disable all augmentation
-#   MEMEX_DB_PATH          - Path to lancedb (default: ~/.ai-memories/lancedb)
+#   MEMEX_DB_PATH          - Path to lancedb (default: ~/.rmcp-servers/rmcp-memex/lancedb)
 #   MEMEX_NAMESPACE=cloud  - Namespace to search
 #   MEMEX_LIMIT=3          - Max memories to return
 #
@@ -33,7 +33,7 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PA
 #   - jq for JSON parsing (optional)
 #
 # ============================================================================
-# Created by M&K (c)2026 The LibraxisAI Team
+# Created by vetcoders (c)2026
 # ============================================================================
 
 set -uo pipefail
@@ -42,7 +42,7 @@ set -uo pipefail
 # CONFIGURATION
 # ============================================================================
 MEMEX_AUGMENT="${MEMEX_AUGMENT:-1}"
-MEMEX_DB_PATH="${MEMEX_DB_PATH:-$HOME/.ai-memories/lancedb}"
+MEMEX_DB_PATH="${MEMEX_DB_PATH:-$HOME/.rmcp-servers/rmcp-memex/lancedb}"
 MEMEX_NAMESPACE="${MEMEX_NAMESPACE:-cloud}"
 MEMEX_LIMIT="${MEMEX_LIMIT:-3}"
 

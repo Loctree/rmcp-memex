@@ -17,7 +17,7 @@ export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PA
 #   - SessionStart hook
 #
 # ============================================================================
-# Created by M&K (c)2026 The LibraxisAI Team
+# Created by vetcoders (c)2026
 # ============================================================================
 
 set -uo pipefail
@@ -25,7 +25,7 @@ set -uo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-MEMEX_DB_PATH="${MEMEX_DB_PATH:-$HOME/.ai-memories/lancedb}"
+MEMEX_DB_PATH="${MEMEX_DB_PATH:-$HOME/.rmcp-servers/rmcp-memex/lancedb}"
 MEMEX_NAMESPACE="${MEMEX_NAMESPACE:-cloud}"
 MEMEX_LIMIT="${MEMEX_LIMIT:-3}"
 CACHE_FILE="/tmp/memex-startup-$(echo "$PWD" | md5 2>/dev/null || echo "$PWD" | md5sum | cut -c1-8).cache"

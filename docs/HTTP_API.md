@@ -1,6 +1,6 @@
 # rmcp-memex HTTP API & Dashboard
 
-Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+Vibecrafted with AI Agents by Vetcoders (c)2026
 
 ## Overview
 

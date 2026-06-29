@@ -2,7 +2,7 @@
 # reindex-memories.sh
 # Reindex all memories after fixing timestamp preservation (P0)
 #
-# Created by M&K (c)2025 The LibraxisAI Team
+# Created by vetcoders (c)2025
 # Part of rmcp-memex P4 fix
 
 set -e
@@ -20,9 +20,9 @@ echo -e "${BLUE}========================================${NC}"
 echo ""
 
 # Default paths
-MEMEX_DB="${MEMEX_DB:-$HOME/.ai-memories/lancedb}"
-MEMEX_SOURCES="${MEMEX_SOURCES:-$HOME/.ai-memories/sources}"
-BACKUP_DIR="${MEMEX_BACKUP:-$HOME/.ai-memories/backups}"
+MEMEX_DB="${MEMEX_DB:-$HOME/.rmcp-servers/rmcp-memex/lancedb}"
+MEMEX_SOURCES="${MEMEX_SOURCES:-$HOME/.rmcp-servers/rmcp-memex/sources}"
+BACKUP_DIR="${MEMEX_BACKUP:-$HOME/.rmcp-servers/rmcp-memex/backups}"
 
 # Parse arguments
 DRY_RUN=false
@@ -58,8 +58,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --dry-run           Show what would be done without doing it"
             echo "  --force             Skip confirmation prompts"
             echo "  -n, --namespace NS  Namespace to reindex (default: conversations)"
-            echo "  --db PATH           LanceDB path (default: ~/.ai-memories/lancedb)"
-            echo "  --sources PATH      Source files path (default: ~/.ai-memories/sources)"
+            echo "  --db PATH           LanceDB path (default: ~/.rmcp-servers/rmcp-memex/lancedb)"
+            echo "  --sources PATH      Source files path (default: ~/.rmcp-servers/rmcp-memex/sources)"
             echo "  -h, --help          Show this help message"
             echo ""
             echo "Environment variables:"
@@ -78,7 +78,7 @@ done
 # Check if rmcp-memex is available
 if ! command -v rmcp-memex &> /dev/null; then
     echo -e "${RED}Error: rmcp-memex not found in PATH${NC}"
-    echo "Install the prebuilt release with: curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh"
+    echo "Install the prebuilt release with: curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh"
     echo "For development-only source builds: cargo install --path ."
     exit 1
 fi

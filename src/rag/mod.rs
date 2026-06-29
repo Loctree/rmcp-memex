@@ -3851,12 +3851,12 @@ mod tests {
     #[test]
     fn keyword_extraction_splits_paths_and_filters_session_tokens() {
         let keywords = extract_keywords(
-            "/Users/silver/Git/tools/TwinSweep session 2ff4de8b9a4e1234567890abcdef notes",
+            "/Users/tester/projects/toolkit session 2ff4de8b9a4e1234567890abcdef notes",
             10,
         );
 
         assert!(keywords.contains(&"users".to_string()));
-        assert!(keywords.contains(&"twinsweep".to_string()));
+        assert!(keywords.contains(&"toolkit".to_string()));
         assert!(!keywords.iter().any(|keyword| keyword.contains("2ff4de8b")));
     }
 
@@ -3874,7 +3874,7 @@ mod tests {
             "vista"
         ));
         assert!(metadata_matches_project(
-            &json!({"project_id": "VetCoders"}),
+            &json!({"project_id": "Vetcoders"}),
             "vetcoders"
         ));
         assert!(!metadata_matches_project(
@@ -3889,18 +3889,18 @@ mod tests {
 
     #[test]
     fn markdown_transcript_extraction_builds_role_aware_turn_docs() {
-        let raw = r#"[project: VetCoders/vibecrafted | agent: codex | date: 2026-03-30]
+        let raw = r#"[project: vetcoders/vibecrafted | agent: codex | date: 2026-03-30]
 
 [signals]
 Results:
-- AICX lookup działa
+- AICX lookup succeeded
 [/signals]
 
-[09:14:00] assistant: Tak, i to właśnie jest sedno: `aicx-dragon` to żywy endpoint MCP.
-[09:15:33] user: ziom ale ty sobie sam skonfigurowałeś ~/.codex/config.toml
-[09:15:47] assistant: Sprawdzam teraz lokalny kontrakt konfiguracji MCP dla Codexa.
+[09:14:00] assistant: Right, that is the core point: the MCP endpoint is live and reachable.
+[09:15:33] user: ok but the local client config was set up automatically
+[09:15:47] assistant: Checking the local MCP configuration contract now.
 [09:15:55] reasoning: **Checking config contract**
-[09:16:06] assistant: Składnia configu wygląda już poprawnie według samego Codexa.
+[09:16:06] assistant: The config syntax already looks correct.
 "#;
 
         let docs = extract_markdown_transcript_documents(raw, Path::new("sample.md"))
@@ -3912,7 +3912,7 @@ Results:
         assert!(docs[1].1.contains("Reasoning focus:"));
         assert_eq!(docs[1].2["format"], "markdown_transcript");
         assert_eq!(docs[1].2["type"], "transcript_turn");
-        assert_eq!(docs[1].2["project"], "VetCoders/vibecrafted");
+        assert_eq!(docs[1].2["project"], "vetcoders/vibecrafted");
     }
 
     #[test]
@@ -3942,7 +3942,7 @@ Results:
         let metadata = json!({
             "type": "transcript_turn",
             "format": "markdown_transcript",
-            "project": "VetCoders/rmcp-memex",
+            "project": "vetcoders/rmcp-memex",
             "agent": "codex"
         });
         let config = OnionSliceConfig {
@@ -3969,7 +3969,7 @@ Results:
     #[test]
     fn json_conversation_docs_flow_through_structured_semantic_slices() {
         let conversation = json!({
-            "project": "VetCoders/rmcp-memex",
+            "project": "vetcoders/rmcp-memex",
             "sessions": [
                 {
                     "info": {

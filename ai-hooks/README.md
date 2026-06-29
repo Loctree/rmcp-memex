@@ -42,10 +42,10 @@ Add to `~/.claude/settings.json`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMEX_DB_PATH` | `~/.ai-memories/lancedb` | Path to LanceDB |
+| `MEMEX_DB_PATH` | `~/.rmcp-servers/rmcp-memex/lancedb` | Path to LanceDB |
 | `MEMEX_NAMESPACE` | `cloud` | Default namespace to search |
 | `MEMEX_LIMIT` | `3` | Max results to return |
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2026 The LibraxisAI Team
+Vibecrafted with AI Agents by Vetcoders (c)2026

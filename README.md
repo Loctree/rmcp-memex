@@ -1,5 +1,5 @@
 # rmcp-memex
-[![Crates.io](https://img.shields.io/crates/v/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![License](https://img.shields.io/crates/l/rmcp-memex)](LICENSE) [![Downloads](https://img.shields.io/crates/d/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![CI](https://github.com/VetCoders/rmcp-memex/actions/workflows/ci.yml/badge.svg)](https://github.com/VetCoders/rmcp-memex/actions)
+[![Crates.io](https://img.shields.io/crates/v/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![License](https://img.shields.io/crates/l/rmcp-memex)](LICENSE) [![Downloads](https://img.shields.io/crates/d/rmcp-memex)](https://crates.io/crates/rmcp-memex) [![CI](https://github.com/vetcoders/rmcp-memex/actions/workflows/ci.yml/badge.svg)](https://github.com/vetcoders/rmcp-memex/actions)
 
 `rmcp-memex` is a custom Rust MCP kernel providing RAG and long-term memory capabilities to AI agents via LanceDB.
 
@@ -13,8 +13,8 @@ It exposes two explicit transport modes from a single canonical surface:
 
 ## Release Surface
 
-- Quick install: `curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh`
-- Prebuilt binary bundles: [GitHub Releases](https://github.com/VetCoders/rmcp-memex/releases) uploaded from locally built and signed artifacts
+- Quick install: `curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh`
+- Prebuilt binary bundles: [GitHub Releases](https://github.com/vetcoders/rmcp-memex/releases) uploaded from locally built and signed artifacts
 - Release runbook: [docs/RELEASE.md](docs/RELEASE.md)
 - Configuration guide: [docs/02_configuration.md](docs/02_configuration.md)
 - HTTP/SSE reference: [docs/HTTP_API.md](docs/HTTP_API.md)
@@ -24,7 +24,7 @@ It exposes two explicit transport modes from a single canonical surface:
 
 ```bash
 # Install from the latest GitHub Release
-curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh
 
 # Start the MCP server
 rmcp-memex serve
@@ -205,7 +205,7 @@ use rmcp_memex::{MemexEngine, SearchMode};
 let engine = MemexEngine::for_app("my-app", "documents").await?;
 
 // Hybrid search with BM25 + vector fusion (recommended)
-let results = engine.search_hybrid("dragon mac studio", 10).await?;
+let results = engine.search_hybrid("host-a mac studio", 10).await?;
 for r in &results {
     println!("{}: {} (combined: {:.2}, vector: {:.2}, bm25: {:.2})",
         r.id, r.document, r.combined_score, r.vector_score, r.bm25_score);
@@ -497,7 +497,7 @@ MLX_MAX_BATCH_ITEMS=32
 
 **Quick install (recommended):**
 ```bash
-curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh
 ```
 
 Prebuilt GitHub Release bundles are the canonical install path and avoid compiling
@@ -597,10 +597,10 @@ Configure in `~/.claude.json`:
 
 ```bash
 # Open the local dashboard
-rmcp-memex dashboard --db-path ~/.ai-memories/lancedb
+rmcp-memex dashboard --db-path ~/.rmcp-servers/rmcp-memex/lancedb
 
 # Start daemon
-rmcp-memex sse --db-path ~/.ai-memories/lancedb &
+rmcp-memex sse --db-path ~/.rmcp-servers/rmcp-memex/lancedb &
 
 # Health check
 curl http://localhost:8997/health
@@ -621,19 +621,19 @@ curl -N "http://localhost:8997/sse/search?query=context&namespace=agent1&limit=5
 
 ### Multi-Host Database Paths
 
-For setups with multiple machines (e.g., dragon, mgbook16), use per-host database paths:
+For setups with multiple machines (e.g., host-a, host-b), use per-host database paths:
 
 ```bash
 # Per-host paths (each machine gets own database)
-rmcp-memex serve --db-path ~/.ai-memories/lancedb.$(hostname -s)
+rmcp-memex serve --db-path ~/.rmcp-servers/rmcp-memex/lancedb.$(hostname -s)
 
 # Or use the wizard for machine-agnostic configuration
 rmcp-memex wizard
 ```
 
 The TUI wizard auto-detects hostname and offers:
-- **Shared mode**: `~/.ai-memories/lancedb` (same path everywhere)
-- **Per-host mode**: `~/.ai-memories/lancedb.dragon`, `~/.ai-memories/lancedb.mgbook16`, etc.
+- **Shared mode**: `~/.rmcp-servers/rmcp-memex/lancedb` (same path everywhere)
+- **Per-host mode**: `~/.rmcp-servers/rmcp-memex/lancedb.host-a`, `~/.rmcp-servers/rmcp-memex/lancedb.host-b`, etc.
 
 ### Configuration (TOML)
 
@@ -685,7 +685,7 @@ Intelligent query intent detection for automatic search mode selection:
 
 ```bash
 # Auto-detect query intent and select optimal mode
-rmcp-memex search -n memories -q "when did we buy dragon" --auto-route
+rmcp-memex search -n memories -q "when did we buy host-a" --auto-route
 # Output: Query intent: temporal (confidence: 0.70)
 #         Selects: hybrid mode with date boosting
 
@@ -695,7 +695,7 @@ rmcp-memex search -n code -q "who imports main.rs" --auto-route
 #         Consider: loctree query --kind who-imports --target main.rs
 
 # Deep exploration with all onion layers
-rmcp-memex dive -n memories -q "dragon" --verbose
+rmcp-memex dive -n memories -q "host-a" --verbose
 ```
 
 **Intent Types:**
@@ -817,5 +817,5 @@ Add to `~/.claude.json`:
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Vetcoders (c)2025
+Co-Authored-By: Vetcoders <hello@vetcoders.io>

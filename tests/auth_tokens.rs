@@ -29,7 +29,7 @@ async fn token_create_hash_roundtrip() {
         .create_token(
             "roundtrip-test".to_string(),
             vec![Scope::Read, Scope::Write],
-            vec!["kb:claude".to_string(), "kb:mikserka".to_string()],
+            vec!["kb:claude".to_string(), "kb:notes".to_string()],
             None,
             "Round-trip test".to_string(),
         )
@@ -45,7 +45,7 @@ async fn token_create_hash_roundtrip() {
     assert_eq!(entry.scopes, vec![Scope::Read, Scope::Write]);
     assert_eq!(
         entry.namespaces,
-        vec!["kb:claude".to_string(), "kb:mikserka".to_string()]
+        vec!["kb:claude".to_string(), "kb:notes".to_string()]
     );
 
     // Hash is an argon2id string (not plaintext)
@@ -243,10 +243,10 @@ async fn v1_migration_preserves_access() {
             }),
         ),
         (
-            "kb:mikserka".to_string(),
+            "kb:notes".to_string(),
             serde_json::json!({
-                "namespace": "kb:mikserka",
-                "token": "ns_mikserka_token",
+                "namespace": "kb:notes",
+                "token": "ns_notes_token",
                 "created_at": 1700000001_u64,
                 "description": null
             }),
@@ -277,11 +277,8 @@ async fn v1_migration_preserves_access() {
     // Migrated tokens get wildcard scopes
     assert!(claude_entry.scopes.contains(&Scope::Admin));
 
-    let mikserka_entry = store
-        .lookup_by_plaintext("ns_mikserka_token")
-        .await
-        .unwrap();
-    assert_eq!(mikserka_entry.id, "migrated-kb:mikserka");
+    let notes_entry = store.lookup_by_plaintext("ns_notes_token").await.unwrap();
+    assert_eq!(notes_entry.id, "migrated-kb:notes");
 
     // v1 backup should exist
     let backup_path = format!("{}.v1.bak", store_path.to_str().unwrap());

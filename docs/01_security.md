@@ -21,7 +21,7 @@ Zamiast hardcoded ograniczenia do `$HOME` i `cwd`, wprowadzono konfigurowalną l
 # ~/.rmcp-servers/rmcp-memex/config.toml
 allowed_paths = [
     "~",                              # Home directory
-    "/Volumes/LibraxisShare/data",    # External volume
+    "/Volumes/SharedDrive/data",    # External volume
     "/opt/shared/documents"           # Shared directory
 ]
 ```
@@ -334,5 +334,5 @@ key_derivation = "argon2id"
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Vetcoders (c)2025
+Co-Authored-By: Vetcoders <hello@vetcoders.io>

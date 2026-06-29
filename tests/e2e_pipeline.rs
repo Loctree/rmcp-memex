@@ -5,7 +5,7 @@
 //!
 //! Run with: cargo test --test e2e_pipeline -- --ignored
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+//! Vibecrafted with AI Agents by Vetcoders (c)2026
 
 use rmcp_memex::{
     ChromaDocument, EmbeddingClient, EmbeddingConfig, ProviderConfig, StorageManager,

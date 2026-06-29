@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # rmcp-memex installer for prebuilt GitHub Release bundles
-# curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+# curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh
 # or with a specific release tag:
-# RMCP_MEMEX_VERSION=v0.5.1 curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+# RMCP_MEMEX_VERSION=v0.5.1 curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh
 
 set -euo pipefail
 
 VERSION="${RMCP_MEMEX_VERSION:-latest}"
 INSTALL_DIR="${RMCP_MEMEX_INSTALL_DIR:-$HOME/.cargo/bin}"
-GITHUB_REPO="VetCoders/rmcp-memex"
+GITHUB_REPO="vetcoders/rmcp-memex"
 BINARY_NAME="rmcp-memex"
 CHECKSUM_FILE="rmcp-memex-sha256sums.txt"
 COMPAT_ALIASES=("rmcp_memex")

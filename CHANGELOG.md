@@ -96,12 +96,12 @@ All notable changes to this project will be documented in this file.
   - Built on axum with tower-http CORS support
 - **TUI Wizard Enhancements** - Machine-agnostic configuration
   - Auto-detect hostname for per-host database paths
-  - **Path Mode**: Shared (`~/.ai-memories/lancedb`) or Per-Host (`~/.ai-memories/lancedb.{hostname}`)
+  - **Path Mode**: Shared (`~/.rmcp-servers/rmcp-memex/lancedb`) or Per-Host (`~/.rmcp-servers/rmcp-memex/lancedb.{hostname}`)
   - HTTP port configuration in wizard
   - Host info displayed in health check
   - Config TOML includes hostname and path mode comments
 - **Multi-Host Database Paths** - Separate databases per machine
-  - Pattern: `~/.ai-memories/lancedb.dragon`, `~/.ai-memories/lancedb.mgbook16`, etc.
+  - Pattern: `~/.rmcp-servers/rmcp-memex/lancedb.host-a`, `~/.rmcp-servers/rmcp-memex/lancedb.host-b`, etc.
   - Avoids conflicts when syncing config across machines
   - `MemexCfg::effective_db_path()` handles path resolution
 
@@ -166,7 +166,7 @@ All notable changes to this project will be documented in this file.
 - **CLI `--auto-route` flag** - Automatic search mode selection for `search` command
   - Analyzes query intent and selects optimal mode (vector/bm25/hybrid)
   - Displays intent, confidence, and loctree suggestions when applicable
-  - Example: `rmcp-memex search -n memories -q "when did we buy dragon" --auto-route`
+  - Example: `rmcp-memex search -n memories -q "when did we buy host-a" --auto-route`
 - **MCP `auto_route` parameter** - Added to `rag_search` and `memory_search` tools
   - When `true`, QueryRouter overrides explicit `mode` parameter
   - Enables intelligent mode selection for AI agents
@@ -296,7 +296,7 @@ All notable changes to this project will be documented in this file.
 - **Release Workflow** - GitHub Actions for multi-platform binary releases.
 - **Install Script** - `curl | sh` installer with platform detection.
   ```bash
-  curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+  curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh
   ```
 
 ## [0.2.1] - 2025-12-26
@@ -365,4 +365,4 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2025 The LibraxisAI Team
+Vibecrafted with AI Agents by Vetcoders (c)2025
