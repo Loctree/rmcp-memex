@@ -13,7 +13,7 @@
 // Usage:
 //   rmcp-memex <command> [args]
 //
-// Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+// Vibecrafted with AI Agents by Vetcoders (c)2026
 
 use anyhow::Result;
 use clap::Parser;

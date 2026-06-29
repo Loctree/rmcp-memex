@@ -79,7 +79,7 @@ log_level = "info"
 # Jeśli puste, domyślnie $HOME i current working directory
 allowed_paths = [
     "~",
-    "/Volumes/LibraxisShare/Klaudiusz",
+    "/Volumes/SharedDrive/notes",
     "/opt/shared/documents"
 ]
 
@@ -264,5 +264,5 @@ rmcp-memex serve --log-level trace
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2025 The LibraxisAI Team
-Co-Authored-By: [Maciej](void@div0.space) & [Klaudiusz](the1st@whoai.am)
+Vibecrafted with AI Agents by Vetcoders (c)2025
+Co-Authored-By: Vetcoders <hello@vetcoders.io>

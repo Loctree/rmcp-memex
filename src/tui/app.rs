@@ -434,9 +434,9 @@ fn get_hostname() -> String {
 /// Database path mode for multi-host setups
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbPathMode {
-    /// Single shared path (e.g., ~/.ai-memories/lancedb)
+    /// Single shared path (e.g., ~/.rmcp-servers/rmcp-memex/lancedb)
     Shared,
-    /// Per-host path with hostname suffix (e.g., ~/.ai-memories/lancedb.dragon)
+    /// Per-host path with hostname suffix (e.g., ~/.rmcp-servers/rmcp-memex/lancedb.host-a)
     PerHost,
 }
 
@@ -470,7 +470,7 @@ impl Default for MemexCfg {
         let hostname = get_hostname();
         Self {
             // New default path per requirements
-            db_path: "~/.ai-memories/lancedb".to_string(),
+            db_path: "~/.rmcp-servers/rmcp-memex/lancedb".to_string(),
             cache_mb: 4096,
             log_level: "info".to_string(),
             max_request_bytes: 10 * 1024 * 1024, // 10MB

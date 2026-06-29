@@ -4,7 +4,7 @@
 //! Each token is hashed with argon2id at rest. Plaintext is shown ONCE
 //! on creation and never stored.
 //!
-//! Vibecrafted with AI Agents by VetCoders (c)2024-2026 The LibraxisAI Team
+//! Vibecrafted with AI Agents by Vetcoders (c)2024-2026
 
 use std::fmt;
 use std::path::Path;
@@ -660,14 +660,14 @@ mod tests {
             id: "limited".to_string(),
             token_hash: String::new(),
             scopes: vec![Scope::Read],
-            namespaces: vec!["kb:claude".to_string(), "kb:mikserka".to_string()],
+            namespaces: vec!["kb:claude".to_string(), "kb:notes".to_string()],
             expires_at: None,
             description: "limited".to_string(),
             created_at: Utc::now(),
         };
 
         assert!(entry.has_namespace_access("kb:claude"));
-        assert!(entry.has_namespace_access("kb:mikserka"));
+        assert!(entry.has_namespace_access("kb:notes"));
         assert!(!entry.has_namespace_access("kb:reports"));
     }
 

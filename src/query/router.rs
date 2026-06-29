@@ -15,7 +15,7 @@
 //! ```rust
 //! use rmcp_memex::query::{QueryIntent, detect_intent, QueryRouter, RoutingDecision};
 //!
-//! let intent = detect_intent("when did we buy dragon");
+//! let intent = detect_intent("when did we buy host-a");
 //! assert!(matches!(intent, QueryIntent::Temporal));
 //!
 //! let router = QueryRouter::new();
@@ -237,7 +237,7 @@ fn semantic_keywords() -> &'static HashSet<&'static str> {
 /// ```rust
 /// use rmcp_memex::query::detect_intent;
 ///
-/// let intent = detect_intent("when did we buy dragon");
+/// let intent = detect_intent("when did we buy host-a");
 /// // Returns QueryIntent::Temporal
 /// ```
 pub fn detect_intent(query: &str) -> QueryIntent {
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn test_temporal_intent_detection() {
         assert_eq!(
-            detect_intent("when did we buy dragon"),
+            detect_intent("when did we buy host-a"),
             QueryIntent::Temporal
         );
         assert_eq!(
@@ -568,12 +568,12 @@ mod tests {
     #[test]
     fn test_exact_intent_detection() {
         assert_eq!(detect_intent(r#"find "exact phrase""#), QueryIntent::Exact);
-        assert_eq!(detect_intent("search 'dragon'"), QueryIntent::Exact);
+        assert_eq!(detect_intent("search 'host-a'"), QueryIntent::Exact);
     }
 
     #[test]
     fn test_hybrid_default() {
-        assert_eq!(detect_intent("dragon mac studio"), QueryIntent::Hybrid);
+        assert_eq!(detect_intent("host-a mac studio"), QueryIntent::Hybrid);
         assert_eq!(detect_intent("how to configure memex"), QueryIntent::Hybrid);
     }
 
@@ -581,7 +581,7 @@ mod tests {
     fn test_router_confidence() {
         let router = QueryRouter::new();
 
-        let decision = router.route("when exactly did we buy dragon in 2024");
+        let decision = router.route("when exactly did we buy host-a in 2024");
         assert_eq!(decision.intent, QueryIntent::Temporal);
         assert!(decision.confidence > 0.5);
 

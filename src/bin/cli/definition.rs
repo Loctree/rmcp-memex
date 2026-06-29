@@ -221,8 +221,8 @@ pub enum Commands {
     /// full metadata, and related chunks.
     ///
     /// Examples:
-    ///   rmcp-memex dive -n memories -q "dragon"
-    ///   rmcp-memex dive -n memories -q "dragon" --verbose
+    ///   rmcp-memex dive -n memories -q "host-a"
+    ///   rmcp-memex dive -n memories -q "host-a" --verbose
     Dive {
         /// Namespace to search in
         #[arg(long, short = 'n', required = true)]
@@ -335,10 +335,10 @@ pub enum Commands {
     /// defaults. Results include relevance scores, timestamps, and metadata.
     ///
     /// Examples:
-    ///   rmcp-memex search -n memories -q "when did we buy dragon"
-    ///   rmcp-memex search -n memories -q "dragon" --deep
-    ///   rmcp-memex search -n memories -q "dragon" -l 20
-    ///   rmcp-memex search -n memories -q "dragon" --mode hybrid
+    ///   rmcp-memex search -n memories -q "when did we buy host-a"
+    ///   rmcp-memex search -n memories -q "host-a" --deep
+    ///   rmcp-memex search -n memories -q "host-a" -l 20
+    ///   rmcp-memex search -n memories -q "host-a" --mode hybrid
     Search {
         /// Namespace to search in
         #[arg(long, short = 'n', required = true)]
@@ -517,7 +517,7 @@ pub enum Commands {
     ///
     /// Examples:
     ///   rmcp-memex recall "Vista architecture"          # Search all namespaces
-    ///   rmcp-memex recall "dragon setup" -n memories    # Specific namespace
+    ///   rmcp-memex recall "host-a setup" -n memories    # Specific namespace
     ///   rmcp-memex recall "auth flow" --limit 20        # More sources
     Recall {
         /// What to recall (search query)
@@ -684,7 +684,7 @@ pub enum Commands {
     /// Examples:
     ///   rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged
     ///   rmcp-memex merge --source ~/db1 --source ~/db2 --target ~/merged --dedup
-    ///   rmcp-memex merge --source ~/dragon-db --target ~/merged --namespace-prefix "dragon:"
+    ///   rmcp-memex merge --source ~/host-a-db --target ~/merged --namespace-prefix "host-a:"
     ///   rmcp-memex merge --source ~/db1 --target ~/merged --dry-run
     Merge {
         /// Source database paths (can specify multiple times)
@@ -699,7 +699,7 @@ pub enum Commands {
         #[arg(long, short = 'd')]
         dedup: bool,
 
-        /// Prefix to add to source namespaces (e.g., "dragon:" -> "dragon:memories")
+        /// Prefix to add to source namespaces (e.g., "host-a:" -> "host-a:memories")
         #[arg(long, short = 'p')]
         namespace_prefix: Option<String>,
 
@@ -977,7 +977,7 @@ pub enum Commands {
     /// ONCE on creation and can never be retrieved again.
     ///
     /// Examples:
-    ///   rmcp-memex auth create --description "iPhone" --scopes read,write --namespaces kb:claude,kb:mikserka
+    ///   rmcp-memex auth create --description "iPhone" --scopes read,write --namespaces kb:claude,kb:notes
     ///   rmcp-memex auth list
     ///   rmcp-memex auth revoke --id monika-iphone
     ///   rmcp-memex auth rotate --id monika-iphone

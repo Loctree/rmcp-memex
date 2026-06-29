@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY_NAME="rmcp-memex"
-GITHUB_REPO="${RMCP_MEMEX_GITHUB_REPO:-VetCoders/rmcp-memex}"
+GITHUB_REPO="${RMCP_MEMEX_GITHUB_REPO:-vetcoders/rmcp-memex}"
 SIGN_IDENTITY="${RMCP_MEMEX_SIGN_IDENTITY:-}"
 OUTPUT_DIR=""
 NOTES_FILE=""

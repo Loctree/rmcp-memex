@@ -59,12 +59,12 @@ Verify the public release surface, not just the repo:
 
 ```bash
 # Installer path
-curl -LsSf https://raw.githubusercontent.com/VetCoders/rmcp-memex/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/vetcoders/rmcp-memex/main/install.sh | sh
 rmcp-memex --version
 
 # Manual artifact path
-curl -LO https://github.com/VetCoders/rmcp-memex/releases/latest/download/rmcp-memex-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/VetCoders/rmcp-memex/releases/latest/download/rmcp-memex-sha256sums.txt
+curl -LO https://github.com/vetcoders/rmcp-memex/releases/latest/download/rmcp-memex-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/vetcoders/rmcp-memex/releases/latest/download/rmcp-memex-sha256sums.txt
 grep rmcp-memex-x86_64-unknown-linux-gnu.tar.gz rmcp-memex-sha256sums.txt
 ```
 

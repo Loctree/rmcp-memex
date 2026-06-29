@@ -676,7 +676,7 @@ impl MemexEngine {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let results = engine.search_hybrid("when did we buy dragon", 10).await?;
+    /// let results = engine.search_hybrid("when did we buy host-a", 10).await?;
     /// for r in results {
     ///     println!("{}: combined={:.3}, vector={:?}, bm25={:?}",
     ///         r.id, r.combined_score, r.vector_score, r.bm25_score);
@@ -721,7 +721,7 @@ impl MemexEngine {
     /// use rmcp_memex::SearchMode;
     ///
     /// // Keyword-only for exact matches
-    /// let results = engine.search_with_mode("dragon", 10, SearchMode::Keyword).await?;
+    /// let results = engine.search_with_mode("host-a", 10, SearchMode::Keyword).await?;
     /// ```
     pub async fn search_with_mode(
         &self,

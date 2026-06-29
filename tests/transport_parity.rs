@@ -8,7 +8,7 @@
 //! These tests require a running embedding server (Ollama with qwen3-embedding:8b, 4096 dims).
 //! Run with: cargo test --test transport_parity -- --ignored
 //!
-//! Vibecrafted with AI Agents (c)2026 VetCoders
+//! Vibecrafted with AI Agents (c)2026 Vetcoders
 
 use rmcp_memex::{
     EmbeddingConfig, HybridConfig, McpTransport, NamespaceSecurityConfig, ProviderConfig,

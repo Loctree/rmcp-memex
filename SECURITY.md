@@ -1,4 +1,4 @@
-<!-- Copyright (c) 2025-2026 VetCoders (https://vetcoders.io) -->
+<!-- Copyright (c) 2025-2026 Vetcoders (https://vetcoders.io) -->
 # Security Policy
 
 ## Supported Versions
@@ -11,7 +11,7 @@
 ## Reporting a Vulnerability
 
 Please use GitHub Security Advisories for responsible disclosure:
-https://github.com/VetCoders/rmcp-memex/security/advisories/new
+https://github.com/vetcoders/rmcp-memex/security/advisories/new
 
 If GitHub Advisories are unavailable, email security@vetcoders.io with a
 summary, affected version, reproduction steps, and expected impact.

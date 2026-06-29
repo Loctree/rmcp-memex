@@ -911,7 +911,7 @@ mod tests {
             "vista"
         ));
         assert!(matches_project_filter(
-            &json!({"project_id": "VetCoders"}),
+            &json!({"project_id": "Vetcoders"}),
             "vetcoders"
         ));
         assert!(!matches_project_filter(

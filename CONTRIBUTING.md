@@ -1,4 +1,4 @@
-<!-- Copyright (c) 2025-2026 VetCoders (https://vetcoders.io) -->
+<!-- Copyright (c) 2025-2026 Vetcoders (https://vetcoders.io) -->
 # Contributing
 
 Thanks for helping improve `rmcp-memex`.
