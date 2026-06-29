@@ -147,6 +147,10 @@ struct GpuMetrics {
     memory_total: Option<u64>,
 }
 
+// On non-macOS targets the cfg'd early return makes the macOS ioreg body below
+// unreachable by design; allow it so `-D warnings` stays green cross-platform
+// without dead-coding the macOS-only helpers.
+#[cfg_attr(not(target_os = "macos"), allow(unreachable_code))]
 fn probe_gpu() -> Result<GpuMetrics, GpuStatus> {
     #[cfg(not(target_os = "macos"))]
     return Err(GpuStatus::Unavailable {
